@@ -1,15 +1,18 @@
 //! vncfree - a free VNC (RFB) client for Windows.
-//! Milestone 0: connect, authenticate, pull one full frame, write it to a PPM.
-//! No window yet - proving the protocol before adding pixels-on-screen.
+//! Milestone 1: live window, continuous incremental updates.
+//! Pass an output path as a second argument for the headless one-frame PPM dump.
 
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use des::cipher::generic_array::GenericArray;
 use des::cipher::{BlockEncrypt, KeyInit};
 use des::Des;
+use minifb::{Key, ScaleMode, Window, WindowOptions};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -66,121 +69,196 @@ fn vnc_auth(r: &mut impl Read, w: &mut impl Write, password: &str) -> Res<()> {
 struct Screen {
     w: usize,
     h: usize,
-    /// 0x00RRGGBB per pixel - the layout minifb wants when we add a window.
+    /// 0x00RRGGBB per pixel - exactly what minifb wants to blit.
     px: Vec<u32>,
+}
+
+struct Vnc {
+    r: BufReader<TcpStream>,
+    w: TcpStream,
+    screen: Screen,
+    name: String,
 }
 
 fn main() -> Res<()> {
     let args: Vec<String> = env::args().collect();
     let Some(addr) = args.get(1) else {
         eprintln!("usage: vncfree <host:port> [out.ppm]");
+        eprintln!("  no out.ppm  -> open a live window");
+        eprintln!("  out.ppm     -> grab one frame headless and exit");
         eprintln!("password is read from the VNC_PASSWORD env var");
         std::process::exit(2);
     };
-    let out = args.get(2).map(String::as_str).unwrap_or("frame.ppm");
     let password = env::var("VNC_PASSWORD").unwrap_or_default();
+    let mut vnc = Vnc::connect(addr, &password)?;
 
-    let screen = grab(addr, &password)?;
-    write_ppm(out, &screen)?;
-    println!("wrote {} ({}x{})", out, screen.w, screen.h);
-    Ok(())
+    match args.get(2) {
+        Some(out) => {
+            vnc.request(false)?;
+            while !vnc.pump()? {}
+            write_ppm(out, &vnc.screen)?;
+            println!("wrote {} ({}x{})", out, vnc.screen.w, vnc.screen.h);
+            Ok(())
+        }
+        None => run_window(vnc),
+    }
 }
 
-fn grab(addr: &str, password: &str) -> Res<Screen> {
-    let tcp = TcpStream::connect(addr)?;
-    tcp.set_nodelay(true)?;
-    let mut w = tcp.try_clone()?;
-    let mut r = BufReader::new(tcp);
+impl Vnc {
+    fn connect(addr: &str, password: &str) -> Res<Vnc> {
+        let tcp = TcpStream::connect(addr)?;
+        tcp.set_nodelay(true)?;
+        let mut w = tcp.try_clone()?;
+        let mut r = BufReader::new(tcp);
 
-    // --- version handshake ---
-    let ver = rd::<12>(&mut r)?;
-    let ver = String::from_utf8_lossy(&ver).trim_end().to_string();
-    // ponytail: RFB 3.8 only. 3.3/3.7 differ in how SecurityResult is sent;
-    // add them when a real server actually refuses us.
-    if !ver.starts_with("RFB 003.008") {
-        return Err(format!("unsupported server version {ver:?}, need RFB 003.008").into());
-    }
-    w.write_all(b"RFB 003.008\n")?;
-
-    // --- security handshake ---
-    let n = u8r(&mut r)? as usize;
-    if n == 0 {
-        return Err(format!("server refused connection: {}", text(&mut r)?).into());
-    }
-    let types = blob(&mut r, n)?;
-    let chosen = if types.contains(&1) {
-        1 // None
-    } else if types.contains(&2) {
-        2 // VNC auth
-    } else {
-        return Err(format!("no supported security type in {types:?}").into());
-    };
-    w.write_all(&[chosen])?;
-    if chosen == 2 {
-        if password.is_empty() {
-            return Err("server wants a password; set VNC_PASSWORD".into());
+        // --- version handshake ---
+        let ver = rd::<12>(&mut r)?;
+        let ver = String::from_utf8_lossy(&ver).trim_end().to_string();
+        // ponytail: RFB 3.8 only. 3.3/3.7 differ in how SecurityResult is sent;
+        // add them when a real server actually refuses us.
+        if !ver.starts_with("RFB 003.008") {
+            return Err(format!("unsupported server version {ver:?}, need RFB 003.008").into());
         }
-        vnc_auth(&mut r, &mut w, password)?;
-    }
-    if u32r(&mut r)? != 0 {
-        return Err(format!("authentication failed: {}", text(&mut r)?).into());
-    }
+        w.write_all(b"RFB 003.008\n")?;
 
-    // --- init ---
-    w.write_all(&[1])?; // ClientInit, shared = yes
-    let width = u16r(&mut r)? as usize;
-    let height = u16r(&mut r)? as usize;
-    let _server_format = rd::<16>(&mut r)?;
-    let name = text(&mut r)?;
-    eprintln!("connected: {name:?} {width}x{height}");
-
-    // Force our own pixel format so we never have to translate: 32bpp little-endian
-    // true colour, shifts 16/8/0 => each pixel reads back as 0x00RRGGBB.
-    #[rustfmt::skip]
-    let set_format: [u8; 20] = [
-        0, 0, 0, 0,               // msg type 0 + 3 padding
-        32, 24, 0, 1,             // bpp, depth, big-endian=no, true-colour=yes
-        0, 255, 0, 255, 0, 255,   // red/green/blue max (u16 each)
-        16, 8, 0,                 // red/green/blue shift
-        0, 0, 0,                  // padding
-    ];
-    w.write_all(&set_format)?;
-
-    // SetEncodings: Raw only for now. Every server must support it.
-    // ponytail: add CopyRect/Tight once the window exists and bandwidth matters.
-    w.write_all(&[2, 0, 0, 1])?;
-    w.write_all(&0i32.to_be_bytes())?;
-
-    // FramebufferUpdateRequest: full screen, non-incremental.
-    let mut req = vec![3, 0];
-    req.extend_from_slice(&0u16.to_be_bytes());
-    req.extend_from_slice(&0u16.to_be_bytes());
-    req.extend_from_slice(&(width as u16).to_be_bytes());
-    req.extend_from_slice(&(height as u16).to_be_bytes());
-    w.write_all(&req)?;
-
-    let mut screen = Screen { w: width, h: height, px: vec![0; width * height] };
-
-    // Read messages until we've consumed one FramebufferUpdate.
-    loop {
-        match u8r(&mut r)? {
-            0 => {
-                let _pad = u8r(&mut r)?;
-                let rects = u16r(&mut r)?;
-                for _ in 0..rects {
-                    read_rect(&mut r, &mut screen)?;
-                }
-                return Ok(screen);
+        // --- security handshake ---
+        let n = u8r(&mut r)? as usize;
+        if n == 0 {
+            return Err(format!("server refused connection: {}", text(&mut r)?).into());
+        }
+        let types = blob(&mut r, n)?;
+        let chosen = if types.contains(&1) {
+            1 // None
+        } else if types.contains(&2) {
+            2 // VNC auth
+        } else {
+            return Err(format!("no supported security type in {types:?}").into());
+        };
+        w.write_all(&[chosen])?;
+        if chosen == 2 {
+            if password.is_empty() {
+                return Err("server wants a password; set VNC_PASSWORD".into());
             }
-            2 => {} // Bell, no body
+            vnc_auth(&mut r, &mut w, password)?;
+        }
+        if u32r(&mut r)? != 0 {
+            return Err(format!("authentication failed: {}", text(&mut r)?).into());
+        }
+
+        // --- init ---
+        w.write_all(&[1])?; // ClientInit, shared = yes
+        let width = u16r(&mut r)? as usize;
+        let height = u16r(&mut r)? as usize;
+        let _server_format = rd::<16>(&mut r)?;
+        let name = text(&mut r)?;
+        eprintln!("connected: {name:?} {width}x{height}");
+
+        // Force our own pixel format so we never have to translate: 32bpp little-endian
+        // true colour, shifts 16/8/0 => each pixel reads back as 0x00RRGGBB.
+        #[rustfmt::skip]
+        let set_format: [u8; 20] = [
+            0, 0, 0, 0,               // msg type 0 + 3 padding
+            32, 24, 0, 1,             // bpp, depth, big-endian=no, true-colour=yes
+            0, 255, 0, 255, 0, 255,   // red/green/blue max (u16 each)
+            16, 8, 0,                 // red/green/blue shift
+            0, 0, 0,                  // padding
+        ];
+        w.write_all(&set_format)?;
+
+        // SetEncodings: Raw only for now. Every server must support it.
+        // ponytail: add CopyRect/Tight once bandwidth matters (milestone 3).
+        w.write_all(&[2, 0, 0, 1])?;
+        w.write_all(&0i32.to_be_bytes())?;
+
+        let screen = Screen { w: width, h: height, px: vec![0; width * height] };
+        Ok(Vnc { r, w, screen, name })
+    }
+
+    /// Ask for the whole screen. Incremental means "only what changed" - the server
+    /// holds the request open until something does, which is what paces our loop.
+    fn request(&mut self, incremental: bool) -> Res<()> {
+        let mut req = vec![3, incremental as u8];
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&(self.screen.w as u16).to_be_bytes());
+        req.extend_from_slice(&(self.screen.h as u16).to_be_bytes());
+        self.w.write_all(&req)?;
+        Ok(())
+    }
+
+    /// Read one server message. Returns true if it was a framebuffer update, i.e.
+    /// the screen changed and is worth showing.
+    fn pump(&mut self) -> Res<bool> {
+        match u8r(&mut self.r)? {
+            0 => {
+                let _pad = u8r(&mut self.r)?;
+                let rects = u16r(&mut self.r)?;
+                for _ in 0..rects {
+                    read_rect(&mut self.r, &mut self.screen)?;
+                }
+                Ok(true)
+            }
+            1 => {
+                // SetColourMapEntries - we asked for true colour, so this is noise,
+                // but we still have to consume it to stay in sync with the stream.
+                blob(&mut self.r, 3)?;
+                let n = u16r(&mut self.r)? as usize;
+                blob(&mut self.r, n * 6)?;
+                Ok(false)
+            }
+            2 => Ok(false), // Bell, no body
             3 => {
                 // ServerCutText: 3 padding, then a u32-prefixed string
-                blob(&mut r, 3)?;
-                text(&mut r)?;
+                blob(&mut self.r, 3)?;
+                text(&mut self.r)?;
+                Ok(false)
             }
-            other => return Err(format!("unexpected server message type {other}").into()),
+            other => Err(format!("unexpected server message type {other}").into()),
         }
     }
+}
+
+fn run_window(mut vnc: Vnc) -> Res<()> {
+    let (w, h) = (vnc.screen.w, vnc.screen.h);
+    let title = format!("{} - vncfree", vnc.name);
+    let frame = Arc::new(Mutex::new(vec![0u32; w * h]));
+    let alive = Arc::new(AtomicBool::new(true));
+
+    // Network on its own thread: reads block for as long as the remote screen is
+    // idle, and the UI thread must never block on that.
+    let (net_frame, net_alive) = (frame.clone(), alive.clone());
+    std::thread::spawn(move || {
+        let mut incremental = false;
+        while net_alive.load(Ordering::Relaxed) {
+            let step = (|| -> Res<()> {
+                vnc.request(incremental)?;
+                while !vnc.pump()? {}
+                net_frame.lock().unwrap().copy_from_slice(&vnc.screen.px);
+                Ok(())
+            })();
+            if let Err(e) = step {
+                eprintln!("connection lost: {e}");
+                net_alive.store(false, Ordering::Relaxed);
+                return;
+            }
+            incremental = true;
+        }
+    });
+
+    let opts = WindowOptions {
+        resize: true,
+        scale_mode: ScaleMode::AspectRatioStretch,
+        ..Default::default()
+    };
+    let mut window = Window::new(&title, w, h, opts)?;
+    window.set_target_fps(60);
+
+    while window.is_open() && !window.is_key_down(Key::Escape) && alive.load(Ordering::Relaxed) {
+        let px = frame.lock().unwrap();
+        window.update_with_buffer(&px, w, h)?;
+    }
+    alive.store(false, Ordering::Relaxed);
+    Ok(())
 }
 
 fn read_rect(r: &mut impl Read, s: &mut Screen) -> Res<()> {
