@@ -17,8 +17,9 @@ work is shared with a server and it's the easier half to get right.
 
 ## Status
 
-Milestone 2 — **done**. A usable remote desktop: live window, keyboard and mouse.
-Verified end to end against a real TigerVNC server.
+Milestone 3 — **done**. A usable remote desktop: live window, keyboard and mouse, and
+Mac support with no settings changed on the Mac. Verified end to end against a real
+TigerVNC server (the Apple auth path is unit-tested only — see the Mac section).
 
 ```
 # live window, full control
@@ -28,9 +29,10 @@ cargo run --release -- 192.168.1.50:5900
 cargo run --release -- 192.168.1.50:5900 frame.ppm
 ```
 
-Password comes from the `VNC_PASSWORD` env var (not argv — argv is visible to every
-process on the box). Close the window to quit; Escape is forwarded to the remote
-machine, so it can't also be the quit key.
+Credentials come from the `VNC_PASSWORD` and `VNC_USERNAME` env vars (not argv — argv is
+visible to every process on the box). `VNC_USERNAME` is only needed for a Mac. Close the
+window to quit; Escape is forwarded to the remote machine, so it can't also be the quit
+key.
 
 Input notes:
 
@@ -43,23 +45,39 @@ Input notes:
 
 ## Connecting to a Mac
 
-macOS Screen Sharing is a real RFB server but differs in two ways that matter:
+**Nothing needs changing on the Mac.** Turn on Screen Sharing and connect with your
+macOS account:
+
+```powershell
+$env:VNC_USERNAME = 'yourmacuser'
+$env:VNC_PASSWORD = 'your account password'
+vncfree 192.168.1.20:5900
+```
+
+Two macOS-specific things are handled:
 
 1. **It announces `RFB 003.889`, not `003.008`.** vncfree replies `003.008`, which makes
-   it fall back to standard RFB 3.8. Handled — no action needed.
-2. **Authentication.** By default a Mac authenticates against macOS user accounts using
-   Apple's Diffie-Hellman scheme (security type 30), which vncfree does not implement.
-   Fix it on the Mac: System Settings > General > Sharing > Screen Sharing > (i) >
-   enable **"VNC viewers may control screen with password"** and set a password. That
-   switches the Mac to standard VNC auth, which works today. vncfree prints exactly
-   this instruction if it sees type 30, rather than a bare protocol error.
+   it fall back to standard RFB 3.8.
+2. **Apple Diffie-Hellman authentication (security type 30)**, which is what Screen
+   Sharing offers by default so it can check real macOS account credentials. The server
+   sends a generator, key length, prime and its public key; we do the DH exchange, MD5
+   the shared secret into an AES-128 key, and send back the username and password
+   encrypted in a 128-byte blob followed by our public key. Full account passwords work
+   — no 8-character DES limit.
 
-VNC auth keys are DES and effectively 8 characters — a longer password is silently
-truncated, so pick 8 meaningful ones.
+If instead you enable "VNC viewers may control screen with password" on the Mac, that
+switches it to standard VNC auth (security type 2), which also works — but note those
+passwords are DES and effectively 8 characters, silently truncated beyond that.
 
 The Windows key sends `Super_L`, which macOS maps to **Command** — so Cmd-C and Cmd-Tab
-work from a Windows keyboard. Alt sends `Alt_L`, which arrives as Option. This mapping
-is from the spec and is not yet confirmed against a physical Mac.
+work from a Windows keyboard. Alt sends `Alt_L`, which arrives as Option.
+
+**Not yet confirmed against a physical Mac.** The Apple DH implementation is verified by
+a round-trip test that plays the server side (proving the DH maths, the MD5-to-AES key
+derivation and the blob layout), and its wire order matches both the RFB protocol
+document and the gtk-vnc-derived description at
+[cafbit.com](https://cafbit.com/post/apple_remote_desktop_quirks/). The keysym-to-Command
+mapping is likewise from the spec. Both want a real Mac to confirm.
 
 ## Roadmap
 
@@ -68,18 +86,21 @@ is from the spec and is not yet confirmed against a physical Mac.
 | 0 | RFB 3.8 handshake, VNC auth, Raw encoding, one frame to disk | done |
 | 1 | Window: continuous incremental updates on screen | done |
 | 2 | Input: keyboard + mouse back to the server | done |
-| 3 | Encodings: CopyRect, then Tight or ZRLE (Raw is ~8 MB/frame at 1080p) | next |
-| 4 | Apple Diffie-Hellman auth (type 30), so a Mac needs no setting changed | |
+| 3 | Apple Diffie-Hellman auth (type 30), so a Mac needs no setting changed | done |
+| 4 | Encodings: CopyRect, then Tight or ZRLE (Raw is ~8 MB/frame at 1080p) | next |
 | 5 | Quality-of-life: reconnect, scaling, clipboard, saved hosts | |
 | 6 | Maybe a server. This is the part people actually can't get for free. | |
 
 ## Design notes
 
 - **Rust**, single static `.exe`. No .NET runtime, no Python, no installer.
-- **Two dependencies**: `des` (VNC auth) and `minifb` (window + framebuffer blit).
-  RFB itself is hand-rolled over `std::net::TcpStream` — the spec is small and the
-  crates that wrap it are larger than the protocol. On Windows `minifb` compiles 7
-  crates; its x11/wayland/sdl2 deps are target-gated and never built.
+- **Dependencies only where hand-rolling would be reckless**: `minifb` (window +
+  framebuffer blit) and the crypto the auth schemes require — `des`, `aes`, `md-5`,
+  `num-bigint` and `getrandom`. RFB itself is hand-rolled over `std::net::TcpStream`;
+  the spec is small and the crates that wrap it are larger than the protocol. Ciphers
+  and 1024-bit modular exponentiation are the opposite case: writing those by hand is
+  how you ship a subtly broken one. `aes` and `des` are pinned to the same `cipher 0.4`
+  generation so there is one copy in the tree.
 - We force our own pixel format (32bpp LE, shifts 16/8/0) at connect time, so every
   pixel arrives as `0x00RRGGBB` — which is also exactly minifb's buffer layout, so
   there is no format-translation layer anywhere in the program.
@@ -97,12 +118,14 @@ is from the spec and is not yet confirmed against a physical Mac.
 ## Known limits
 
 - RFB 3.8 or later. Older servers (3.3/3.7) negotiate security differently.
-- Raw encoding only — fine on a LAN, painful over the internet. That's milestone 3.
-- Apple Diffie-Hellman auth (type 30) is not implemented; see the Mac section above.
+- Raw encoding only — fine on a LAN, painful over the internet. That's milestone 4.
 - US keyboard layout. Non-US punctuation needs minifb's character callback rather than
   the static keysym table.
-- No TLS. VNC auth is DES-based and weak by modern standards; tunnel over SSH or a
-  VPN if the link isn't trusted.
+- No TLS. Apple DH protects the credentials in transit but not the session, and
+  classic VNC auth is DES and weak by modern standards. Neither encrypts the
+  framebuffer or your keystrokes — tunnel over SSH or a VPN if the link isn't trusted.
+- The DH exchange is unauthenticated, so it stops eavesdroppers but not an active
+  machine-in-the-middle. Same caveat as every other VNC client doing type 30.
 
 ## Testing against a real server
 

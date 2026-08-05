@@ -10,10 +10,13 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use aes::Aes128;
 use des::cipher::generic_array::GenericArray;
 use des::cipher::{BlockEncrypt, KeyInit};
 use des::Des;
+use md5::{Digest, Md5};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
+use num_bigint::BigUint;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -72,6 +75,84 @@ fn vnc_auth(r: &mut impl Read, w: &mut impl Write, password: &str) -> Res<()> {
     Ok(())
 }
 
+/// A big-endian integer in exactly `len` bytes, left-padded with zeros. Both the
+/// shared secret and the public key are fixed-width on the wire: hashing a secret
+/// that is one byte short silently produces a different AES key, and the only
+/// symptom is the server saying authentication failed.
+fn pad_be(n: &BigUint, len: usize) -> Vec<u8> {
+    let b = n.to_bytes_be();
+    assert!(b.len() <= len, "value is wider than the key length");
+    let mut out = vec![0u8; len - b.len()];
+    out.extend_from_slice(&b);
+    out
+}
+
+/// Write a null-terminated string into a fixed field, leaving the rest of the field
+/// as-is (Apple pre-fills the credential blob with random bytes, so the padding after
+/// the terminator is random rather than zeros).
+fn write_cstr(dst: &mut [u8], s: &str, what: &str) -> Res<()> {
+    let b = s.as_bytes();
+    if b.len() >= dst.len() {
+        return Err(format!("{what} is too long: max {} bytes", dst.len() - 1).into());
+    }
+    dst[..b.len()].copy_from_slice(b);
+    dst[b.len()] = 0;
+    Ok(())
+}
+
+/// Apple's Diffie-Hellman authentication (security type 30), which is what macOS
+/// Screen Sharing uses by default so it can check real macOS account credentials.
+///
+/// The server sends a generator, a key length, a prime and its public key. We do a
+/// standard DH exchange, MD5 the shared secret into an AES-128 key, and return the
+/// username and password encrypted in a 128-byte blob followed by our public key.
+fn apple_dh_auth(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    username: &str,
+    password: &str,
+) -> Res<()> {
+    let generator = u16r(r)?;
+    let key_len = u16r(r)? as usize;
+    let prime = blob(r, key_len)?;
+    let server_pub = blob(r, key_len)?;
+
+    let p = BigUint::from_bytes_be(&prime);
+    if p == BigUint::from(0u32) {
+        return Err("server sent a zero prime".into());
+    }
+
+    // Our DH private key. This must come from the OS CSPRNG - a predictable private
+    // key hands the session to anyone who can watch the exchange.
+    let mut private = vec![0u8; key_len];
+    getrandom::fill(&mut private)?;
+
+    let x = BigUint::from_bytes_be(&private);
+    let client_pub = BigUint::from(generator).modpow(&x, &p);
+    let shared = BigUint::from_bytes_be(&server_pub).modpow(&x, &p);
+    let key: [u8; 16] = Md5::digest(pad_be(&shared, key_len)).into();
+
+    // 128-byte credential blob: username at 0, password at 64, each null-terminated
+    // inside its own 64-byte field, with the slack left as the random fill.
+    let mut creds = [0u8; 128];
+    getrandom::fill(&mut creds)?;
+    let (user_field, pass_field) = creds.split_at_mut(64);
+    write_cstr(user_field, username, "username")?;
+    write_cstr(pass_field, password, "password")?;
+
+    // AES-128-ECB, exactly 8 blocks, no padding.
+    let cipher = Aes128::new(&key.into());
+    for block in creds.chunks_mut(16) {
+        let mut b = GenericArray::clone_from_slice(block);
+        cipher.encrypt_block(&mut b);
+        block.copy_from_slice(&b);
+    }
+
+    w.write_all(&creds)?;
+    w.write_all(&pad_be(&client_pub, key_len))?;
+    Ok(())
+}
+
 struct Screen {
     w: usize,
     h: usize,
@@ -92,11 +173,12 @@ fn main() -> Res<()> {
         eprintln!("usage: vncfree <host:port> [out.ppm]");
         eprintln!("  no out.ppm  -> open a live window");
         eprintln!("  out.ppm     -> grab one frame headless and exit");
-        eprintln!("password is read from the VNC_PASSWORD env var");
+        eprintln!("credentials come from VNC_PASSWORD, plus VNC_USERNAME for a Mac");
         std::process::exit(2);
     };
+    let username = env::var("VNC_USERNAME").unwrap_or_default();
     let password = env::var("VNC_PASSWORD").unwrap_or_default();
-    let mut vnc = Vnc::connect(addr, &password)?;
+    let mut vnc = Vnc::connect(addr, &username, &password)?;
 
     match args.get(2) {
         Some(out) => {
@@ -111,7 +193,7 @@ fn main() -> Res<()> {
 }
 
 impl Vnc {
-    fn connect(addr: &str, password: &str) -> Res<Vnc> {
+    fn connect(addr: &str, username: &str, password: &str) -> Res<Vnc> {
         let tcp = TcpStream::connect(addr)?;
         tcp.set_nodelay(true)?;
         let mut w = tcp.try_clone()?;
@@ -141,24 +223,29 @@ impl Vnc {
         let chosen = if types.contains(&1) {
             1 // None
         } else if types.contains(&2) {
-            2 // VNC auth
+            2 // VNC auth: DES, 8-character passwords, no username
         } else if types.contains(&30) {
-            // Apple's Diffie-Hellman auth, used when a Mac is set to authenticate
-            // against macOS user accounts. Not implemented - point at the fix.
-            return Err("this Mac wants Apple's Diffie-Hellman auth (type 30), which \
-                        vncfree does not implement yet. In System Settings > General > \
-                        Sharing > Screen Sharing > (i), enable 'VNC viewers may control \
-                        screen with password' and set an 8-character password."
-                .into());
+            30 // Apple Diffie-Hellman: what macOS Screen Sharing offers by default
         } else {
             return Err(format!("no supported security type in {types:?}").into());
         };
         w.write_all(&[chosen])?;
-        if chosen == 2 {
-            if password.is_empty() {
-                return Err("server wants a password; set VNC_PASSWORD".into());
+        match chosen {
+            2 => {
+                if password.is_empty() {
+                    return Err("server wants a password; set VNC_PASSWORD".into());
+                }
+                vnc_auth(&mut r, &mut w, password)?;
             }
-            vnc_auth(&mut r, &mut w, password)?;
+            30 => {
+                if username.is_empty() || password.is_empty() {
+                    return Err("this Mac authenticates against a macOS account; set \
+                                VNC_USERNAME and VNC_PASSWORD"
+                        .into());
+                }
+                apple_dh_auth(&mut r, &mut w, username, password)?;
+            }
+            _ => {}
         }
         if u32r(&mut r)? != 0 {
             return Err(format!("authentication failed: {}", text(&mut r)?).into());
@@ -512,6 +599,118 @@ mod tests {
         // longer than 8 chars is truncated, not hashed
         assert_eq!(vnc_key("abcdefghij"), vnc_key("abcdefgh"));
         assert_eq!(vnc_key(""), [0; 8]);
+    }
+
+    /// 1024-bit MODP group (RFC 2409 group 2) - same 128-byte key length a Mac uses.
+    const MODP_1024: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
+        29024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6D\
+        F25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
+        EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF";
+
+    /// Proves the primitives are wired up right, independently of the protocol.
+    /// AES vector is FIPS-197 C.1; MD5 vector is RFC 1321.
+    #[test]
+    fn crypto_primitives_match_published_vectors() {
+        let key: [u8; 16] = (0u8..16).collect::<Vec<_>>().try_into().unwrap();
+        let mut block = GenericArray::clone_from_slice(&[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        Aes128::new(&key.into()).encrypt_block(&mut block);
+        assert_eq!(
+            block[..],
+            [
+                0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70,
+                0xb4, 0xc5, 0x5a
+            ]
+        );
+        let md5: [u8; 16] = Md5::digest(b"abc").into();
+        assert_eq!(
+            md5,
+            [
+                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28,
+                0xe1, 0x7f, 0x72
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_width_padding_and_credential_fields() {
+        assert_eq!(pad_be(&BigUint::from(1u32), 4), [0, 0, 0, 1]);
+        assert_eq!(pad_be(&BigUint::from(0u32), 3), [0, 0, 0]);
+        assert_eq!(pad_be(&BigUint::from(0x1234u32), 2), [0x12, 0x34]);
+
+        // The field keeps its random fill after the null terminator.
+        let mut f = [0xAAu8; 8];
+        write_cstr(&mut f, "hi", "username").unwrap();
+        assert_eq!(f, [b'h', b'i', 0, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+        // A string that would fill the field leaves no room for the terminator.
+        assert!(write_cstr(&mut [0u8; 4], "abcd", "username").is_err());
+        assert!(write_cstr(&mut [0u8; 4], "abc", "username").is_ok());
+    }
+
+    /// Stands in for the Mac: plays the server side of the exchange, then decrypts
+    /// what we sent and checks the credentials come back out intact. This verifies
+    /// the DH maths, the MD5-to-AES key derivation and the blob layout. It cannot
+    /// verify Apple's field order, which is taken from the protocol description.
+    #[test]
+    fn apple_dh_round_trip_recovers_the_credentials() {
+        use aes::cipher::BlockDecrypt;
+
+        let p = BigUint::parse_bytes(MODP_1024.as_bytes(), 16).unwrap();
+        let key_len = 128usize;
+        assert_eq!(p.to_bytes_be().len(), key_len, "prime transcribed wrong");
+
+        let server_priv = BigUint::from(0x0123_4567_89ABu64);
+        let server_pub = BigUint::from(2u32).modpow(&server_priv, &p);
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&2u16.to_be_bytes()); // generator
+        msg.extend_from_slice(&(key_len as u16).to_be_bytes());
+        msg.extend_from_slice(&pad_be(&p, key_len));
+        msg.extend_from_slice(&pad_be(&server_pub, key_len));
+
+        let mut out = Vec::new();
+        apple_dh_auth(&mut &msg[..], &mut out, "alice", "hunter2").unwrap();
+        assert_eq!(out.len(), 128 + key_len, "blob then public key");
+
+        // Server side: derive the same key from our public key and decrypt.
+        let (ciphertext, client_pub) = out.split_at(128);
+        let shared = BigUint::from_bytes_be(client_pub).modpow(&server_priv, &p);
+        let key: [u8; 16] = Md5::digest(pad_be(&shared, key_len)).into();
+        let cipher = Aes128::new(&key.into());
+        let mut plain = ciphertext.to_vec();
+        for block in plain.chunks_mut(16) {
+            let mut b = GenericArray::clone_from_slice(block);
+            cipher.decrypt_block(&mut b);
+            block.copy_from_slice(&b);
+        }
+
+        let field = |f: &[u8]| {
+            String::from_utf8(f[..f.iter().position(|&c| c == 0).unwrap()].to_vec()).unwrap()
+        };
+        assert_eq!(field(&plain[..64]), "alice");
+        assert_eq!(field(&plain[64..]), "hunter2");
+    }
+
+    /// Two runs must differ: the private key and the blob padding are random, so
+    /// identical output would mean the CSPRNG is not being used at all.
+    #[test]
+    fn apple_dh_output_is_not_deterministic() {
+        let p = BigUint::parse_bytes(MODP_1024.as_bytes(), 16).unwrap();
+        let key_len = 128usize;
+        let server_pub = BigUint::from(2u32).modpow(&BigUint::from(99u32), &p);
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&2u16.to_be_bytes());
+        msg.extend_from_slice(&(key_len as u16).to_be_bytes());
+        msg.extend_from_slice(&pad_be(&p, key_len));
+        msg.extend_from_slice(&pad_be(&server_pub, key_len));
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        apple_dh_auth(&mut &msg[..], &mut a, "alice", "hunter2").unwrap();
+        apple_dh_auth(&mut &msg[..], &mut b, "alice", "hunter2").unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]
