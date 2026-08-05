@@ -1,0 +1,12 @@
+[package]
+name = "vncfree"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+# Only dep. VNC auth is DES-ECB with a bit-reversed key; hand-rolling DES is not lazy.
+des = "0.8"
+
+[profile.release]
+opt-level = 3
+strip = true
