@@ -30,15 +30,21 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
 
+      # Both binaries. Shipping a release with only the viewer in it would be a
+      # strange thing to do to a project whose point is that the server is free too.
       - uses: actions/upload-artifact@v4
         with:
           name: vncfree-windows-x64
-          path: target/release/vncfree.exe
+          path: |
+            target/release/vncfree.exe
+            target/release/vncfree-server.exe
 
-      # Only on a version tag: publish the exe on the Releases page so people can
-      # download it without building or trusting a binary from anywhere else.
+      # Only on a version tag: publish on the Releases page so people can download
+      # without building, or trusting a binary from anywhere else.
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
-          files: target/release/vncfree.exe
+          files: |
+            target/release/vncfree.exe
+            target/release/vncfree-server.exe
           generate_release_notes: true

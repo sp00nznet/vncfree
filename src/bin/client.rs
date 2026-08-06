@@ -175,9 +175,13 @@ fn main() {
 fn ask_where_to_connect() -> Res<Option<Target>> {
     let mut fields = vec![
         vncfree::gui::Field::new("Address", false, true),
+        vncfree::gui::Field::new("Username", false, false),
         vncfree::gui::Field::new("Password", true, false),
     ];
-    let note = "Address is host:port, for example 192.168.1.50:5900.";
+    // Pre-fill from the environment if it is set, so the variable still works.
+    fields[1].value = env::var("VNC_USERNAME").unwrap_or_default();
+    let note = "Address is host:port, for example 192.168.1.50:5900.\n\
+                Username is only for a Mac - leave it blank if not needed.";
     let check: vncfree::gui::Validator =
         |f| vncfree::gui::check_host_port("The address", &f[0].value);
     if !vncfree::gui::form(
@@ -191,10 +195,8 @@ fn ask_where_to_connect() -> Res<Option<Target>> {
     }
     Ok(Some(Target {
         addr: fields[0].value.trim().to_string(),
-        // A Mac authenticates against a macOS account and still needs a username;
-        // there is no box for it, so it comes from the environment.
-        user: env::var("VNC_USERNAME").unwrap_or_default(),
-        pass: fields[1].value.clone(),
+        user: fields[1].value.trim().to_string(),
+        pass: fields[2].value.clone(),
     }))
 }
 

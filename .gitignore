@@ -1,3 +1,6 @@
 /target
-*.ppm
-*.png
+
+# Frame dumps and captures land in the working directory during testing. Rooted so
+# that docs/ can still carry screenshots.
+/*.ppm
+/*.png

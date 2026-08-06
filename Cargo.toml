@@ -1,7 +1,13 @@
 [package]
 name = "vncfree"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
+description = "A free VNC client and server for Windows. No subscription, no telemetry, no installer."
+repository = "https://github.com/sp00nznet/vncfree"
+license = "MIT"
+readme = "README.md"
+keywords = ["vnc", "rfb", "remote-desktop", "windows"]
+categories = ["network-programming", "command-line-utilities"]
 
 # Shared RFB protocol pieces. The two binaries below are the client and the server.
 [lib]
