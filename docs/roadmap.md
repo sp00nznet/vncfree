@@ -12,16 +12,18 @@
 | 7 | Server-side ZRLE, so the server is usable off the LAN too | done |
 | 8 | A GUI for both, so neither needs a terminal | done |
 | 9 | Go public, tag a release, attach the binaries | done |
+| 10 | CopyRect on the server: send scrolling as a move, not as pixels | done |
 
 ## Ideas, not commitments
 
 Roughly in the order they would earn their keep:
 
-- **CopyRect on the server.** Dragging a window currently costs real bytes instead of a
-  "copy this block from over there" instruction. Cheap to add, immediately visible.
 - **Clipboard against macOS.** Works both directions against TigerVNC; macOS appears to
   use a proprietary extension instead of the standard messages. Needs reverse
   engineering, or Apple's extended clipboard pseudo-encoding.
+- **Two-dimensional motion.** CopyRect currently covers vertical scrolling. A window
+  dragged sideways still costs pixels. Best solved by taking move rectangles from the
+  Desktop Duplication API rather than by searching for motion.
 - **The two remaining ZRLE subencodings.** Plain and palette RLE, on top of the solid,
   packed-palette and raw forms the encoder already produces. Bytes, not compatibility.
 - **Desktop Duplication API for capture.** GDI `BitBlt` is simple and works everywhere;

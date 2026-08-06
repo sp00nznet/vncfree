@@ -85,6 +85,17 @@ the frame lock the network thread is waiting on.
   `DrawIconEx`; a remote desktop with no visible pointer is close to unusable.
 - **A DIB's top byte is undefined.** Mask it, or pixels compare unequal frame to frame
   and every tile looks changed.
+- **Scroll detection must look at the busiest column range, not the union of changed
+  rectangles.** The union spans from the leftmost change to the rightmost, swallowing
+  the static desktop in between; rows of that area differ from one another, so every
+  row comparison fails and no scroll is ever found. Costing an hour of "why does this
+  never fire".
+- **Probe more than one row when hunting for a shift.** A terminal or a document is
+  mostly background, so a single probe row frequently lands on a blank line whose
+  matches are all unrelated blank lines elsewhere.
+- **A scroll candidate is verified pixel by pixel before it is used.** Row hashes only
+  nominate; a CopyRect built on a hash collision would corrupt the client's screen
+  with no way for it to notice.
 - **The dialog raises DPI awareness per *thread*, not per process.** That keeps it
   crisp at 200% without changing how the client's session window is treated. Per
   process would have altered a tested rendering path for a cosmetic gain.
@@ -95,8 +106,10 @@ the frame lock the network thread is waiting on.
 
 - **Tight encoding.** Four persistent zlib streams and a JPEG decoder, and ZRLE gets
   most of the win.
-- **CopyRect on the server.** Dragging a window costs real bytes instead of a "copy
-  this block" instruction. The client decodes it; the server just never sends it.
+- **Two-dimensional motion search.** The server spots vertical scrolling, not a window
+  being dragged sideways. Finding arbitrary movement is motion estimation, which is
+  expensive to do and dangerous to get wrong; the Desktop Duplication API hands out
+  move rectangles for free and is the right way in if this ever matters.
 - **The two RLE ZRLE subencodings.** The encoder emits solid, packed palette and raw.
   The client decodes all five, so this only ever costs bytes, never compatibility.
 - **Saved hosts.** A desktop shortcut with the arguments already does it, and a config

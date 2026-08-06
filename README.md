@@ -79,7 +79,7 @@ visible to every process on the machine.
 |---|---|
 | **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode |
 | **Server** | Screen capture with the cursor, keyboard and mouse injection, clipboard, mandatory password |
-| **Encodings** | Raw, CopyRect, ZRLE. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction |
+| **Encodings** | Raw, CopyRect, ZRLE. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
 | **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
 | **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, and itself |
 
@@ -97,8 +97,9 @@ authentication, so there is no unauthenticated path at all.
 - **Clipboard does not work against macOS.** It works both directions against TigerVNC,
   but macOS appears to use a proprietary extension. See [docs/macos.md](docs/macos.md).
 - RFB 3.8 or later. Older servers (3.3/3.7) negotiate security differently.
-- No Tight encoding; the server sends Raw and ZRLE but not CopyRect. Compatibility is
-  unaffected — these cost bytes, not connections.
+- No Tight encoding, and the server's CopyRect covers vertical scrolling but not a
+  window dragged sideways. Compatibility is unaffected — these cost bytes, not
+  connections.
 - The server shares the primary monitor only, and does not follow a resolution change
   while a client is connected.
 - US keyboard layout for non-alphanumeric keys.

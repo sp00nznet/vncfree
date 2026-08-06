@@ -320,7 +320,158 @@ impl PixFmt {
     }
 }
 
+/// One piece of an update. A Copy tells the client to move something it already has,
+/// which costs four bytes instead of the pixels.
+#[derive(Debug, PartialEq)]
+enum Part {
+    Copy {
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        sx: usize,
+        sy: usize,
+    },
+    Pixels {
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    },
+}
+
 const TILE: usize = 64;
+
+/// Scrolling less than this is not worth a CopyRect, and the search is skipped.
+const MIN_SCROLL: usize = 64;
+
+/// How many rows to probe when hunting for a shift. One is not enough: a terminal or
+/// a document is mostly background, so a single probe frequently lands on a blank row
+/// whose matches are all unrelated blank rows elsewhere.
+const PROBES: usize = 8;
+
+/// Hash one row, but only the columns in `cols`. Scrolling almost always happens
+/// inside a window, so the desktop either side of it does not move; hashing whole rows
+/// would only ever spot a scroll spanning the entire screen.
+fn row_hash(px: &[u32], w: usize, y: usize, cols: (usize, usize)) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &p in &px[y * w + cols.0..y * w + cols.1] {
+        h ^= p as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+fn rows_match(
+    prev: &[u32],
+    cur: &[u32],
+    w: usize,
+    cols: (usize, usize),
+    sy: usize,
+    dy: usize,
+    n: usize,
+) -> bool {
+    (0..n).all(|i| {
+        prev[(sy + i) * w + cols.0..(sy + i) * w + cols.1]
+            == cur[(dy + i) * w + cols.0..(dy + i) * w + cols.1]
+    })
+}
+
+/// Find a band of rows within `cols` that simply moved vertically - in other words,
+/// scrolling, which is where CopyRect earns its keep.
+///
+/// Row hashes only propose a candidate; the winner is then compared pixel for pixel
+/// before it is used. A CopyRect based on a hash collision would corrupt the client's
+/// screen with no way for it to notice, so guessing is not acceptable here.
+///
+/// Returns (destination y, source y, height).
+fn find_scroll(
+    prev: &[u32],
+    cur: &[u32],
+    w: usize,
+    h: usize,
+    cols: (usize, usize),
+) -> Option<(usize, usize, usize)> {
+    if h < MIN_SCROLL || cols.1 <= cols.0 {
+        return None;
+    }
+    let ph: Vec<u64> = (0..h).map(|y| row_hash(prev, w, y, cols)).collect();
+    let ch: Vec<u64> = (0..h).map(|y| row_hash(cur, w, y, cols)).collect();
+
+    let first = (0..h).find(|&y| ph[y] != ch[y])?;
+    let last = (0..h).rev().find(|&y| ph[y] != ch[y])?;
+    if last - first + 1 < MIN_SCROLL {
+        return None;
+    }
+    // Several probe rows spread through the changed band, not one. A single probe
+    // lands on a blank row often enough to matter - a terminal or a document is mostly
+    // background - and every candidate it then finds is an unrelated blank row.
+    let mut best: Option<(usize, usize, usize)> = None;
+    for k in 0..PROBES {
+        let probe = first + (last - first) * k / (PROBES - 1);
+        let mut tried = 0;
+        for src in 0..h {
+            if ph[src] != ch[probe] {
+                continue;
+            }
+            // Cap the candidates per probe so a screen of identical rows cannot make
+            // this crawl.
+            tried += 1;
+            if tried > 8 {
+                break;
+            }
+            if src == probe {
+                continue;
+            }
+            // How far the content moved. Row y of the new frame should equal row
+            // y - shift of the old one.
+            let shift = probe as isize - src as isize;
+            let source_of = |y: usize| -> Option<usize> {
+                let s = y as isize - shift;
+                (s >= 0 && (s as usize) < h).then_some(s as usize)
+            };
+
+            // Grow a run of rows around the probe that all agree on this shift.
+            let (mut a, mut b) = (probe, probe);
+            while a > 0 && source_of(a - 1).is_some_and(|s| ch[a - 1] == ph[s]) {
+                a -= 1;
+            }
+            while b + 1 < h && source_of(b + 1).is_some_and(|s| ch[b + 1] == ph[s]) {
+                b += 1;
+            }
+            let n = b - a + 1;
+            if n >= MIN_SCROLL && best.is_none_or(|(_, _, bn)| n > bn) {
+                best = Some((a, source_of(a)?, n));
+            }
+        }
+    }
+
+    let (dst_y, src_y, n) = best?;
+    // The expensive, and only trustworthy, part.
+    rows_match(prev, cur, w, cols, src_y, dst_y, n).then_some((dst_y, src_y, n))
+}
+
+/// The column range that most of the change happened in.
+///
+/// Deliberately not the union of every changed rectangle: that spans from the leftmost
+/// change to the rightmost, swallowing whatever static desktop sits between them. Rows
+/// of that static area differ from each other, so including it makes every row
+/// comparison fail and no scroll is ever found. A scrolling window instead produces
+/// many rectangles sharing one exact column range, which is what this picks out.
+fn dominant_cols(rects: &[(usize, usize, usize, usize)]) -> Option<(usize, usize)> {
+    let mut groups: Vec<((usize, usize), usize)> = Vec::new();
+    for &(x, _, w, h) in rects {
+        let key = (x, x + w);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, area)) => *area += w * h,
+            None => groups.push((key, w * h)),
+        }
+    }
+    groups
+        .into_iter()
+        .max_by_key(|&(_, area)| area)
+        .map(|(k, _)| k)
+}
 
 /// Changed regions between two frames, as 64-pixel tile rows with horizontally
 /// adjacent tiles merged into runs. Merging matters: without it a full-screen change
@@ -461,50 +612,53 @@ fn deflate(z: &mut Compress, input: &[u8]) -> Res<Vec<u8>> {
     }
 }
 
-fn zrle_update(
-    z: &mut Compress,
-    s: &Screen,
-    rects: &[(usize, usize, usize, usize)],
-    fmt: &PixFmt,
-) -> Res<Vec<u8>> {
-    let mut out = vec![0u8, 0];
-    out.extend_from_slice(&(rects.len() as u16).to_be_bytes());
-    for &(x, y, w, h) in rects {
-        let mut tiles = Vec::new();
-        for ty in (0..h).step_by(64) {
-            for tx in (0..w).step_by(64) {
-                let (tw, th) = ((w - tx).min(64), (h - ty).min(64));
-                encode_tile(&mut tiles, s, x + tx, y + ty, tw, th, fmt);
-            }
-        }
-        let body = deflate(z, &tiles)?;
+/// Build one FramebufferUpdate. Copy parts become CopyRect; pixel parts become ZRLE
+/// when a compressor is supplied and Raw otherwise.
+fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) -> Res<Vec<u8>> {
+    let mut out = vec![0u8, 0]; // FramebufferUpdate, padding
+    out.extend_from_slice(&(parts.len() as u16).to_be_bytes());
+    let mut z = z;
+    for part in parts {
+        let (x, y, w, h) = match *part {
+            Part::Copy { x, y, w, h, .. } => (x, y, w, h),
+            Part::Pixels { x, y, w, h } => (x, y, w, h),
+        };
         out.extend_from_slice(&(x as u16).to_be_bytes());
         out.extend_from_slice(&(y as u16).to_be_bytes());
         out.extend_from_slice(&(w as u16).to_be_bytes());
         out.extend_from_slice(&(h as u16).to_be_bytes());
-        out.extend_from_slice(&16i32.to_be_bytes()); // ZRLE
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        out.extend_from_slice(&body);
+        match *part {
+            Part::Copy { sx, sy, .. } => {
+                out.extend_from_slice(&1i32.to_be_bytes()); // CopyRect
+                out.extend_from_slice(&(sx as u16).to_be_bytes());
+                out.extend_from_slice(&(sy as u16).to_be_bytes());
+            }
+            Part::Pixels { .. } => match z.as_mut() {
+                Some(z) => {
+                    let mut tiles = Vec::new();
+                    for ty in (0..h).step_by(64) {
+                        for tx in (0..w).step_by(64) {
+                            let (tw, th) = ((w - tx).min(64), (h - ty).min(64));
+                            encode_tile(&mut tiles, s, x + tx, y + ty, tw, th, fmt);
+                        }
+                    }
+                    let body = deflate(z, &tiles)?;
+                    out.extend_from_slice(&16i32.to_be_bytes()); // ZRLE
+                    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&body);
+                }
+                None => {
+                    out.extend_from_slice(&0i32.to_be_bytes()); // Raw
+                    for row in y..y + h {
+                        for col in x..x + w {
+                            out.extend_from_slice(&fmt.pixel(s.px[row * s.w + col]));
+                        }
+                    }
+                }
+            },
+        }
     }
     Ok(out)
-}
-
-fn raw_update(s: &Screen, rects: &[(usize, usize, usize, usize)], fmt: &PixFmt) -> Vec<u8> {
-    let mut out = vec![0u8, 0]; // FramebufferUpdate, padding
-    out.extend_from_slice(&(rects.len() as u16).to_be_bytes());
-    for &(x, y, w, h) in rects {
-        out.extend_from_slice(&(x as u16).to_be_bytes());
-        out.extend_from_slice(&(y as u16).to_be_bytes());
-        out.extend_from_slice(&(w as u16).to_be_bytes());
-        out.extend_from_slice(&(h as u16).to_be_bytes());
-        out.extend_from_slice(&0i32.to_be_bytes()); // Raw
-        for row in y..y + h {
-            for col in x..x + w {
-                out.extend_from_slice(&fmt.pixel(s.px[row * s.w + col]));
-            }
-        }
-    }
-    out
 }
 
 /// Shared between a client's reader thread and its sender thread.
@@ -519,6 +673,8 @@ struct Shared {
     /// The client listed ZRLE in SetEncodings. Sending an encoding a client never
     /// asked for is a protocol violation, so Raw is the default until it does.
     zrle: AtomicBool,
+    /// Likewise for CopyRect.
+    copyrect: AtomicBool,
     alive: AtomicBool,
     clip: Mutex<String>,
 }
@@ -676,6 +832,7 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
         wants: AtomicBool::new(false),
         incremental: AtomicBool::new(false),
         zrle: AtomicBool::new(false),
+        copyrect: AtomicBool::new(false),
         alive: AtomicBool::new(true),
         clip: Mutex::new(String::new()),
     });
@@ -725,10 +882,12 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
                     .map(|c| i32::from_be_bytes(c.try_into().unwrap()))
                     .collect();
                 shared.zrle.store(encs.contains(&16), Ordering::Relaxed);
+                shared.copyrect.store(encs.contains(&1), Ordering::Relaxed);
                 if debug() {
                     eprintln!(
-                        "[debug] client supports encodings {encs:?}, using {}",
-                        if encs.contains(&16) { "ZRLE" } else { "Raw" }
+                        "[debug] client supports encodings {encs:?}, using {}{}",
+                        if encs.contains(&16) { "ZRLE" } else { "Raw" },
+                        if encs.contains(&1) { " + CopyRect" } else { "" }
                     );
                 }
             }
@@ -813,13 +972,52 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
 
         cap.grab(&mut cur.px);
         let full = first || !shared.incremental.load(Ordering::Relaxed);
-        let rects = if full {
-            vec![(0, 0, w, h)]
-        } else {
-            changed_rects(&prev.px, &cur.px, w, h)
-        };
+        let mut parts = Vec::new();
 
-        if rects.is_empty() {
+        if full {
+            parts.push(Part::Pixels { x: 0, y: 0, w, h });
+        } else {
+            let mut rects = changed_rects(&prev.px, &cur.px, w, h);
+            // Worth looking for a scroll only if the change is tall enough to contain
+            // one. Gating on *area* instead would never fire: a scrolling window is a
+            // couple of percent of a 4K desktop.
+            let top = rects.iter().map(|r| r.1).min().unwrap_or(0);
+            let bottom = rects.iter().map(|r| r.1 + r.3).max().unwrap_or(0);
+            let cols = dominant_cols(&rects).unwrap_or((0, 0));
+            if shared.copyrect.load(Ordering::Relaxed) && bottom - top >= MIN_SCROLL {
+                if let Some((dst_y, src_y, n)) = find_scroll(&prev.px, &cur.px, w, h, cols) {
+                    let cw = cols.1 - cols.0;
+                    parts.push(Part::Copy {
+                        x: cols.0,
+                        y: dst_y,
+                        w: cw,
+                        h: n,
+                        sx: cols.0,
+                        sy: src_y,
+                    });
+                    // Apply it to our copy of what the client has, so the diff below
+                    // describes only the difference genuinely left over. Source and
+                    // destination overlap, so this goes via a scratch buffer.
+                    let band: Vec<u32> = (0..n)
+                        .flat_map(|i| {
+                            prev.px[(src_y + i) * w + cols.0..(src_y + i) * w + cols.1].to_vec()
+                        })
+                        .collect();
+                    for i in 0..n {
+                        prev.px[(dst_y + i) * w + cols.0..(dst_y + i) * w + cols.1]
+                            .copy_from_slice(&band[i * cw..(i + 1) * cw]);
+                    }
+                    rects = changed_rects(&prev.px, &cur.px, w, h);
+                }
+            }
+            parts.extend(
+                rects
+                    .into_iter()
+                    .map(|(x, y, w, h)| Part::Pixels { x, y, w, h }),
+            );
+        }
+
+        if parts.is_empty() {
             // An incremental request stays outstanding until something actually
             // changes; answering with zero rectangles would spin the client.
             std::thread::sleep(Duration::from_millis(20));
@@ -829,16 +1027,34 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         let fmt = *shared.fmt.lock().unwrap();
         // ZRLE needs both the client's blessing and a pixel layout that has a legal
         // 3-byte CPIXEL; otherwise fall back to Raw, which every client understands.
-        let msg = if shared.zrle.load(Ordering::Relaxed) && fmt.cpixel(0).is_some() {
-            zrle_update(&mut deflater, &cur, &rects, &fmt)?
-        } else {
-            raw_update(&cur, &rects, &fmt)
-        };
+        let zrle_ok = shared.zrle.load(Ordering::Relaxed) && fmt.cpixel(0).is_some();
+        let msg = update(
+            if zrle_ok { Some(&mut deflater) } else { None },
+            &cur,
+            &parts,
+            &fmt,
+        )?;
         if debug() {
-            let pixels: usize = rects.iter().map(|r| r.2 * r.3).sum();
+            let copied: usize = parts
+                .iter()
+                .filter_map(|p| match p {
+                    Part::Copy { w, h, .. } => Some(w * h),
+                    _ => None,
+                })
+                .sum();
+            let pixels: usize = parts
+                .iter()
+                .filter_map(|p| match p {
+                    Part::Pixels { w, h, .. } => Some(w * h),
+                    _ => None,
+                })
+                .sum();
+            if copied > 0 {
+                eprintln!("[debug] copyrect moved {copied} px without sending them");
+            }
             eprintln!(
                 "[debug] update: {} rect(s), {pixels} px, {} bytes on the wire ({:.1}% of raw)",
-                rects.len(),
+                parts.len(),
                 msg.len(),
                 100.0 * msg.len() as f64 / (pixels * 4).max(1) as f64
             );
@@ -1028,11 +1244,142 @@ mod tests {
         );
     }
 
+    /// A scrolled band must be found, and must be exactly right - the whole point of
+    /// verifying pixels rather than trusting the row hashes.
+    #[test]
+    fn a_scrolled_band_is_found_and_reported_exactly() {
+        let (w, h) = (8usize, 200usize);
+        // Every row distinct, so a shift is unambiguous.
+        let prev: Vec<u32> = (0..w * h).map(|i| (i / w) as u32 + 1).collect();
+        // Scroll up by 10 rows: row y now holds what row y+10 held.
+        let mut cur = vec![0u32; w * h];
+        for y in 0..h - 10 {
+            cur[y * w..(y + 1) * w].copy_from_slice(&prev[(y + 10) * w..(y + 11) * w]);
+        }
+        let (dst_y, src_y, n) =
+            find_scroll(&prev, &cur, w, h, (0, w)).expect("should spot the scroll");
+        assert_eq!(dst_y, 0);
+        assert_eq!(src_y, 10);
+        assert_eq!(n, h - 10, "the whole scrolled band");
+        assert!(rows_match(&prev, &cur, w, (0, w), src_y, dst_y, n));
+    }
+
+    /// Scrolling inside a window: only some columns move, and the desktop either side
+    /// stays put. Hashing whole rows would miss this entirely.
+    #[test]
+    fn a_scroll_inside_a_column_band_is_found() {
+        let (w, h) = (40usize, 200usize);
+        // Left third is a static "desktop" whose rows differ from each other - as a
+        // real desktop's do - and the rest is a scrolling window.
+        let band = (12usize, 40usize);
+        let mut prev = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..band.0 {
+                prev[y * w + x] = 900_000 + (y as u32) * 7 + x as u32;
+            }
+            for x in band.0..band.1 {
+                prev[y * w + x] = (y as u32 + 1) * 100 + x as u32;
+            }
+        }
+        let mut cur = prev.clone();
+        for y in 0..h - 10 {
+            for x in band.0..band.1 {
+                cur[y * w + x] = prev[(y + 10) * w + x];
+            }
+        }
+        assert_eq!(
+            find_scroll(&prev, &cur, w, h, (0, w)),
+            None,
+            "full-width hashing cannot see a windowed scroll"
+        );
+        let (dst_y, src_y, n) = find_scroll(&prev, &cur, w, h, band).expect("found in the band");
+        assert_eq!((dst_y, src_y), (0, 10));
+        assert_eq!(n, h - 10);
+    }
+
+    #[test]
+    fn a_still_screen_and_a_tiny_change_are_not_scrolls() {
+        let (w, h) = (8usize, 200usize);
+        let a: Vec<u32> = (0..w * h).map(|i| (i / w) as u32 + 1).collect();
+        assert_eq!(find_scroll(&a, &a, w, h, (0, w)), None, "nothing moved");
+
+        let mut b = a.clone();
+        b[100 * w + 3] = 99; // one pixel
+        assert_eq!(
+            find_scroll(&a, &b, w, h, (0, w)),
+            None,
+            "too small to be a scroll"
+        );
+    }
+
+    /// The union would be (10, 108) here, dragging in the static desktop between the
+    /// two changes and making every row comparison fail.
+    #[test]
+    fn dominant_columns_pick_the_busiest_band_not_the_union() {
+        let rects = [
+            (10, 0, 20, 64), // a scrolling window, three tile rows of it
+            (10, 64, 20, 64),
+            (10, 128, 20, 64),
+            (100, 0, 8, 8), // something small twitching far away
+        ];
+        assert_eq!(dominant_cols(&rects), Some((10, 30)));
+        assert_eq!(dominant_cols(&[]), None);
+    }
+
+    /// Rows that hash alike but differ must be rejected. A CopyRect built on a
+    /// collision would corrupt the client's screen silently.
+    #[test]
+    fn a_band_that_only_looks_shifted_is_rejected() {
+        let (w, h) = (8usize, 200usize);
+        let prev: Vec<u32> = (0..w * h).map(|i| (i / w) as u32 + 1).collect();
+        let mut cur = vec![0u32; w * h];
+        for y in 0..h - 10 {
+            cur[y * w..(y + 1) * w].copy_from_slice(&prev[(y + 10) * w..(y + 11) * w]);
+        }
+        // Corrupt one pixel inside the band so the pixel check must fail.
+        cur[50 * w + 2] = 0xDEAD;
+        assert!(!rows_match(&prev, &cur, w, (0, w), 10, 0, h - 10));
+    }
+
+    #[test]
+    fn copyrect_costs_four_bytes_of_coordinates_and_no_pixels() {
+        let s = Screen::new(64, 64);
+        let parts = [Part::Copy {
+            x: 0,
+            y: 10,
+            w: 64,
+            h: 20,
+            sx: 0,
+            sy: 30,
+        }];
+        let msg = update(None, &s, &parts, &PixFmt::default()).unwrap();
+        assert_eq!(msg[0], 0, "FramebufferUpdate");
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 1, "one rectangle");
+        assert_eq!(
+            i32::from_be_bytes(msg[12..16].try_into().unwrap()),
+            1,
+            "CopyRect"
+        );
+        assert_eq!(u16::from_be_bytes([msg[16], msg[17]]), 0, "source x");
+        assert_eq!(u16::from_be_bytes([msg[18], msg[19]]), 30, "source y");
+        assert_eq!(
+            msg.len(),
+            4 + 12 + 4,
+            "header, rect, and just the source point"
+        );
+    }
+
     #[test]
     fn zrle_rect_header_is_well_formed() {
         let mut z = Compress::new(Compression::default(), true);
         let s = Screen::new(4, 4);
-        let msg = zrle_update(&mut z, &s, &[(0, 0, 4, 4)], &PixFmt::default()).unwrap();
+        let parts = [Part::Pixels {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        }];
+        let msg = update(Some(&mut z), &s, &parts, &PixFmt::default()).unwrap();
         assert_eq!(msg[0], 0, "FramebufferUpdate");
         assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 1, "one rectangle");
         assert_eq!(
@@ -1047,7 +1394,13 @@ mod tests {
     #[test]
     fn raw_update_header_is_well_formed() {
         let s = Screen::new(2, 1);
-        let msg = raw_update(&s, &[(0, 0, 2, 1)], &PixFmt::default());
+        let parts = [Part::Pixels {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 1,
+        }];
+        let msg = update(None, &s, &parts, &PixFmt::default()).unwrap();
         assert_eq!(msg[0], 0, "FramebufferUpdate");
         assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 1, "one rectangle");
         assert_eq!(u16::from_be_bytes([msg[8], msg[9]]), 2, "width");
