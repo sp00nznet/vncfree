@@ -4,8 +4,9 @@
 //! account: run the exe, it serves while it is running, close it and nothing is left
 //! behind. A password is mandatory - see the note in `run`.
 //!
-//! Capture is GDI BitBlt into a DIB, which already holds 0x00RRGGBB pixels, so the
-//! framebuffer needs no conversion. Input is injected with SendInput.
+//! Capture is Desktop Duplication where it is available and GDI BitBlt otherwise,
+//! both landing in a DIB that already holds 0x00RRGGBB pixels, so the framebuffer
+//! needs no conversion. Input is injected with SendInput.
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -16,6 +17,183 @@ use std::time::Duration;
 use flate2::{Compress, Compression, FlushCompress};
 use vncfree::{blob, cut_text_msg, debug, from_latin1, rd, u16r, u32r, u8r, vnc_des};
 use vncfree::{Res, Screen, PIXEL_FORMAT};
+
+mod dxgi {
+    //! Screen capture through Desktop Duplication.
+    //!
+    //! `BitBlt` copies the whole screen every time it is asked, whether or not
+    //! anything changed, and then the framebuffer has to be diffed to find out what
+    //! did. Desktop Duplication instead hands over a frame only when the desktop
+    //! actually changes, which is both faster and quieter on an idle machine.
+    //!
+    //! This is COM, so the objects here are reference counted and released in the
+    //! order they are dropped. Failure is normal and expected - see the caller.
+
+    use vncfree::Res;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::Win32::Graphics::Dxgi::*;
+
+    pub struct Duplicator {
+        w: usize,
+        h: usize,
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        dupl: IDXGIOutputDuplication,
+        /// A CPU-readable copy target. The duplicated frame lives in GPU memory that
+        /// cannot be mapped directly, so each frame is copied into this first.
+        staging: ID3D11Texture2D,
+        holding: bool,
+    }
+
+    impl Duplicator {
+        pub fn new(w: usize, h: usize) -> Res<Duplicator> {
+            unsafe {
+                let mut device = None;
+                let mut context = None;
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    windows::Win32::Foundation::HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )?;
+                let device: ID3D11Device = device.ok_or("no D3D11 device")?;
+                let context: ID3D11DeviceContext = context.ok_or("no D3D11 context")?;
+
+                // Walk device -> adapter -> outputs, and take the one that actually is
+                // the primary display. Output 0 is not necessarily it: with more than
+                // one monitor the enumeration order is the adapter's, not Windows'.
+                // Capturing the wrong monitor produces a perfectly valid image of
+                // entirely the wrong screen.
+                let dxgi_device: IDXGIDevice = device.cast()?;
+                let adapter = dxgi_device.GetAdapter()?;
+                let mut chosen = None;
+                for i in 0.. {
+                    let Ok(output) = adapter.EnumOutputs(i) else {
+                        break;
+                    };
+                    let desc = output.GetDesc()?;
+                    let r = desc.DesktopCoordinates;
+                    let (ow, oh) = ((r.right - r.left) as usize, (r.bottom - r.top) as usize);
+                    if super::debug() {
+                        eprintln!("[debug] dxgi output {i}: {ow}x{oh} at {},{}", r.left, r.top);
+                    }
+                    // The primary display is the one whose top-left is the origin.
+                    if r.left == 0 && r.top == 0 && ow == w && oh == h {
+                        chosen = Some(output);
+                        break;
+                    }
+                }
+                let output = chosen.ok_or_else(|| {
+                    format!("no duplicable output matches the primary display at {w}x{h}")
+                })?;
+                let output1: IDXGIOutput1 = output.cast()?;
+                let dupl = output1.DuplicateOutput(&device)?;
+
+                // BGRA to match the DIB exactly, so the copy out is a straight memcpy
+                // per row rather than a per-pixel shuffle.
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w as u32,
+                    Height: h as u32,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                };
+                let mut staging = None;
+                device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+                let staging = staging.ok_or("no staging texture")?;
+
+                Ok(Duplicator {
+                    w,
+                    h,
+                    device,
+                    context,
+                    dupl,
+                    staging,
+                    holding: false,
+                })
+            }
+        }
+
+        /// Fill `dst` with the current screen. Returns false when nothing changed
+        /// within the timeout, which leaves `dst` untouched and is not an error.
+        pub fn frame(&mut self, dst: &mut [u32]) -> Res<bool> {
+            unsafe {
+                if self.holding {
+                    // Every acquired frame must be released before the next is asked
+                    // for, or AcquireNextFrame fails from then on.
+                    let _ = self.dupl.ReleaseFrame();
+                    self.holding = false;
+                }
+
+                let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                let mut resource = None;
+                match self.dupl.AcquireNextFrame(15, &mut info, &mut resource) {
+                    Ok(()) => {}
+                    // Nobody drew anything. Perfectly normal on an idle desktop.
+                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                    Err(e) => return Err(e.into()),
+                }
+                self.holding = true;
+
+                // A frame arrives when the pointer moves as well as when something is
+                // drawn, and a pointer-only frame carries no desktop image - its
+                // texture is empty. Copying it anyway paints the screen black, which
+                // is exactly what it did. LastPresentTime is what tells them apart.
+                let redrawn = info.LastPresentTime != 0;
+                let pointer_moved = info.LastMouseUpdateTime != 0;
+                if redrawn {
+                    let frame: ID3D11Texture2D = resource.ok_or("no frame resource")?.cast()?;
+                    self.context.CopyResource(&self.staging, &frame);
+
+                    let mut map = D3D11_MAPPED_SUBRESOURCE::default();
+                    self.context
+                        .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut map))?;
+                    // The GPU picks its own row stride, usually wider than the image;
+                    // copying width*height in one go would shear the picture.
+                    let stride = map.RowPitch as usize / 4;
+                    let src = std::slice::from_raw_parts(map.pData as *const u32, stride * self.h);
+                    for y in 0..self.h {
+                        dst[y * self.w..(y + 1) * self.w]
+                            .copy_from_slice(&src[y * stride..y * stride + self.w]);
+                    }
+                    self.context.Unmap(&self.staging, 0);
+                }
+                // A moved pointer still changes the picture, because the cursor is
+                // composited into the framebuffer.
+                Ok(redrawn || pointer_moved)
+            }
+        }
+    }
+
+    impl Drop for Duplicator {
+        fn drop(&mut self) {
+            unsafe {
+                if self.holding {
+                    let _ = self.dupl.ReleaseFrame();
+                }
+            }
+            // device, context, dupl and staging release themselves.
+            let _ = &self.device;
+            let _ = &self.context;
+        }
+    }
+}
 
 mod win {
     //! The only unsafe in the project: screen capture and input injection.
@@ -44,8 +222,12 @@ mod win {
         }
     }
 
-    /// A reusable capture surface. Creating the DIB once and re-blitting into it is
-    /// far cheaper than building one per frame.
+    /// A reusable capture surface. Creating the DIB once and re-filling it is far
+    /// cheaper than building one per frame.
+    ///
+    /// Pixels come from Desktop Duplication when it is available and from `BitBlt`
+    /// otherwise, but either way they land in this same DIB, so the cursor is
+    /// composited by one piece of code regardless.
     pub struct Capture {
         w: usize,
         h: usize,
@@ -53,6 +235,11 @@ mod win {
         mem: HDC,
         bitmap: HBITMAP,
         bits: *mut u32,
+        dxgi: Option<super::dxgi::Duplicator>,
+        /// Whether the DIB has ever held a real frame. Desktop Duplication reports
+        /// "nothing changed" on an idle desktop, which is only a safe answer once
+        /// there is something to have not changed from.
+        primed: bool,
     }
 
     impl Capture {
@@ -75,6 +262,31 @@ mod win {
                     return None;
                 }
                 SelectObject(mem, bitmap as HGDIOBJ);
+
+                // Desktop Duplication is preferred: it wakes only when the screen
+                // actually changes, and it reports which parts. It can legitimately
+                // fail - no GPU access from this session, a driver that declines,
+                // another program already duplicating - so GDI stays as the fallback
+                // rather than being ripped out.
+                let dxgi = if std::env::var("VNC_CAPTURE")
+                    .map(|v| v == "gdi")
+                    .unwrap_or(false)
+                {
+                    eprintln!("VNC_CAPTURE=gdi: using BitBlt");
+                    None
+                } else {
+                    match super::dxgi::Duplicator::new(w, h) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            eprintln!("desktop duplication unavailable, using BitBlt: {e}");
+                            None
+                        }
+                    }
+                };
+                if dxgi.is_some() && super::debug() {
+                    eprintln!("[debug] capturing with Desktop Duplication");
+                }
+
                 Some(Capture {
                     w,
                     h,
@@ -82,26 +294,60 @@ mod win {
                     mem,
                     bitmap,
                     bits: bits as *mut u32,
+                    dxgi,
+                    primed: false,
                 })
             }
         }
 
-        /// Copy the screen into `dst`. The cursor is drawn in by hand because BitBlt
-        /// does not include it, and a remote desktop with no visible pointer is
-        /// almost unusable.
-        pub fn grab(&self, dst: &mut [u32]) {
+        /// Copy the screen into `dst`, and say whether anything might have changed.
+        ///
+        /// Desktop Duplication knows when the desktop is idle and says so, which lets
+        /// the caller skip diffing a screen that provably did not move. `BitBlt` has
+        /// no such knowledge, so on that path the answer is always "maybe".
+        ///
+        /// The cursor is drawn in by hand either way: neither capture route includes
+        /// it, and a remote desktop with no visible pointer is close to unusable.
+        pub fn grab(&mut self, dst: &mut [u32]) -> bool {
             unsafe {
-                BitBlt(
-                    self.mem,
-                    0,
-                    0,
-                    self.w as i32,
-                    self.h as i32,
-                    self.screen,
-                    0,
-                    0,
-                    SRCCOPY,
-                );
+                let rows = std::slice::from_raw_parts_mut(self.bits, self.w * self.h);
+                let blit = |c: &Capture| {
+                    BitBlt(c.mem, 0, 0, c.w as i32, c.h as i32, c.screen, 0, 0, SRCCOPY);
+                };
+
+                let mut changed = false;
+                // Duplication only ever reports *changes*, so the first frame has to
+                // come from somewhere. Take it from BitBlt and let duplication update
+                // it from then on.
+                if !self.primed {
+                    blit(self);
+                    self.primed = true;
+                    changed = true;
+                }
+
+                match self.dxgi.as_mut() {
+                    Some(d) => match d.frame(rows) {
+                        Ok(moved) => changed |= moved,
+                        Err(e) => {
+                            // A duplication can be lost at any time - a resolution
+                            // change, a full-screen game taking the output, the
+                            // session locking. Fall back rather than dying.
+                            eprintln!("desktop duplication stopped, using BitBlt: {e}");
+                            self.dxgi = None;
+                            blit(self);
+                            changed = true;
+                        }
+                    },
+                    // BitBlt cannot tell us whether anything moved, so assume it did.
+                    None => {
+                        blit(self);
+                        changed = true;
+                    }
+                }
+
+                if !changed {
+                    return false;
+                }
                 let mut ci: CURSORINFO = zeroed();
                 ci.cbSize = size_of::<CURSORINFO>() as u32;
                 if GetCursorInfo(&mut ci) != 0 && ci.flags == CURSOR_SHOWING {
@@ -132,6 +378,7 @@ mod win {
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d = s & 0x00FF_FFFF;
                 }
+                true
             }
         }
     }
@@ -967,7 +1214,7 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
     let mut cur = Screen::new(w, h);
     let mut prev = Screen::new(w, h);
     let mut first = true;
-    let cap = win::Capture::new(w, h).ok_or("could not create the capture surface")?;
+    let mut cap = win::Capture::new(w, h).ok_or("could not create the capture surface")?;
     // One deflate stream for the whole connection. ZRLE's zlib state spans the
     // session, not a rectangle; restarting it per rectangle decodes the first one and
     // then produces garbage on the client forever.
@@ -1006,8 +1253,12 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
             continue;
         }
 
-        cap.grab(&mut cur.px);
         let full = first || !shared.incremental.load(Ordering::Relaxed);
+        if !cap.grab(&mut cur.px) && !full {
+            // Desktop Duplication says the screen did not move, so there is nothing
+            // to diff and nothing to send. The request stays outstanding.
+            continue;
+        }
         let mut parts = Vec::new();
 
         if full {

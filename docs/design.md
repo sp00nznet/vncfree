@@ -28,6 +28,7 @@ Only where hand-rolling would be reckless:
 | `minifb` | A window and a `u32` framebuffer to blit into. Nothing else. |
 | `arboard` | Clipboard, with the image-format support turned off. |
 | `windows-sys` | Screen capture, input injection and the dialogs. |
+| `windows` | Desktop Duplication only. It is COM, and `windows-sys` has no COM support — several hundred lines of hand-written vtable calls in unsafe code, against a crate that brings reference counting and `QueryInterface`. Worth it when the alternative is managing COM lifetimes by hand. |
 
 RFB itself is hand-rolled over `std::net::TcpStream` — the spec is small and the crates
 that wrap it are larger than the protocol. `aes` and `des` are pinned to the same
@@ -81,8 +82,23 @@ the frame lock the network thread is waiting on.
   the framebuffer is in physical pixels. The pointer uses `SetPhysicalCursorPos`
   instead. Beware measuring this from a DPI-unaware process — `GetCursorPos` there
   reports logical coordinates and makes a correct fix look broken.
-- **`BitBlt` does not include the cursor.** It is composited in by hand with
-  `DrawIconEx`; a remote desktop with no visible pointer is close to unusable.
+- **Neither capture route includes the cursor.** It is composited in by hand with
+  `DrawIconEx`; a remote desktop with no visible pointer is close to unusable. Both
+  routes fill the same DIB precisely so that one piece of code can do this.
+- **Desktop Duplication reports pointer-only frames.** They carry no desktop image and
+  their texture is empty, so copying one paints the screen black — which is exactly
+  what it did until `LastPresentTime` was checked. On a mostly-idle desktop these are
+  most of the frames.
+- **Duplication reports changes, so the first frame has to come from somewhere.** It
+  has nothing to report a change *from* until something is drawn, so the very first
+  capture is a `BitBlt` and duplication updates it thereafter. Without that, a client
+  connecting to an idle machine gets a black screen.
+- **Output 0 is not necessarily the primary display.** `EnumOutputs` is in the
+  adapter's order, not Windows'. The outputs are searched for one whose desktop
+  coordinates start at the origin and match the screen size, because capturing the
+  wrong monitor produces a perfectly valid image of entirely the wrong screen.
+- **The GPU picks its own row stride**, usually wider than the image. Copying
+  `width * height` in one go shears the picture; copy row by row.
 - **A DIB's top byte is undefined.** Mask it, or pixels compare unequal frame to frame
   and every tile looks changed.
 - **Scroll detection must look at the busiest column range, not the union of changed

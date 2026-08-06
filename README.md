@@ -69,6 +69,7 @@ All environment variables. There is no config file and nothing is written to dis
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
 | `VNC_RAW_ONLY=1` | Disable ZRLE and CopyRect. Answers "is it my decoder or the server?" |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
+| `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
 
 Credentials come from the environment rather than the command line, because argv is
 visible to every process on the machine.
@@ -78,7 +79,7 @@ visible to every process on the machine.
 | | |
 |---|---|
 | **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode |
-| **Server** | Screen capture with the cursor, keyboard and mouse injection, clipboard, mandatory password |
+| **Server** | Desktop Duplication capture with the cursor, keyboard and mouse injection, clipboard, mandatory password. An idle desktop costs about 20x less CPU than the `BitBlt` it falls back to |
 | **Encodings** | Raw, CopyRect, ZRLE. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
 | **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
 | **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, macOS's own client, and itself |

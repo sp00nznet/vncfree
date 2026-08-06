@@ -13,6 +13,8 @@
 | 8 | A GUI for both, so neither needs a terminal | done |
 | 9 | Go public, tag a release, attach the binaries | done |
 | 10 | CopyRect on the server: send scrolling as a move, not as pixels | done |
+| 11 | RFB 3.3, so macOS's own Screen Sharing client can connect to the server | done |
+| 12 | Desktop Duplication capture, ~20x less CPU on an idle desktop | done |
 
 ## Ideas, not commitments
 
@@ -27,9 +29,10 @@ Roughly in the order they would earn their keep:
   Desktop Duplication API rather than by searching for motion.
 - **The two remaining ZRLE subencodings.** Plain and palette RLE, on top of the solid,
   packed-palette and raw forms the encoder already produces. Bytes, not compatibility.
-- **Desktop Duplication API for capture.** GDI `BitBlt` is simple and works everywhere;
-  DXGI is faster and hands back dirty rectangles, which would pair well with the tile
-  diffing already in place.
+- **Dirty and move rectangles from Desktop Duplication.** Capture already uses it, but
+  only for pixels: it also reports exactly which regions changed and which merely
+  moved. That would replace the tile diff outright and give two-dimensional CopyRect
+  for free, rather than only vertical scrolling.
 - **Multi-monitor.** The server shares the primary display only.
 - **Following a resolution change** while a client is connected. The client already
   handles the framebuffer resizing across a reconnect; the server just never tells it.

@@ -36,7 +36,8 @@ flate2 = "1.1.9"
 minifb = "0.28.0"
 arboard = { version = "3.6.1", default-features = false }
 
-# Server only: screen capture (BitBlt into a DIB) and input injection (SendInput).
+# Screen capture, input injection and the dialogs. windows-sys is the plain binding
+# crate and is all the flat C API needs.
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
 features = [
@@ -46,6 +47,22 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_System_LibraryLoader",
+]
+
+# Desktop Duplication is COM, and windows-sys has no COM support - it would be several
+# hundred lines of hand-written vtable calls in unsafe code. The full crate brings
+# reference counting and QueryInterface, which is worth a dependency when the
+# alternative is managing COM lifetimes by hand.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # DXGI_OUTPUT_DESC carries an HMONITOR, so GetDesc needs this too.
+    "Win32_Graphics_Gdi",
 ]
 
 [profile.release]
