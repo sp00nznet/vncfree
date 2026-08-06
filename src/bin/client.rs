@@ -16,15 +16,17 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
-use des::cipher::generic_array::GenericArray;
-use des::cipher::{BlockEncrypt, KeyInit};
-use des::Des;
 use md5::{Digest, Md5};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 use num_bigint::BigUint;
 
-type Res<T> = Result<T, Box<dyn std::error::Error>>;
+use vncfree::{
+    blob, cut_text_msg, debug, from_latin1, i32r, rd, text, u16r, u32r, u8r, vnc_des, Res, Screen,
+    PIXEL_FORMAT,
+};
 
 /// Shared write half. Both the network thread (update requests) and the UI thread
 /// (input events) write to this socket, and an interleaved write would desync the
@@ -40,61 +42,11 @@ fn send(w: &Writer, bytes: &[u8]) -> Res<()> {
     Ok(())
 }
 
-fn rd<const N: usize>(s: &mut impl Read) -> Res<[u8; N]> {
-    let mut b = [0u8; N];
-    s.read_exact(&mut b)?;
-    Ok(b)
-}
-fn u8r(s: &mut impl Read) -> Res<u8> {
-    Ok(rd::<1>(s)?[0])
-}
-fn u16r(s: &mut impl Read) -> Res<u16> {
-    Ok(u16::from_be_bytes(rd::<2>(s)?))
-}
-fn u32r(s: &mut impl Read) -> Res<u32> {
-    Ok(u32::from_be_bytes(rd::<4>(s)?))
-}
-fn i32r(s: &mut impl Read) -> Res<i32> {
-    Ok(i32::from_be_bytes(rd::<4>(s)?))
-}
-fn blob(s: &mut impl Read, n: usize) -> Res<Vec<u8>> {
-    let mut v = vec![0u8; n];
-    s.read_exact(&mut v)?;
-    Ok(v)
-}
-/// A u32-prefixed string, used by RFB for error reasons and the desktop name.
-fn text(s: &mut impl Read) -> Res<String> {
-    let n = u32r(s)? as usize;
-    Ok(String::from_utf8_lossy(&blob(s, n)?).into_owned())
-}
-
-/// RFB's VNC-auth DES key: password truncated/zero-padded to 8 bytes, each byte
-/// bit-reversed. The bit reversal is the part everyone gets wrong; see tests.
-fn vnc_key(password: &str) -> [u8; 8] {
-    let mut k = [0u8; 8];
-    for (i, b) in password.bytes().take(8).enumerate() {
-        k[i] = b.reverse_bits();
-    }
-    k
-}
-
 fn vnc_auth(r: &mut impl Read, w: &mut impl Write, password: &str) -> Res<()> {
     let mut challenge = rd::<16>(r)?;
-    let cipher = Des::new(&vnc_key(password).into());
-    for chunk in challenge.chunks_mut(8) {
-        let mut b = GenericArray::clone_from_slice(chunk);
-        cipher.encrypt_block(&mut b);
-        chunk.copy_from_slice(&b);
-    }
+    vnc_des(&mut challenge, password);
     w.write_all(&challenge)?;
     Ok(())
-}
-
-/// `VNC_DEBUG=1` prints what was negotiated. Worth having permanently: when a server
-/// refuses you, the useful facts are its version, the security types it offered and
-/// which one we picked, and none of those are visible from the error alone.
-fn debug() -> bool {
-    env::var("VNC_DEBUG").is_ok()
 }
 
 /// A big-endian integer in exactly `len` bytes, left-padded with zeros. Both the
@@ -171,13 +123,6 @@ fn apple_dh_auth(r: &mut impl Read, w: &mut impl Write, username: &str, password
     w.write_all(&creds)?;
     w.write_all(&pad_be(&client_pub, key_len))?;
     Ok(())
-}
-
-struct Screen {
-    w: usize,
-    h: usize,
-    /// 0x00RRGGBB per pixel - exactly what minifb wants to blit.
-    px: Vec<u32>,
 }
 
 /// Everything needed to open the connection again after it drops.
@@ -347,14 +292,8 @@ impl Vnc {
 
         // Force our own pixel format so we never have to translate: 32bpp little-endian
         // true colour, shifts 16/8/0 => each pixel reads back as 0x00RRGGBB.
-        #[rustfmt::skip]
-        let set_format: [u8; 20] = [
-            0, 0, 0, 0,               // msg type 0 + 3 padding
-            32, 24, 0, 1,             // bpp, depth, big-endian=no, true-colour=yes
-            0, 255, 0, 255, 0, 255,   // red/green/blue max (u16 each)
-            16, 8, 0,                 // red/green/blue shift
-            0, 0, 0,                  // padding
-        ];
+        let mut set_format = vec![0u8, 0, 0, 0]; // msg type 0 + 3 padding
+        set_format.extend_from_slice(&PIXEL_FORMAT);
         w.write_all(&set_format)?;
 
         // SetEncodings, most preferred first. Raw is always last so that a server
@@ -540,30 +479,6 @@ fn key_msg(sym: u32, down: bool) -> [u8; 8] {
 fn pointer_msg(mask: u8, x: u16, y: u16) -> [u8; 6] {
     let (x, y) = (x.to_be_bytes(), y.to_be_bytes());
     [5, mask, x[0], x[1], y[0], y[1]]
-}
-
-/// ClientCutText (msg 6). RFB clipboard text is ISO 8859-1 with LF line endings, so
-/// characters outside Latin-1 become '?' and the CR of a Windows CRLF is dropped.
-fn cut_text_msg(text: &str) -> Vec<u8> {
-    let body: Vec<u8> = text
-        .chars()
-        .filter(|c| *c != '\r')
-        .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
-        .collect();
-    let mut m = vec![6, 0, 0, 0];
-    m.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    m.extend_from_slice(&body);
-    m
-}
-
-/// The reverse: Latin-1 to a Rust string, putting the CR back so Windows apps see
-/// proper line breaks when pasting.
-fn from_latin1(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|&b| b as char)
-        .collect::<String>()
-        .replace('\n', "\r\n")
 }
 
 /// Remembers the last clipboard text that crossed the link in either direction.
@@ -1090,15 +1005,6 @@ fn write_ppm(path: &str, s: &Screen) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn key_reverses_bits_and_pads() {
-        // 'A' is 0b0100_0001 -> reversed 0b1000_0010
-        assert_eq!(vnc_key("A"), [0b1000_0010, 0, 0, 0, 0, 0, 0, 0]);
-        // longer than 8 chars is truncated, not hashed
-        assert_eq!(vnc_key("abcdefghij"), vnc_key("abcdefgh"));
-        assert_eq!(vnc_key(""), [0; 8]);
-    }
 
     /// 1024-bit MODP group (RFC 2409 group 2) - same 128-byte key length a Mac uses.
     const MODP_1024: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\

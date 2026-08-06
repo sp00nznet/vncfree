@@ -3,16 +3,43 @@ name = "vncfree"
 version = "0.0.1"
 edition = "2021"
 
+# Shared RFB protocol pieces. The two binaries below are the client and the server.
+[lib]
+name = "vncfree"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vncfree"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "vncfree-server"
+path = "src/bin/server.rs"
+
 [dependencies]
+# Crypto the auth schemes need. Ciphers and 1024-bit modular exponentiation are the
+# one place where hand-rolling is reckless rather than lazy.
 aes = "0.8"
-arboard = { version = "3.6.1", default-features = false }
-# Only dep. VNC auth is DES-ECB with a bit-reversed key; hand-rolling DES is not lazy.
 des = "0.8"
-flate2 = "1.1.9"
-getrandom = "0.4.3"
 md-5 = "0.10"
-minifb = "0.28.0"
 num-bigint = "0.5.1"
+getrandom = "0.4.3"
+# ZRLE is deflate over run-length-encoded tiles.
+flate2 = "1.1.9"
+# Client only: window, and clipboard without the image-format baggage.
+minifb = "0.28.0"
+arboard = { version = "3.6.1", default-features = false }
+
+# Server only: screen capture (BitBlt into a DIB) and input injection (SendInput).
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+]
 
 [profile.release]
 opt-level = 3

@@ -1,8 +1,11 @@
 # vncfree
 
-A free, modern, open-source VNC client for Windows 11. MIT licensed. Free forever.
-No spyware, no bundled junk, no "free trial" nag screens, no telemetry, no accounts,
-no subscription, no ad-gated download.
+A free, modern, open-source VNC **client and server** for Windows 11. MIT licensed.
+Free forever. No spyware, no bundled junk, no "free trial" nag screens, no telemetry,
+no accounts, no subscription, no ad-gated download.
+
+Two self-contained executables. Run them, close them, delete them. No installer, no
+service, nothing running when you are not using it.
 
 ## Why
 
@@ -63,6 +66,7 @@ nothing is written to disk:
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
 | `VNC_RAW_ONLY=1` | Disable ZRLE and CopyRect. For "is it my decoder or the server?" |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
+| `VNC_BIND` | Server only. Where to listen; default `0.0.0.0:5900`. |
 
 **Clipboard** is shared both ways, as Latin-1 with LF endings per the RFB spec, so CRs
 are stripped on the way out and restored on the way in. The local clipboard is polled
@@ -82,6 +86,30 @@ Input notes:
   letting go of shift first can't leave a capital letter stuck down.
 - Losing window focus releases every held key. Without that, alt-tabbing while holding
   a modifier strands it down on the remote machine.
+
+## The server
+
+```powershell
+$env:VNC_PASSWORD = 'up to 8 chars'
+vncfree-server            # serves 0.0.0.0:5900
+$env:VNC_BIND = '127.0.0.1:5900'   # or pick where to listen
+```
+
+**It will not start without `VNC_PASSWORD`.** An open VNC port hands the whole desktop
+to anyone who can reach it, and defaulting to "no password" is exactly the decision
+that makes remote-access software dangerous. It offers only VNC authentication, so
+there is no unauthenticated path at all.
+
+- Captures with GDI `BitBlt` into a DIB, which already holds `0x00RRGGBB` pixels, so
+  the framebuffer needs no conversion in either direction.
+- The process is marked DPI-aware, so a 4K screen at 200% scaling is captured as real
+  3840x2160 pixels rather than a blurry upscale of 1920x1080.
+- The cursor is composited in by hand with `DrawIconEx`. `BitBlt` does not include it,
+  and a remote desktop with no visible pointer is close to unusable.
+- Only changed 64-pixel tiles are sent, with horizontally adjacent tiles merged into
+  runs. Without merging a full-screen change at 1080p is 510 separate rectangles.
+- Input is injected with `SendInput`, and the pointer with `SetPhysicalCursorPos` —
+  see the DPI note in "Known limits".
 
 ## Connecting to a Mac
 
@@ -159,7 +187,8 @@ The keysym-to-Command mapping is still spec-only — no key has yet been pressed
 | 3 | Apple Diffie-Hellman auth (type 30), so a Mac needs no setting changed | done |
 | 4 | Encodings: CopyRect and ZRLE (Raw is ~8 MB/frame at 1080p) | done |
 | 5 | Clipboard, automatic reconnect, view-only mode | done |
-| 6 | A server. This is the part people actually can't get for free. | next |
+| 6 | A server: capture, input injection, clipboard. The part nobody gives away. | done |
+| 7 | Server-side ZRLE, so the server is usable off the LAN too | next |
 
 Saved hosts were considered and dropped: a desktop shortcut with the arguments already
 does it, and a config file format is a lot of surface for no new capability.
@@ -208,6 +237,16 @@ does it, and a config file format is a lot of surface for no new capability.
   TigerVNC, but macOS Screen Sharing neither applies our `ClientCutText` to its
   pasteboard nor sends `ServerCutText` when its own clipboard changes — it appears to
   use a proprietary extension instead. `VNC_DEBUG=1` will show the message being sent.
+- **The server only sends Raw.** Fine on a LAN, painful over the internet — that is
+  milestone 7. It advertises nothing else, so any client falls back correctly.
+- The server shares the primary monitor only, and does not follow a resolution change
+  while a client is connected.
+- Windows DPI gotcha, in case it bites elsewhere: `SendInput` with
+  `MOUSEEVENTF_ABSOLUTE` maps its 0..65535 range onto the **logical** desktop, so on a
+  200% display every injected coordinate lands at half the intended position. The
+  framebuffer is in physical pixels, so the pointer uses `SetPhysicalCursorPos`
+  instead. Beware measuring this from a DPI-unaware process — `GetCursorPos` there
+  reports logical coordinates and makes a correct fix look broken.
 - No TLS. Apple DH protects the credentials in transit but not the session, and
   classic VNC auth is DES and weak by modern standards. Neither encrypts the
   framebuffer or your keystrokes — tunnel over SSH or a VPN if the link isn't trusted.
@@ -250,8 +289,10 @@ like a broken decoder (a black screen).
 cargo build --release
 ```
 
-Output is a single self-contained `target/release/vncfree.exe` with no runtime to
-install. CI builds it on every push and runs `cargo fmt --check`, `clippy -D warnings`
+Produces two self-contained executables with no runtime to install:
+`target/release/vncfree.exe` (client) and `target/release/vncfree-server.exe`. Shared
+RFB protocol pieces live in `src/lib.rs`; decoding belongs to the client and encoding
+to the server, so those stay in their own binaries. CI builds it on every push and runs `cargo fmt --check`, `clippy -D warnings`
 and the tests; pushing a `v*` tag attaches the exe to a GitHub release. GitHub Actions
 is free with unlimited minutes for public repositories, so the binary on the Releases
 page costs nothing to produce and nobody has to trust a build from anywhere else.
