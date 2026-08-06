@@ -32,8 +32,8 @@ Sibling project to [futureburn](https://github.com/sp00nznet/futureburn), same a
 free and open source, and both are fine software — the complaint above is about how
 TightVNC is *packaged*, not about its licence. If you need a mature, battle-tested
 viewer today, use TigerVNC. vncfree exists because a viewer should be a single
-executable you can drop on a machine and delete afterwards, and because the protocol
-work is shared with a server — which is the half nobody gives away.
+executable you can drop on a machine and delete afterwards — and because the server is
+the half everyone charges for, so that one is free here too.
 
 ## Use it
 
