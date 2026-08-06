@@ -111,6 +111,7 @@ authentication, so there is no unauthenticated path at all.
   there, and the traps that cost real time.
 - **[docs/testing.md](docs/testing.md)** — standing up a real server to test against,
   and the harness mistakes that make correct code look broken.
+- **[docs/roadmap.md](docs/roadmap.md)** — what is done, and what might come next.
 
 ## Building
 
@@ -121,25 +122,8 @@ cargo build --release
 Produces `target/release/vncfree.exe` and `target/release/vncfree-server.exe`, with no
 runtime to install.
 
-CI builds on every push and runs `cargo fmt --check`, `clippy -D warnings` and the
-tests; pushing a `v*` tag attaches both binaries to a GitHub release. Actions is free
-with unlimited minutes for public repositories, so the binaries on the Releases page
-cost nothing to produce and nobody has to trust a build from anywhere else.
-
-## Roadmap
-
-| # | Milestone | State |
-|---|-----------|-------|
-| 0 | RFB 3.8 handshake, VNC auth, Raw encoding, one frame to disk | done |
-| 1 | Window: continuous incremental updates on screen | done |
-| 2 | Input: keyboard + mouse back to the server | done |
-| 3 | Apple Diffie-Hellman auth, so a Mac needs no setting changed | done |
-| 4 | Encodings: CopyRect and ZRLE | done |
-| 5 | Clipboard, automatic reconnect, view-only mode | done |
-| 6 | A server: capture, input injection, clipboard | done |
-| 7 | Server-side ZRLE, so the server is usable off the LAN too | done |
-| 8 | A GUI for both, so neither needs a terminal | done |
-| 9 | Go public, tag a release, attach the binaries | next |
+Or grab them from [Releases](https://github.com/sp00nznet/vncfree/releases) — built by
+CI straight from a tag, so nobody has to trust a binary from anywhere else.
 
 ## License
 
