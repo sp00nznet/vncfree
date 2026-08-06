@@ -15,6 +15,7 @@
 | 10 | CopyRect on the server: send scrolling as a move, not as pixels | done |
 | 11 | RFB 3.3, so macOS's own Screen Sharing client can connect to the server | done |
 | 12 | Desktop Duplication capture, ~20x less CPU on an idle desktop | done |
+| 13 | Dirty and move rectangles, so the framebuffer is not diffed against itself | done |
 
 ## Ideas, not commitments
 
@@ -29,11 +30,9 @@ Roughly in the order they would earn their keep:
   Desktop Duplication API rather than by searching for motion.
 - **The two remaining ZRLE subencodings.** Plain and palette RLE, on top of the solid,
   packed-palette and raw forms the encoder already produces. Bytes, not compatibility.
-- **Dirty and move rectangles from Desktop Duplication.** Capture already uses it, but
-  only for pixels: it also reports exactly which regions changed and which merely
-  moved. That would replace the tile diff outright and give two-dimensional CopyRect
-  for free, rather than only vertical scrolling.
-- **Multi-monitor.** The server shares the primary display only.
+- **Multi-monitor.** The server shares the primary display only. Duplication is already
+  per-output, so most of the work is deciding what to do about a client that expects
+  one rectangular screen.
 - **Following a resolution change** while a client is connected. The client already
   handles the framebuffer resizing across a reconnect; the server just never tells it.
 - **Non-US keyboard layouts.** Punctuation currently comes from a static US keysym

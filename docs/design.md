@@ -99,6 +99,27 @@ the frame lock the network thread is waiting on.
   wrong monitor produces a perfectly valid image of entirely the wrong screen.
 - **The GPU picks its own row stride**, usually wider than the image. Copying
   `width * height` in one go shears the picture; copy row by row.
+- **Windows reports a *move* only for things like a dragged window.** A terminal or a
+  document scrolling comes back as ordinary dirty regions, so taking duplication's
+  report at face value throws away the scroll detection and sends megabytes of pixels
+  a CopyRect would have moved for nothing. Past an eighth of the screen changing it is
+  worth spending a comparison to go looking. Measured on a scrolling terminal, that is
+  the difference between about 170KB and 48KB per frame.
+- **Duplication's rectangles describe the desktop, which does not include the cursor.**
+  Nothing else would ever report that the pointer moved, so the cursor's own box is
+  tracked and both where it was and where it now is are repainted. Otherwise it smears
+  across the client's screen.
+
+## Checking that the rectangles are honest
+
+Trusting the capture to have reported every change is the whole point of using it, and
+also how it would fail silently: a missed region leaves stale pixels on the client with
+nothing to ever correct them. Under `VNC_DEBUG` the server does the comparison anyway
+and reports any changed pixel the rectangles did not cover.
+
+That check has to be pixel accurate. Asking whether each changed region sits inside a
+*single* rectangle reports over a hundred false alarms in a few seconds, because two
+adjacent rectangles routinely cover a region between them.
 - **A DIB's top byte is undefined.** Mask it, or pixels compare unequal frame to frame
   and every tile looks changed.
 - **Scroll detection must look at the busiest column range, not the union of changed

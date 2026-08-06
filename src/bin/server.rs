@@ -130,9 +130,11 @@ mod dxgi {
             }
         }
 
-        /// Fill `dst` with the current screen. Returns false when nothing changed
-        /// within the timeout, which leaves `dst` untouched and is not an error.
-        pub fn frame(&mut self, dst: &mut [u32]) -> Res<bool> {
+        /// Fill `dst` with the current screen and append what changed to `parts`.
+        ///
+        /// Returns false when nothing changed within the timeout, which leaves both
+        /// arguments untouched and is not an error.
+        pub fn frame(&mut self, dst: &mut [u32], parts: &mut Vec<super::Part>) -> Res<bool> {
             unsafe {
                 if self.holding {
                     // Every acquired frame must be released before the next is asked
@@ -173,10 +175,76 @@ mod dxgi {
                             .copy_from_slice(&src[y * stride..y * stride + self.w]);
                     }
                     self.context.Unmap(&self.staging, 0);
+                    self.collect(&info, parts)?;
                 }
                 // A moved pointer still changes the picture, because the cursor is
                 // composited into the framebuffer.
                 Ok(redrawn || pointer_moved)
+            }
+        }
+
+        /// Read the metadata describing what changed: which regions merely moved, and
+        /// which were redrawn. This is the whole reason for using duplication over
+        /// BitBlt - it removes the need to compare two framebuffers to find out.
+        ///
+        /// Move rectangles must come first: they describe the screen as it was being
+        /// rearranged, and the dirty rectangles are what was painted afterwards.
+        fn collect(&self, info: &DXGI_OUTDUPL_FRAME_INFO, parts: &mut Vec<super::Part>) -> Res<()> {
+            unsafe {
+                if info.TotalMetadataBufferSize == 0 {
+                    return Ok(());
+                }
+                let mut meta = vec![0u8; info.TotalMetadataBufferSize as usize];
+                let clamp = |r: windows::Win32::Foundation::RECT| {
+                    let x = r.left.max(0) as usize;
+                    let y = r.top.max(0) as usize;
+                    let right = (r.right.max(0) as usize).min(self.w);
+                    let bottom = (r.bottom.max(0) as usize).min(self.h);
+                    (x, y, right.saturating_sub(x), bottom.saturating_sub(y))
+                };
+
+                let mut used = 0u32;
+                self.dupl.GetFrameMoveRects(
+                    meta.len() as u32,
+                    meta.as_mut_ptr() as *mut DXGI_OUTDUPL_MOVE_RECT,
+                    &mut used,
+                )?;
+                let n = used as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+                // Copied out before the buffer is reused for the dirty rectangles.
+                let moves: Vec<DXGI_OUTDUPL_MOVE_RECT> =
+                    std::slice::from_raw_parts(meta.as_ptr() as *const DXGI_OUTDUPL_MOVE_RECT, n)
+                        .to_vec();
+                for m in moves {
+                    let (x, y, w, h) = clamp(m.DestinationRect);
+                    if w > 0 && h > 0 {
+                        parts.push(super::Part::Copy {
+                            x,
+                            y,
+                            w,
+                            h,
+                            sx: m.SourcePoint.x.max(0) as usize,
+                            sy: m.SourcePoint.y.max(0) as usize,
+                        });
+                    }
+                }
+
+                self.dupl.GetFrameDirtyRects(
+                    meta.len() as u32,
+                    meta.as_mut_ptr() as *mut windows::Win32::Foundation::RECT,
+                    &mut used,
+                )?;
+                let n = used as usize / std::mem::size_of::<windows::Win32::Foundation::RECT>();
+                let dirty = std::slice::from_raw_parts(
+                    meta.as_ptr() as *const windows::Win32::Foundation::RECT,
+                    n,
+                );
+                for r in dirty {
+                    let (x, y, w, h) = clamp(*r);
+                    if w > 0 && h > 0 {
+                        parts.push(super::Part::Pixels { x, y, w, h });
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -240,6 +308,10 @@ mod win {
         /// "nothing changed" on an idle desktop, which is only a safe answer once
         /// there is something to have not changed from.
         primed: bool,
+        /// Where the cursor was painted last time. Duplication describes the desktop,
+        /// which does not include the cursor, so nothing else would ever report that
+        /// the pointer moved and it would smear across the client's screen.
+        cursor: Option<(usize, usize, usize, usize)>,
     }
 
     impl Capture {
@@ -296,6 +368,7 @@ mod win {
                     bits: bits as *mut u32,
                     dxgi,
                     primed: false,
+                    cursor: None,
                 })
             }
         }
@@ -308,25 +381,30 @@ mod win {
         ///
         /// The cursor is drawn in by hand either way: neither capture route includes
         /// it, and a remote desktop with no visible pointer is close to unusable.
-        pub fn grab(&mut self, dst: &mut [u32]) -> bool {
+        pub fn grab(&mut self, dst: &mut [u32]) -> super::Frame {
             unsafe {
                 let rows = std::slice::from_raw_parts_mut(self.bits, self.w * self.h);
                 let blit = |c: &Capture| {
                     BitBlt(c.mem, 0, 0, c.w as i32, c.h as i32, c.screen, 0, 0, SRCCOPY);
                 };
 
+                let mut parts = Vec::new();
                 let mut changed = false;
+                let mut precise = self.dxgi.is_some();
+
                 // Duplication only ever reports *changes*, so the first frame has to
                 // come from somewhere. Take it from BitBlt and let duplication update
-                // it from then on.
+                // it from then on - and that first frame is a whole screen, not a set
+                // of rectangles.
                 if !self.primed {
                     blit(self);
                     self.primed = true;
                     changed = true;
+                    precise = false;
                 }
 
                 match self.dxgi.as_mut() {
-                    Some(d) => match d.frame(rows) {
+                    Some(d) => match d.frame(rows, &mut parts) {
                         Ok(moved) => changed |= moved,
                         Err(e) => {
                             // A duplication can be lost at any time - a resolution
@@ -336,50 +414,77 @@ mod win {
                             self.dxgi = None;
                             blit(self);
                             changed = true;
+                            precise = false;
                         }
                     },
                     // BitBlt cannot tell us whether anything moved, so assume it did.
                     None => {
                         blit(self);
                         changed = true;
+                        precise = false;
                     }
                 }
 
                 if !changed {
-                    return false;
+                    return super::Frame::Unchanged;
                 }
+
                 let mut ci: CURSORINFO = zeroed();
                 ci.cbSize = size_of::<CURSORINFO>() as u32;
+                let mut now = None;
                 if GetCursorInfo(&mut ci) != 0 && ci.flags == CURSOR_SHOWING {
                     let mut ii: ICONINFO = zeroed();
                     if GetIconInfo(ci.hCursor, &mut ii) != 0 {
-                        DrawIconEx(
-                            self.mem,
+                        let (x, y) = (
                             ci.ptScreenPos.x - ii.xHotspot as i32,
                             ci.ptScreenPos.y - ii.yHotspot as i32,
-                            ci.hCursor,
-                            0,
-                            0,
-                            0,
-                            null_mut(),
-                            DI_NORMAL,
                         );
+                        DrawIconEx(self.mem, x, y, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
                         if !ii.hbmColor.is_null() {
                             DeleteObject(ii.hbmColor as HGDIOBJ);
                         }
                         if !ii.hbmMask.is_null() {
                             DeleteObject(ii.hbmMask as HGDIOBJ);
                         }
+                        // A generous box rather than the exact icon size. Cursors are
+                        // small, so over-reporting costs a rounding error of pixels
+                        // and saves asking the bitmap how big it is.
+                        now = Some(self.clamp_rect(x - 4, y - 4, 136, 136));
                     }
                 }
+                // Both where it was and where it is now have to be repainted, or the
+                // old one stays on the client's screen forever.
+                if precise {
+                    for r in [self.cursor, now].into_iter().flatten() {
+                        parts.push(super::Part::Pixels {
+                            x: r.0,
+                            y: r.1,
+                            w: r.2,
+                            h: r.3,
+                        });
+                    }
+                }
+                self.cursor = now;
                 // The DIB's top byte is undefined; mask it so pixels compare equal
                 // frame to frame instead of producing phantom changes.
                 let src = std::slice::from_raw_parts(self.bits, self.w * self.h);
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d = s & 0x00FF_FFFF;
                 }
-                true
+                if precise {
+                    super::Frame::Known(parts)
+                } else {
+                    super::Frame::Unknown
+                }
             }
+        }
+
+        fn clamp_rect(&self, x: i32, y: i32, w: i32, h: i32) -> (usize, usize, usize, usize) {
+            let x0 = x.max(0) as usize;
+            let y0 = y.max(0) as usize;
+            let x1 = ((x + w).max(0) as usize).min(self.w);
+            let y1 = ((y + h).max(0) as usize).min(self.h);
+            (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
         }
     }
 
@@ -565,6 +670,17 @@ impl PixFmt {
             [b[0], b[1], b[2]]
         })
     }
+}
+
+/// What a capture managed to say about a frame.
+enum Frame {
+    /// Nothing was drawn and the pointer did not move.
+    Unchanged,
+    /// Exactly these regions moved or were repainted. Desktop Duplication knows this;
+    /// it is the reason the framebuffer no longer has to be diffed against itself.
+    Known(Vec<Part>),
+    /// The capture cannot say, so the frames have to be compared. This is BitBlt.
+    Unknown,
 }
 
 /// One piece of an update. A Copy tells the client to move something it already has,
@@ -1254,15 +1370,82 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         }
 
         let full = first || !shared.incremental.load(Ordering::Relaxed);
-        if !cap.grab(&mut cur.px) && !full {
-            // Desktop Duplication says the screen did not move, so there is nothing
-            // to diff and nothing to send. The request stays outstanding.
+        let reported = cap.grab(&mut cur.px);
+        if matches!(reported, Frame::Unchanged) && !full {
+            // The screen provably did not move, so there is nothing to diff and
+            // nothing to send. The request stays outstanding.
             continue;
         }
+        // Windows reports a *move* only for things like a dragged window. A terminal
+        // or a document scrolling comes back as ordinary dirty regions, so taking the
+        // report at face value loses the scroll detection entirely and sends megabytes
+        // of pixels that a CopyRect would have moved for nothing. Past this much
+        // change it is worth spending a comparison to go looking.
+        let trusted = match reported {
+            Frame::Known(r) => {
+                let dirty: usize = r
+                    .iter()
+                    .map(|p| match *p {
+                        Part::Pixels { w, h, .. } => w * h,
+                        _ => 0,
+                    })
+                    .sum();
+                if dirty * 8 <= w * h {
+                    Some(r)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
         let mut parts = Vec::new();
 
         if full {
             parts.push(Part::Pixels { x: 0, y: 0, w, h });
+        } else if let Some(reported) = trusted {
+            // The capture said exactly what changed, so no comparison is needed. Move
+            // rectangles are already CopyRects, in two dimensions rather than the
+            // vertical-scroll guess a diff has to make.
+            if shared.copyrect.load(Ordering::Relaxed) {
+                parts = reported;
+            } else {
+                // A client that never asked for CopyRect gets the moved regions as
+                // pixels instead; sending it an encoding it did not request is a
+                // protocol violation.
+                parts = reported
+                    .into_iter()
+                    .map(|p| match p {
+                        Part::Copy { x, y, w, h, .. } => Part::Pixels { x, y, w, h },
+                        other => other,
+                    })
+                    .collect();
+            }
+            // Trusting the capture to have told us everything is the whole point, and
+            // also the way this fails silently: a missed region leaves stale pixels on
+            // the client with nothing to correct them. Under VNC_DEBUG, do the diff
+            // anyway and complain about anything the rectangles did not cover.
+            if debug() {
+                // Pixel accurate on purpose. Asking whether each changed region sits
+                // inside a single rectangle gives false alarms whenever two adjacent
+                // rectangles cover it between them.
+                let mut covered = vec![false; w * h];
+                for p in &parts {
+                    let (px, py, pw, ph) = match *p {
+                        Part::Copy { x, y, w, h, .. } => (x, y, w, h),
+                        Part::Pixels { x, y, w, h } => (x, y, w, h),
+                    };
+                    for row in py..py + ph {
+                        covered[row * w + px..row * w + px + pw].fill(true);
+                    }
+                }
+                let missed = (0..w * h)
+                    .filter(|&i| prev.px[i] != cur.px[i] && !covered[i])
+                    .count();
+                if missed > 0 {
+                    eprintln!("[debug] {missed} changed px not covered by the reported rects");
+                }
+            }
         } else {
             let mut rects = changed_rects(&prev.px, &cur.px, w, h);
             // Worth looking for a scroll only if the change is tall enough to contain
