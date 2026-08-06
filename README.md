@@ -79,7 +79,7 @@ visible to every process on the machine.
 
 | | |
 |---|---|
-| **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode |
+| **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode. **Ctrl-Shift-V** types the local clipboard at the remote machine, for servers that will not share one |
 | **Server** | Desktop Duplication capture with the cursor, keyboard and mouse injection, clipboard, mandatory password. An idle desktop costs about 20x less CPU than the `BitBlt` it falls back to |
 | **Encodings** | Raw, CopyRect, ZRLE. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
 | **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
@@ -102,7 +102,8 @@ authentication, so there is no unauthenticated path at all.
 - **Clipboard does not work against macOS, and cannot.** It works both directions
   against TigerVNC, but macOS puts clipboard sharing on Apple Remote Desktop's own
   channel (port 3283) rather than on the VNC connection — established by watching both
-  directions and Apple's own client. See [docs/macos.md](docs/macos.md).
+  directions and Apple's own client. **Ctrl-Shift-V types the local clipboard at the
+  remote machine instead**, which works anywhere. See [docs/macos.md](docs/macos.md).
 - RFB 3.8 or later. Older servers (3.3/3.7) negotiate security differently.
 - No Tight encoding, and the server's CopyRect covers vertical scrolling but not a
   window dragged sideways. Compatibility is unaffected — these cost bytes, not

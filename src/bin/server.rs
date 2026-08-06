@@ -549,6 +549,22 @@ mod win {
         })
     }
 
+    /// Inject a keysym. `shift_held` says whether the client has told us shift is
+    /// down, because an uppercase keysym means the character, not the key: pressing
+    /// the A key without shift types a lowercase 'a'. A client typing normally sends
+    /// Shift itself, but one synthesising text - pasting, say - sends only the
+    /// character, and would otherwise get lowercase.
+    pub fn inject_key_shifted(sym: u32, down: bool, shift_held: bool) {
+        let needs_shift = (0x41..=0x5a).contains(&sym) && !shift_held;
+        if needs_shift && down {
+            inject_key(0xffe1, true);
+        }
+        inject_key(sym, down);
+        if needs_shift && !down {
+            inject_key(0xffe1, false);
+        }
+    }
+
     pub fn inject_key(sym: u32, down: bool) {
         let mut i: INPUT = unsafe { zeroed() };
         i.r#type = INPUT_KEYBOARD;
@@ -1246,6 +1262,7 @@ fn refuse(tcp: &mut TcpStream, old: bool, reason: &[u8]) -> Res<()> {
 
 fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
     let mut mask = 0u8;
+    let mut shift_held = false;
     let mut board = arboard::Clipboard::new().ok();
     while shared.alive.load(Ordering::Relaxed) {
         match u8r(tcp)? {
@@ -1287,7 +1304,11 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
             4 => {
                 let down = u8r(tcp)? != 0;
                 blob(tcp, 2)?;
-                win::inject_key(u32r(tcp)?, down);
+                let sym = u32r(tcp)?;
+                if sym == 0xffe1 || sym == 0xffe2 {
+                    shift_held = down;
+                }
+                win::inject_key_shifted(sym, down, shift_held);
             }
             5 => {
                 let now = u8r(tcp)?;

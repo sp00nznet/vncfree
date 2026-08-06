@@ -541,6 +541,37 @@ fn keysym(k: Key, shift: bool) -> Option<u32> {
     })
 }
 
+/// Longest clipboard this will type. At roughly a hundred characters a second a
+/// runaway paste is worse than no paste, and a clipboard this size is not something
+/// anyone meant to send through a keyboard.
+const MAX_TYPED: usize = 4000;
+
+/// Turn text into the keys needed to type it: each entry is a keysym and whether
+/// shift must be held for it.
+///
+/// This exists because macOS does not do clipboard over VNC at all - see
+/// docs/macos.md - so the only way to get text onto a Mac is to type it.
+///
+/// Shift is stated explicitly rather than left to the server. RFB says a keysym *is*
+/// the character, but a server that maps 'A' straight onto the A key without holding
+/// shift produces a lowercase 'a' - which is exactly what vncfree-server does, and
+/// probably not alone.
+fn typed_keys(text: &str) -> Vec<(u32, bool)> {
+    text.chars()
+        .filter(|c| *c != '\r') // CRLF arrives as one Return, not two
+        .map(|c| match c {
+            '\n' => (0xff0d, false), // Return
+            '\t' => (0xff09, false), // Tab
+            'A'..='Z' => (c as u32, true),
+            // Anything else goes as its own keysym. Servers that cannot map it to a
+            // key generally fall back to injecting the character directly, which
+            // handles punctuation and accents without a layout table here.
+            c if (c as u32) < 256 => (c as u32, false),
+            c => (0x0100_0000 + c as u32, false),
+        })
+        .collect()
+}
+
 /// Window pixel -> framebuffer pixel. AspectRatioStretch centres the image and
 /// letterboxes it, so undo the scale and the bars before reporting a position.
 fn to_fb(mx: f32, my: f32, win: (usize, usize), fb: (usize, usize)) -> (u16, u16) {
@@ -693,17 +724,85 @@ impl Input {
         // Presses before releases: a key tapped and released inside one 60fps frame
         // shows up in both lists, and handling the release first would send an up
         // with nothing held, then a down that never gets released - a stuck key.
+        let ctrl = win.is_key_down(Key::LeftCtrl) || win.is_key_down(Key::RightCtrl);
         for k in win.get_keys_pressed(KeyRepeat::Yes) {
+            // Ctrl-Shift-V types the local clipboard at the remote machine, for
+            // servers that will not share one. Deliberately not Ctrl-V or Cmd-V:
+            // those still legitimately paste the *remote* machine's own clipboard,
+            // and taking them over would break something that already works.
+            if k == Key::V && ctrl && shift {
+                // The remote thinks Ctrl and Shift are held, because they are. Let go
+                // of them there before typing, or every character arrives as a
+                // shortcut.
+                self.release_all()?;
+                self.type_clipboard()?;
+                // Sentinel: swallowed here, so nothing is sent for it and the repeat
+                // does not fire the paste again on the next frame.
+                self.held.insert(k, 0);
+                continue;
+            }
             if let Some(sym) = keysym(k, shift) {
                 self.held.insert(k, sym);
                 self.key_event(sym, true)?;
             }
         }
         for k in win.get_keys_released() {
-            if let Some(sym) = self.held.remove(&k) {
-                self.key_event(sym, false)?;
+            match self.held.remove(&k) {
+                Some(0) => {} // swallowed locally; nothing was ever sent
+                Some(sym) => self.key_event(sym, false)?,
+                None => {}
             }
         }
+        Ok(())
+    }
+
+    /// Type the local clipboard at the remote machine, one key at a time.
+    ///
+    /// The escape hatch for servers that do not share a clipboard - macOS being the
+    /// one that prompted it. Runs on its own thread: a long clipboard takes seconds
+    /// and the window must keep drawing.
+    fn type_clipboard(&mut self) -> Res<()> {
+        let Some(board) = self.board.as_mut() else {
+            return Ok(());
+        };
+        let Ok(text) = board.get_text() else {
+            return Ok(());
+        };
+        if text.is_empty() {
+            return Ok(());
+        }
+        let keys = typed_keys(&text);
+        let sent = keys.len().min(MAX_TYPED);
+        if keys.len() > MAX_TYPED {
+            eprintln!(
+                "clipboard is {} keys, typing the first {MAX_TYPED}",
+                keys.len()
+            );
+        } else if debug() {
+            eprintln!("[debug] typing {sent} key(s) from the clipboard");
+        }
+
+        let w = self.w.clone();
+        std::thread::spawn(move || {
+            for &(sym, shift) in keys.iter().take(sent) {
+                let step = || -> Res<()> {
+                    if shift {
+                        send(&w, &key_msg(0xffe1, true))?; // Shift_L
+                    }
+                    send(&w, &key_msg(sym, true))?;
+                    send(&w, &key_msg(sym, false))?;
+                    if shift {
+                        send(&w, &key_msg(0xffe1, false))?;
+                    }
+                    Ok(())
+                };
+                if step().is_err() {
+                    return; // the link went away; the reconnect will sort it out
+                }
+                // Slow enough that a remote which drops keys under load keeps up.
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        });
         Ok(())
     }
 
@@ -711,7 +810,9 @@ impl Input {
     /// modifier leaves it stuck down on the remote machine.
     fn release_all(&mut self) -> Res<()> {
         for (_, sym) in std::mem::take(&mut self.held) {
-            self.key_event(sym, false)?;
+            if sym != 0 {
+                self.key_event(sym, false)?;
+            }
         }
         Ok(())
     }
@@ -1501,6 +1602,32 @@ mod tests {
         assert_eq!(from_latin1(b"a\nb"), "a\r\nb");
         assert_eq!(from_latin1(&[0xe9]), "\u{e9}");
         assert_eq!(from_latin1(b""), "");
+    }
+
+    /// Typing the clipboard is the only way to get text onto a Mac, so the conversion
+    /// has to be right for the characters people actually paste.
+    #[test]
+    fn clipboard_text_becomes_typeable_keys() {
+        assert_eq!(typed_keys("ab"), [(0x61, false), (0x62, false)]);
+        // Uppercase says shift explicitly; a server that maps 'A' to the A key
+        // without it types a lowercase 'a'.
+        assert_eq!(typed_keys("Hi"), [(0x48, true), (0x69, false)]);
+        // A Windows CRLF is one Return, not a stray carriage return as well.
+        assert_eq!(
+            typed_keys("a\r\nb"),
+            [(0x61, false), (0xff0d, false), (0x62, false)]
+        );
+        assert_eq!(typed_keys("\t"), [(0xff09, false)]);
+        // Punctuation goes as its own keysym and is left to the server to place.
+        assert_eq!(typed_keys("!"), [(0x21, false)]);
+        assert_eq!(
+            typed_keys("\u{e9}"),
+            [(0xe9, false)],
+            "latin-1 is its own keysym"
+        );
+        // Beyond Latin-1, RFB adds 0x01000000 to the code point.
+        assert_eq!(typed_keys("\u{4e2d}"), [(0x0100_4e2d, false)]);
+        assert!(typed_keys("").is_empty());
     }
 
     #[test]

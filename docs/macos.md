@@ -93,6 +93,21 @@ ship alongside VNC, not an extension of it.
 If you have SSH to the Mac (likely, if you are administering it), a small bridge using
 `pbcopy` and `pbpaste` is a far better use of the effort than reverse engineering 3283.
 
+### Getting text onto a Mac anyway: Ctrl-Shift-V
+
+Since typing *is* something the protocol does, the client can type the clipboard
+instead of sharing it. Copy on Windows, focus the vncfree window, press
+**Ctrl-Shift-V**, and the text is sent one key at a time.
+
+Deliberately not Cmd-V or Ctrl-V. Those still legitimately paste the *remote*
+machine's own clipboard, which works, and taking them over would break something that
+already worked. The modifiers you are holding are released on the remote first, or
+every character would arrive as a shortcut.
+
+It types at about a hundred characters a second and stops at 4000, so it is for a
+password or a URL or a block of config, not for moving a file around. Text only, and
+the remote has to have focus somewhere that accepts typing.
+
 ## Apple's pseudo-encodings
 
 Captured by pointing macOS's Screen Sharing client at `vncfree-server` and logging what
