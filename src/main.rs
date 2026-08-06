@@ -279,11 +279,16 @@ impl Vnc {
                 return Err(format!(
                     "authentication failed: {why}\n\
                      The Diffie-Hellman exchange completed, so the Mac read our \
-                     credentials and refused them. Check, on the Mac:\n\
-                     - the account's short name (run `whoami`), not its full name\n\
-                     - System Settings > General > Sharing > Screen Sharing > (i): \
-                     'Allow access for' must include that account\n\
-                     - that the account has a password set and can log in normally"
+                     credentials and refused them. A macOS account that logs in fine \
+                     locally is still refused here unless it is separately authorised \
+                     for remote access. On the Mac:\n\
+                     - grant access to every account:\n    \
+                     sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app\\\n      \
+                     /Contents/Resources/kickstart -configure -allowAccessFor -allUsers \
+                     -privs -all -restart -agent\n\
+                     - or System Settings > General > Sharing > Remote Management (or \
+                     Screen Sharing) > (i), add the account and tick Observe/Control\n\
+                     - use the account's short name (`whoami`), not its full name"
                 )
                 .into());
             }

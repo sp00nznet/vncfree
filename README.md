@@ -36,9 +36,8 @@ work is shared with a server — which is the half nobody gives away.
 ## Status
 
 Milestone 4 — **done**. A usable remote desktop: live window, keyboard and mouse, Mac
-support with no settings changed on the Mac, and ZRLE compression so it is usable over
-a real network. Verified end to end against a real TigerVNC server (the Apple auth path
-is unit-tested only — see the Mac section).
+support, and ZRLE compression so it is usable over a real network. Verified end to end
+against both a real TigerVNC server and real macOS 15.7.3 Screen Sharing.
 
 ```
 # live window, full control
@@ -91,12 +90,42 @@ passwords are DES and effectively 8 characters, silently truncated beyond that.
 The Windows key sends `Super_L`, which macOS maps to **Command** — so Cmd-C and Cmd-Tab
 work from a Windows keyboard. Alt sends `Alt_L`, which arrives as Option.
 
-**Not yet confirmed against a physical Mac.** The Apple DH implementation is verified by
-a round-trip test that plays the server side (proving the DH maths, the MD5-to-AES key
-derivation and the blob layout), and its wire order matches both the RFB protocol
-document and the gtk-vnc-derived description at
-[cafbit.com](https://cafbit.com/post/apple_remote_desktop_quirks/). The keysym-to-Command
-mapping is likewise from the spec. Both want a real Mac to confirm.
+### If the Mac says "Authentication or authorization failure"
+
+This appears *after* the Diffie-Hellman exchange has already succeeded, so it means the
+Mac read your credentials and refused them — not that anything is wrong with the
+protocol. The cause is almost always Remote Management's own access list.
+
+**Being in the `com.apple.access_screensharing` group is not sufficient.** On macOS
+15.7.3 an account that could SSH in, was an admin, and was in that group was still
+refused. What fixed it was System Settings > General > Sharing > **Remote Management** >
+ⓘ, switching "Allow access for" from *All users* to *Only these users* with the account
+listed explicitly. Ticking Observe/Control for the account is worth checking too.
+
+The equivalent from a terminal:
+
+```bash
+sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+  -configure -users <shortname> -access -on -privs -all -restart -agent
+```
+
+If the security types offered include 33/35/36 but not 2, it is Remote Management that
+is switched on rather than Screen Sharing. Run with `VNC_DEBUG=1` to see the server
+version, the types offered and which one was chosen — none of that is otherwise visible.
+
+### Verification status
+
+**Confirmed working against real macOS 15.7.3 (Sequoia).** The server announces
+`RFB 003.889`, we negotiate down to 3.8, it offers `[30, 33, 36, 35]`, we select 30, the
+Diffie-Hellman exchange completes with generator 2 and a 128-byte key, and the session
+authenticates and delivers a 1920x1080 desktop.
+
+The crypto is additionally covered by a round-trip test that plays the server side
+(proving the DH maths, MD5-to-AES key derivation and blob layout), and the wire format
+matches [neatvnc](https://github.com/any1/neatvnc)'s server-side implementation and the
+[RFB protocol document](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst).
+
+The keysym-to-Command mapping is still spec-only — no key has yet been pressed on a Mac.
 
 ## Roadmap
 
@@ -145,9 +174,9 @@ mapping is likewise from the spec. Both want a real Mac to confirm.
 - Encodings are Raw, CopyRect and ZRLE. No Tight — it needs four persistent zlib
   streams and a JPEG decoder, and ZRLE gets most of the win. If a server offers Tight
   but not ZRLE we fall back to Raw and still work, just slowly.
-- ZRLE raw-tile and large-palette decoding is covered by unit tests but has not been
-  exercised against a live server yet; the test server could only be made to produce
-  two-colour screens. A real desktop with a photo wallpaper would cover it.
+- ZRLE is verified on a real 1920x1080 macOS desktop (all 256 byte values present, so
+  raw tiles and large palettes are genuinely exercised), decoding to a pixel-accurate
+  image.
 - US keyboard layout. Non-US punctuation needs minifb's character callback rather than
   the static keysym table.
 - No TLS. Apple DH protects the credentials in transit but not the session, and
