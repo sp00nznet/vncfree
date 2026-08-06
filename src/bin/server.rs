@@ -798,10 +798,28 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
         eprintln!("[debug] client speaks {ver:?}");
     }
 
+    // The client picks the version, and may pick one older than ours. macOS's own
+    // Screen Sharing client asks for 3.3, so refusing it would lock out the viewer
+    // built into every Mac.
+    let minor: u32 = ver
+        .strip_prefix("RFB 003.")
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(3);
+    let old = minor < 7;
+
     // --- security: VNC auth only, because a password is always required ---
-    tcp.write_all(&[1, 2])?; // one type on offer: 2 = VNC auth
-    if u8r(&mut tcp)? != 2 {
-        return refuse(&mut tcp, b"vncfree-server only offers VNC authentication");
+    if old {
+        // 3.3 has no negotiation: the server states the type as a u32, and that is it.
+        tcp.write_all(&2u32.to_be_bytes())?;
+    } else {
+        tcp.write_all(&[1, 2])?; // a list of one: 2 = VNC auth
+        if u8r(&mut tcp)? != 2 {
+            return refuse(
+                &mut tcp,
+                old,
+                b"vncfree-server only offers VNC authentication",
+            );
+        }
     }
 
     let mut challenge = [0u8; 16];
@@ -811,7 +829,7 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
     let mut expected = challenge;
     vnc_des(&mut expected, password);
     if answer != expected {
-        return refuse(&mut tcp, b"authentication failed");
+        return refuse(&mut tcp, old, b"authentication failed");
     }
     tcp.write_all(&0u32.to_be_bytes())?; // SecurityResult: OK
 
@@ -852,10 +870,14 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
     result
 }
 
-fn refuse(tcp: &mut TcpStream, reason: &[u8]) -> Res<()> {
+/// Say no. RFB 3.7 added the explanatory string; sending one to a 3.3 client would be
+/// unexpected bytes on a connection it thinks is finished.
+fn refuse(tcp: &mut TcpStream, old: bool, reason: &[u8]) -> Res<()> {
     tcp.write_all(&1u32.to_be_bytes())?;
-    tcp.write_all(&(reason.len() as u32).to_be_bytes())?;
-    tcp.write_all(reason)?;
+    if !old {
+        tcp.write_all(&(reason.len() as u32).to_be_bytes())?;
+        tcp.write_all(reason)?;
+    }
     Err(String::from_utf8_lossy(reason).into_owned().into())
 }
 
@@ -921,7 +943,21 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
                     let _ = b.set_text(text);
                 }
             }
-            other => return Err(format!("unknown client message type {other}").into()),
+            other => {
+                // We cannot skip a message whose length we do not know, so this ends
+                // the connection either way. Dump what follows first: an unrecognised
+                // type is exactly how a proprietary extension announces itself, and
+                // the bytes are the only record of it.
+                if debug() {
+                    let mut peek = [0u8; 64];
+                    let n = std::io::Read::read(tcp, &mut peek).unwrap_or(0);
+                    eprintln!(
+                        "[debug] unknown client message type {other}, next {n} bytes: {:02x?}",
+                        &peek[..n]
+                    );
+                }
+                return Err(format!("unknown client message type {other}").into());
+            }
         }
     }
     Ok(())

@@ -81,7 +81,10 @@ visible to every process on the machine.
 | **Server** | Screen capture with the cursor, keyboard and mouse injection, clipboard, mandatory password |
 | **Encodings** | Raw, CopyRect, ZRLE. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
 | **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
-| **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, and itself |
+| **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, macOS's own client, and itself |
+
+The server speaks RFB 3.3 as well as 3.8, so **the viewer built into every Mac can
+connect to it** — Screen Sharing.app asks for 3.3 and would otherwise be locked out.
 
 **The server will not start without a password.** An open VNC port hands the whole
 desktop to anyone who can reach it, and defaulting to "no password" is exactly the
@@ -94,8 +97,10 @@ authentication, so there is no unauthenticated path at all.
   classic VNC auth is DES and weak by modern standards. Neither encrypts the
   framebuffer or your keystrokes — **tunnel over SSH or a VPN if the link isn't
   trusted**, and don't port-forward this to the internet.
-- **Clipboard does not work against macOS.** It works both directions against TigerVNC,
-  but macOS appears to use a proprietary extension. See [docs/macos.md](docs/macos.md).
+- **Clipboard does not work against macOS, and cannot.** It works both directions
+  against TigerVNC, but macOS puts clipboard sharing on Apple Remote Desktop's own
+  channel (port 3283) rather than on the VNC connection — established by watching both
+  directions and Apple's own client. See [docs/macos.md](docs/macos.md).
 - RFB 3.8 or later. Older servers (3.3/3.7) negotiate security differently.
 - No Tight encoding, and the server's CopyRect covers vertical scrolling but not a
   window dragged sideways. Compatibility is unaffected — these cost bytes, not

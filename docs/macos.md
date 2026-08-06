@@ -66,7 +66,61 @@ The crypto is additionally covered by a round-trip test that plays the server si
 matches [neatvnc](https://github.com/any1/neatvnc)'s server-side implementation and the
 [RFB protocol document](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst).
 
-**Clipboard does not work against macOS.** It is verified working both directions
-against TigerVNC, but macOS Screen Sharing neither applies our `ClientCutText` to its
-pasteboard nor sends `ServerCutText` when its own clipboard changes — it appears to use
-a proprietary extension instead. `VNC_DEBUG=1` shows the message going out.
+## Clipboard: why it cannot work over VNC
+
+**macOS clipboard sharing is not part of its VNC service.** This was chased down rather
+than guessed at, and the conclusion is that no amount of RFB work will get it.
+
+What was established:
+
+1. Our `ClientCutText` reaches the Mac (`VNC_DEBUG=1` shows it sent) and is ignored.
+   The same message works both directions against TigerVNC, so the message itself is
+   correct.
+2. macOS never sends `ServerCutText`, however much its pasteboard changes.
+3. Pointing macOS's **own** Screen Sharing client at `vncfree-server` and changing the
+   Mac's clipboard produced no clipboard message either — not the standard one, and
+   nothing unrecognised. Apple's client does not put the clipboard on the RFB
+   connection at all.
+4. The Mac listens on **port 3283, TCP and UDP**, alongside 5900. That is Apple Remote
+   Desktop's control channel, and it is where clipboard, file transfer and remote
+   commands live.
+
+Both directions being silent is the tell: there is nothing to decode on 5900, because
+the clipboard was never there. Supporting it would mean implementing Apple's
+proprietary, undocumented ARD protocol on 3283 — a different protocol that happens to
+ship alongside VNC, not an extension of it.
+
+If you have SSH to the Mac (likely, if you are administering it), a small bridge using
+`pbcopy` and `pbpaste` is a far better use of the effort than reverse engineering 3283.
+
+## Apple's pseudo-encodings
+
+Captured by pointing macOS's Screen Sharing client at `vncfree-server` and logging what
+it asked for:
+
+```
+1011, 1002, 6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110
+```
+
+`6` is zlib, `16` is ZRLE, `-239` is Cursor and `-223` is DesktopSize. The rest are
+Apple's own. Advertising them to the Mac's server makes it send them, and their bodies
+begin with a `u16` length, so they can be stepped over without understanding them.
+Decoded so far:
+
+| Encoding | Contents |
+|---|---|
+| 1104 | Cursor. Rectangle carries the hotspot and size, with an empty body. |
+| 1105 | Display geometry: pixel size, a scale factor as an IEEE-754 double, display id. |
+| 1107 | Four 4-byte entries `10 08 fd 00` … `fd 03`. Looks like a capability list. |
+| 1109 | Keyboard layout, as the string `com.apple.keylayout.US`. |
+| 1110 | Machine model, as the string `iMacPro1,1`. |
+
+None of them is the clipboard. They are recorded here because working this out took a
+live Mac, and the next person should not have to repeat it.
+
+## Talking to Apple's client
+
+`vncfree-server` speaks RFB 3.3 as well as 3.8, because macOS's Screen Sharing client
+asks for **3.3** and 3.3 has no security negotiation — the server states the type as a
+`u32` and that is that. Without it, every Mac's built-in viewer is locked out. With it,
+Screen Sharing.app connects and renders happily over ZRLE.

@@ -18,9 +18,10 @@
 
 Roughly in the order they would earn their keep:
 
-- **Clipboard against macOS.** Works both directions against TigerVNC; macOS appears to
-  use a proprietary extension instead of the standard messages. Needs reverse
-  engineering, or Apple's extended clipboard pseudo-encoding.
+- ~~**Clipboard against macOS.**~~ Investigated and closed: macOS runs clipboard
+  sharing over Apple Remote Desktop's channel on port 3283, not over VNC at all, so
+  there is nothing to implement on the RFB side. See [macos.md](macos.md). A bridge
+  over SSH using `pbcopy`/`pbpaste` would be a fraction of the effort if it is wanted.
 - **Two-dimensional motion.** CopyRect currently covers vertical scrolling. A window
   dragged sideways still costs pixels. Best solved by taking move rectangles from the
   Desktop Duplication API rather than by searching for motion.

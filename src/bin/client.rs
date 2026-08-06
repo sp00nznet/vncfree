@@ -352,15 +352,15 @@ impl Vnc {
         // ponytail: no Tight. It needs four persistent zlib streams and a JPEG
         // decoder, and ZRLE already gets most of the win. Add it if a real server
         // turns out to offer Tight but not ZRLE.
-        let encodings: &[i32] = if env::var("VNC_RAW_ONLY").is_ok() {
+        let encodings: Vec<i32> = if env::var("VNC_RAW_ONLY").is_ok() {
             eprintln!("VNC_RAW_ONLY set: requesting Raw only");
-            &[0]
+            vec![0]
         } else {
-            &[16, 1, 0] // ZRLE, CopyRect, Raw
+            vec![16, 1, 0] // ZRLE, CopyRect, Raw
         };
         w.write_all(&[2, 0])?;
         w.write_all(&(encodings.len() as u16).to_be_bytes())?;
-        for e in encodings {
+        for e in &encodings {
             w.write_all(&e.to_be_bytes())?;
         }
 
@@ -424,7 +424,21 @@ impl Vnc {
                 self.paste(from_latin1(&body));
                 Ok(false)
             }
-            other => Err(format!("unexpected server message type {other}").into()),
+            other => {
+                // A message whose length we do not know cannot be skipped, so this
+                // ends the session either way. Dump what follows first: an
+                // unrecognised type is exactly how a proprietary extension announces
+                // itself, and these bytes are the only record of it.
+                if debug() {
+                    let mut peek = [0u8; 64];
+                    let n = std::io::Read::read(&mut self.r, &mut peek).unwrap_or(0);
+                    eprintln!(
+                        "[debug] unknown server message type {other}, next {n} bytes: {:02x?}",
+                        &peek[..n]
+                    );
+                }
+                Err(format!("unexpected server message type {other}").into())
+            }
         }
     }
 }
@@ -855,7 +869,19 @@ impl Decoder {
             0 => self.raw(r, s, x, y, w, h),
             1 => self.copy_rect(r, s, x, y, w, h),
             16 => self.zrle(r, s, x, y, w, h),
-            _ => Err(format!("encoding {enc} not implemented").into()),
+            _ => {
+                // Anything else carries a body whose length only that encoding
+                // defines, so the stream cannot be resynchronised. Record it first.
+                if debug() {
+                    let mut peek = [0u8; 64];
+                    let n = std::io::Read::read(r, &mut peek).unwrap_or(0);
+                    eprintln!(
+                        "[debug] encoding {enc}: rect {x},{y} {w}x{h}, next {n} bytes: {:02x?}",
+                        &peek[..n]
+                    );
+                }
+                Err(format!("encoding {enc} not implemented").into())
+            }
         }
     }
 
