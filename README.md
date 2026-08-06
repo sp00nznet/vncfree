@@ -1,25 +1,44 @@
 # vncfree
 
-A free VNC client for Windows. No subscription, no ad-gated download, no account.
+A free, modern, open-source VNC client for Windows 11. MIT licensed. Free forever.
+No spyware, no bundled junk, no "free trial" nag screens, no telemetry, no accounts,
+no subscription, no ad-gated download.
 
 ## Why
 
-RealVNC puts its **server** behind a subscription. UltraVNC's download page makes you
-sit through an ad. VNC is a 1998 protocol with a published spec — nobody should be
-renting it to you.
+The state of free VNC software in 2026 is a disgrace.
 
-**Honest caveat, up front:** free VNC *viewers* already exist and are genuinely good —
-[TigerVNC](https://tigervnc.org) and [TightVNC](https://www.tightvnc.com) both ship
-free, open-source, ad-free Windows viewers. If you just need to connect to something
-today, use one of those. The real gap is on the *server* side, which is exactly what
-RealVNC charges for. This repo is a from-scratch viewer first, because the protocol
-work is shared with a server and it's the easier half to get right.
+RealVNC puts its **server** behind a subscription. UltraVNC makes you sit through an
+ad to download it. TightVNC's Windows installer pushes a server on you when all you
+wanted was a viewer. Meanwhile the "premium" options charge a recurring fee for
+software that has not meaningfully changed since 2008.
+
+This shouldn't be a market. RFB is a published protocol from 1998. The spec is a few
+dozen pages, it is stable, and it is free to read. Remote desktop is a solved
+engineering problem.
+
+So here's the deal: vncfree is MIT licensed, the code lives on GitHub, and anyone can
+build it, fork it, ship it or audit it. It is one self-contained `.exe` — no
+installer, no service, no server pushed on you, nothing running when you close the
+window. **If anyone tries to sell you this software, they're scamming you. Walk away.**
+
+Sibling project to [futureburn](https://github.com/sp00nznet/futureburn), same attitude.
+
+### Prior art, credit where due
+
+[TigerVNC](https://tigervnc.org) and [TightVNC](https://www.tightvnc.com) are genuinely
+free and open source, and both are fine software — the complaint above is about how
+TightVNC is *packaged*, not about its licence. If you need a mature, battle-tested
+viewer today, use TigerVNC. vncfree exists because a viewer should be a single
+executable you can drop on a machine and delete afterwards, and because the protocol
+work is shared with a server — which is the half nobody gives away.
 
 ## Status
 
-Milestone 3 — **done**. A usable remote desktop: live window, keyboard and mouse, and
-Mac support with no settings changed on the Mac. Verified end to end against a real
-TigerVNC server (the Apple auth path is unit-tested only — see the Mac section).
+Milestone 4 — **done**. A usable remote desktop: live window, keyboard and mouse, Mac
+support with no settings changed on the Mac, and ZRLE compression so it is usable over
+a real network. Verified end to end against a real TigerVNC server (the Apple auth path
+is unit-tested only — see the Mac section).
 
 ```
 # live window, full control
@@ -87,8 +106,8 @@ mapping is likewise from the spec. Both want a real Mac to confirm.
 | 1 | Window: continuous incremental updates on screen | done |
 | 2 | Input: keyboard + mouse back to the server | done |
 | 3 | Apple Diffie-Hellman auth (type 30), so a Mac needs no setting changed | done |
-| 4 | Encodings: CopyRect, then Tight or ZRLE (Raw is ~8 MB/frame at 1080p) | next |
-| 5 | Quality-of-life: reconnect, scaling, clipboard, saved hosts | |
+| 4 | Encodings: CopyRect and ZRLE (Raw is ~8 MB/frame at 1080p) | done |
+| 5 | Quality-of-life: reconnect, scaling, clipboard, saved hosts | next |
 | 6 | Maybe a server. This is the part people actually can't get for free. | |
 
 ## Design notes
@@ -113,12 +132,22 @@ mapping is likewise from the spec. Both want a real Mac to confirm.
 - Input presses are processed before releases. A key tapped and released inside a
   single 60fps frame appears in both lists, and handling the release first sends an up
   against an empty held-map followed by a down that never gets released.
+- ZRLE's zlib stream spans the whole connection, not one rectangle. A decoder that
+  resets it per rectangle decodes the first one correctly and then emits garbage
+  forever, so the inflater lives in `Decoder` alongside the connection.
+- `VNC_RAW_ONLY=1` forces Raw and disables ZRLE and CopyRect. When a screen looks
+  wrong, this answers "is it my decoder or the server?" in one run.
 - Deliberate shortcuts are marked `// ponytail:` in the source with their upgrade path.
 
 ## Known limits
 
 - RFB 3.8 or later. Older servers (3.3/3.7) negotiate security differently.
-- Raw encoding only — fine on a LAN, painful over the internet. That's milestone 4.
+- Encodings are Raw, CopyRect and ZRLE. No Tight — it needs four persistent zlib
+  streams and a JPEG decoder, and ZRLE gets most of the win. If a server offers Tight
+  but not ZRLE we fall back to Raw and still work, just slowly.
+- ZRLE raw-tile and large-palette decoding is covered by unit tests but has not been
+  exercised against a live server yet; the test server could only be made to produce
+  two-colour screens. A real desktop with a photo wallpaper would cover it.
 - US keyboard layout. Non-US punctuation needs minifb's character callback rather than
   the static keysym table.
 - No TLS. Apple DH protects the credentials in transit but not the session, and
@@ -159,4 +188,5 @@ like a broken decoder (a black screen).
 
 ## License
 
-TBD — will be MIT or BSD-2. The whole point is that nobody pays for this.
+MIT. See [LICENSE](LICENSE). Free forever, for everyone. The whole point is that
+nobody pays for this.

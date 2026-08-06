@@ -7,6 +7,7 @@ edition = "2021"
 aes = "0.8"
 # Only dep. VNC auth is DES-ECB with a bit-reversed key; hand-rolling DES is not lazy.
 des = "0.8"
+flate2 = "1.1.9"
 getrandom = "0.4.3"
 md-5 = "0.10"
 minifb = "0.28.0"

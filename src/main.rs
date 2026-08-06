@@ -165,6 +165,7 @@ struct Vnc {
     w: Writer,
     screen: Screen,
     name: String,
+    dec: Decoder,
 }
 
 fn main() -> Res<()> {
@@ -271,13 +272,25 @@ impl Vnc {
         ];
         w.write_all(&set_format)?;
 
-        // SetEncodings: Raw only for now. Every server must support it.
-        // ponytail: add CopyRect/Tight once bandwidth matters (milestone 3).
-        w.write_all(&[2, 0, 0, 1])?;
-        w.write_all(&0i32.to_be_bytes())?;
+        // SetEncodings, most preferred first. Raw is always last so that a server
+        // supporting neither of the others still works - the fallback is automatic.
+        // ponytail: no Tight. It needs four persistent zlib streams and a JPEG
+        // decoder, and ZRLE already gets most of the win. Add it if a real server
+        // turns out to offer Tight but not ZRLE.
+        let encodings: &[i32] = if env::var("VNC_RAW_ONLY").is_ok() {
+            eprintln!("VNC_RAW_ONLY set: requesting Raw only");
+            &[0]
+        } else {
+            &[16, 1, 0] // ZRLE, CopyRect, Raw
+        };
+        w.write_all(&[2, 0])?;
+        w.write_all(&(encodings.len() as u16).to_be_bytes())?;
+        for e in encodings {
+            w.write_all(&e.to_be_bytes())?;
+        }
 
         let screen = Screen { w: width, h: height, px: vec![0; width * height] };
-        Ok(Vnc { r, w: Arc::new(Mutex::new(w)), screen, name })
+        Ok(Vnc { r, w: Arc::new(Mutex::new(w)), screen, name, dec: Decoder::new() })
     }
 
     /// Ask for the whole screen. Incremental means "only what changed" - the server
@@ -300,7 +313,7 @@ impl Vnc {
                 let _pad = u8r(&mut self.r)?;
                 let rects = u16r(&mut self.r)?;
                 for _ in 0..rects {
-                    read_rect(&mut self.r, &mut self.screen)?;
+                    self.dec.rect(&mut self.r, &mut self.screen)?;
                 }
                 Ok(true)
             }
@@ -553,28 +566,213 @@ fn run_window(mut vnc: Vnc) -> Res<()> {
     Ok(())
 }
 
-fn read_rect(r: &mut impl Read, s: &mut Screen) -> Res<()> {
-    let x = u16r(r)? as usize;
-    let y = u16r(r)? as usize;
-    let w = u16r(r)? as usize;
-    let h = u16r(r)? as usize;
-    let enc = i32r(r)?;
-    if enc != 0 {
-        return Err(format!("encoding {enc} not implemented (Raw only)").into());
-    }
-    if x + w > s.w || y + h > s.h {
-        return Err(format!("rect {x},{y} {w}x{h} outside {}x{} framebuffer", s.w, s.h).into());
-    }
-    let data = blob(r, w * h * 4)?;
-    for row in 0..h {
-        for col in 0..w {
-            let p = (row * w + col) * 4;
-            // Little-endian 32bpp with shifts 16/8/0 => bytes are B,G,R,pad.
-            let rgb = (data[p + 2] as u32) << 16 | (data[p + 1] as u32) << 8 | data[p] as u32;
-            s.px[(y + row) * s.w + x + col] = rgb;
+// ---------------------------------------------------------------- decoding
+
+/// A ZRLE "compressed pixel". Our pixel format puts all the colour in the low 3
+/// bytes, so CPIXELs drop the unused fourth byte: little-endian B, G, R.
+fn cpixel(r: &mut impl Read) -> Res<u32> {
+    let b = rd::<3>(r)?;
+    Ok((b[2] as u32) << 16 | (b[1] as u32) << 8 | b[0] as u32)
+}
+
+/// A ZRLE run length: one more than the sum of the bytes, where 255 means "keep
+/// reading". So a run of 256 arrives as 255, 0.
+fn run_len(r: &mut impl Read) -> Res<usize> {
+    let mut len = 1usize;
+    loop {
+        let b = u8r(r)?;
+        len += b as usize;
+        if b != 255 {
+            return Ok(len);
         }
     }
+}
+
+struct Decoder {
+    /// ZRLE's zlib stream spans the whole connection, not one rectangle. Resetting
+    /// it per rectangle decodes the first one and then produces garbage forever.
+    zlib: flate2::Decompress,
+}
+
+impl Decoder {
+    fn new() -> Decoder {
+        Decoder { zlib: flate2::Decompress::new(true) }
+    }
+
+    fn rect(&mut self, r: &mut impl Read, s: &mut Screen) -> Res<()> {
+        let x = u16r(r)? as usize;
+        let y = u16r(r)? as usize;
+        let w = u16r(r)? as usize;
+        let h = u16r(r)? as usize;
+        let enc = i32r(r)?;
+        if x + w > s.w || y + h > s.h {
+            return Err(format!("rect {x},{y} {w}x{h} outside {}x{} framebuffer", s.w, s.h).into());
+        }
+        match enc {
+            0 => self.raw(r, s, x, y, w, h),
+            1 => self.copy_rect(r, s, x, y, w, h),
+            16 => self.zrle(r, s, x, y, w, h),
+            _ => Err(format!("encoding {enc} not implemented").into()),
+        }
+    }
+
+    fn raw(&mut self, r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) -> Res<()> {
+        let data = blob(r, w * h * 4)?;
+        for row in 0..h {
+            for col in 0..w {
+                let p = (row * w + col) * 4;
+                // Little-endian 32bpp with shifts 16/8/0 => bytes are B,G,R,pad.
+                let rgb = (data[p + 2] as u32) << 16 | (data[p + 1] as u32) << 8 | data[p] as u32;
+                s.px[(y + row) * s.w + x + col] = rgb;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy a block already on screen somewhere else - what a server sends when you
+    /// drag a window or scroll. Source and destination overlap constantly, so the
+    /// rows go via a scratch buffer rather than being copied in place.
+    fn copy_rect(&mut self, r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) -> Res<()> {
+        let sx = u16r(r)? as usize;
+        let sy = u16r(r)? as usize;
+        if sx + w > s.w || sy + h > s.h {
+            return Err(format!("copyrect source {sx},{sy} {w}x{h} is off-screen").into());
+        }
+        let mut tmp = Vec::with_capacity(w * h);
+        for row in 0..h {
+            let o = (sy + row) * s.w + sx;
+            tmp.extend_from_slice(&s.px[o..o + w]);
+        }
+        for row in 0..h {
+            let o = (y + row) * s.w + x;
+            s.px[o..o + w].copy_from_slice(&tmp[row * w..(row + 1) * w]);
+        }
+        Ok(())
+    }
+
+    /// Feed one rectangle's bytes through the connection-wide zlib stream.
+    fn inflate(&mut self, input: &[u8], expect: usize) -> Res<Vec<u8>> {
+        let mut out = Vec::with_capacity(expect + 4096);
+        let mut consumed = 0;
+        loop {
+            // decompress_vec only writes into spare capacity; it never grows the Vec.
+            if out.len() == out.capacity() {
+                out.reserve(expect.max(4096));
+            }
+            let (in0, out0) = (self.zlib.total_in(), self.zlib.total_out());
+            self.zlib.decompress_vec(
+                &input[consumed..],
+                &mut out,
+                flate2::FlushDecompress::None,
+            )?;
+            consumed += (self.zlib.total_in() - in0) as usize;
+            // No input taken and no output produced means the stream is drained.
+            if self.zlib.total_in() == in0 && self.zlib.total_out() == out0 {
+                return Ok(out);
+            }
+        }
+    }
+
+    fn zrle(&mut self, r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) -> Res<()> {
+        let n = u32r(r)? as usize;
+        let compressed = blob(r, n)?;
+        let data = self.inflate(&compressed, w * h * 3)?;
+        let mut d: &[u8] = &data;
+        // 64x64 tiles in raster order; the right and bottom edges may be smaller.
+        for ty in (0..h).step_by(64) {
+            for tx in (0..w).step_by(64) {
+                let tw = (w - tx).min(64);
+                let th = (h - ty).min(64);
+                zrle_tile(&mut d, s, x + tx, y + ty, tw, th)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One ZRLE tile. The leading byte says how it is encoded: bit 7 means RLE, and the
+/// low 7 bits are the palette size (0 meaning no palette).
+fn zrle_tile(r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) -> Res<()> {
+    let sub = u8r(r)?;
+    let rle = sub & 0x80 != 0;
+    let palette_size = (sub & 0x7f) as usize;
+    let mut put = |i: usize, c: u32| s.px[(y + i / w) * s.w + x + i % w] = c;
+
+    match (rle, palette_size) {
+        // Raw tile.
+        (false, 0) => {
+            for i in 0..w * h {
+                put(i, cpixel(r)?);
+            }
+        }
+        // Solid tile: a single colour.
+        (false, 1) => {
+            let c = cpixel(r)?;
+            for i in 0..w * h {
+                put(i, c);
+            }
+        }
+        // Packed palette: indices bit-packed MSB-first, each row padded to a byte.
+        (false, 2..=16) => {
+            let pal = read_palette(r, palette_size)?;
+            let bits = match palette_size {
+                2 => 1,
+                3..=4 => 2,
+                _ => 4,
+            };
+            for row in 0..h {
+                let line = blob(r, (w * bits + 7) / 8)?;
+                for col in 0..w {
+                    let bit = col * bits;
+                    let idx = (line[bit / 8] >> (8 - bits - bit % 8)) & ((1 << bits) - 1);
+                    let c = *pal
+                        .get(idx as usize)
+                        .ok_or("ZRLE palette index out of range")?;
+                    put(row * w + col, c);
+                }
+            }
+        }
+        // Plain RLE: colour then run length, runs flow across rows.
+        (true, 0) => {
+            let mut i = 0;
+            while i < w * h {
+                let c = cpixel(r)?;
+                let n = run_len(r)?;
+                if i + n > w * h {
+                    return Err("ZRLE run overruns its tile".into());
+                }
+                for _ in 0..n {
+                    put(i, c);
+                    i += 1;
+                }
+            }
+        }
+        // Palette RLE: an index byte, and the high bit marks a run rather than one pixel.
+        (true, 2..=127) => {
+            let pal = read_palette(r, palette_size)?;
+            let mut i = 0;
+            while i < w * h {
+                let b = u8r(r)?;
+                let c = *pal
+                    .get((b & 0x7f) as usize)
+                    .ok_or("ZRLE palette index out of range")?;
+                let n = if b & 0x80 != 0 { run_len(r)? } else { 1 };
+                if i + n > w * h {
+                    return Err("ZRLE run overruns its tile".into());
+                }
+                for _ in 0..n {
+                    put(i, c);
+                    i += 1;
+                }
+            }
+        }
+        _ => return Err(format!("invalid ZRLE subencoding {sub}").into()),
+    }
     Ok(())
+}
+
+fn read_palette(r: &mut impl Read, n: usize) -> Res<Vec<u32>> {
+    (0..n).map(|_| cpixel(r)).collect()
 }
 
 fn write_ppm(path: &str, s: &Screen) -> Res<()> {
@@ -723,15 +921,161 @@ mod tests {
             0, 0, 0, 0,           // encoding = Raw
             0xAA, 0xBB, 0xCC, 0,  // one pixel: B, G, R, pad
         ];
-        read_rect(&mut &bytes[..], &mut s).unwrap();
+        Decoder::new().rect(&mut &bytes[..], &mut s).unwrap();
         assert_eq!(s.px, vec![0, 0, 0, 0x00CC_BBAA]);
+    }
+
+    /// B, G, R - a CPIXEL, which is a pixel minus the unused fourth byte.
+    fn cp(c: u32) -> [u8; 3] {
+        [c as u8, (c >> 8) as u8, (c >> 16) as u8]
+    }
+
+    /// Run `payload` through a zlib stream and wrap it as ZRLE rectangles. Returns
+    /// one encoded rectangle per payload, all sharing a single zlib stream, which is
+    /// what a real server does.
+    fn zrle_rects(dims: (usize, usize), payloads: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut c = flate2::Compress::new(flate2::Compression::default(), true);
+        let mut out = Vec::new();
+        for payload in payloads {
+            // Capacity is ample for these small payloads, so each step needs one call.
+            // Note the flush must happen exactly once: calling Sync repeatedly emits a
+            // fresh sync marker every time and never reports "done".
+            let mut z = Vec::with_capacity(payload.len() * 2 + 1024);
+            let mut consumed = 0;
+            while consumed < payload.len() {
+                let in0 = c.total_in();
+                c.compress_vec(&payload[consumed..], &mut z, flate2::FlushCompress::None)
+                    .unwrap();
+                consumed += (c.total_in() - in0) as usize;
+                assert!(c.total_in() > in0, "compressor stalled on input");
+            }
+            c.compress_vec(&[], &mut z, flate2::FlushCompress::Sync).unwrap();
+            assert!(z.len() < z.capacity(), "flush filled the buffer; reserve more");
+            let mut m = Vec::new();
+            m.extend_from_slice(&0u16.to_be_bytes()); // x
+            m.extend_from_slice(&0u16.to_be_bytes()); // y
+            m.extend_from_slice(&(dims.0 as u16).to_be_bytes());
+            m.extend_from_slice(&(dims.1 as u16).to_be_bytes());
+            m.extend_from_slice(&16i32.to_be_bytes()); // ZRLE
+            m.extend_from_slice(&(z.len() as u32).to_be_bytes());
+            m.extend_from_slice(&z);
+            out.push(m);
+        }
+        out
+    }
+
+    fn decode_one(payload: Vec<u8>) -> Vec<u32> {
+        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        let rects = zrle_rects((2, 2), &[payload]);
+        Decoder::new().rect(&mut &rects[0][..], &mut s).unwrap();
+        s.px
+    }
+
+    const A: u32 = 0x00AA_BBCC;
+    const B: u32 = 0x0011_2233;
+
+    #[test]
+    fn zrle_solid_and_raw_tiles() {
+        // Subencoding 1: one colour for the whole tile.
+        let mut solid = vec![1u8];
+        solid.extend_from_slice(&cp(A));
+        assert_eq!(decode_one(solid), vec![A; 4]);
+
+        // Subencoding 0: every pixel spelled out.
+        let mut raw = vec![0u8];
+        for c in [A, B, B, A] {
+            raw.extend_from_slice(&cp(c));
+        }
+        assert_eq!(decode_one(raw), vec![A, B, B, A]);
+    }
+
+    #[test]
+    fn zrle_packed_palette_unpacks_msb_first() {
+        // Two colours => 1 bit per index, each row padded to a whole byte.
+        let mut t = vec![2u8];
+        t.extend_from_slice(&cp(A));
+        t.extend_from_slice(&cp(B));
+        t.push(0b0100_0000); // row 0: A then B
+        t.push(0b1000_0000); // row 1: B then A
+        assert_eq!(decode_one(t), vec![A, B, B, A]);
+    }
+
+    #[test]
+    fn zrle_rle_tiles_run_across_rows() {
+        // Plain RLE: colour, then a length byte (length is one more than the sum).
+        let mut plain = vec![128u8];
+        plain.extend_from_slice(&cp(A));
+        plain.push(1); // run of 2
+        plain.extend_from_slice(&cp(B));
+        plain.push(1); // run of 2
+        assert_eq!(decode_one(plain), vec![A, A, B, B]);
+
+        // Palette RLE: index byte, high bit means a run follows.
+        let mut pal = vec![130u8];
+        pal.extend_from_slice(&cp(A));
+        pal.extend_from_slice(&cp(B));
+        pal.extend_from_slice(&[0x80, 1]); // palette[0] x2
+        pal.extend_from_slice(&[0x81, 1]); // palette[1] x2
+        assert_eq!(decode_one(pal), vec![A, A, B, B]);
+    }
+
+    #[test]
+    fn zrle_run_overrunning_its_tile_is_rejected() {
+        let mut t = vec![128u8];
+        t.extend_from_slice(&cp(A));
+        t.push(200); // run of 201 into a 4-pixel tile
+        let rects = zrle_rects((2, 2), &[t]);
+        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        assert!(Decoder::new().rect(&mut &rects[0][..], &mut s).is_err());
+    }
+
+    /// ZRLE's zlib stream spans the connection. A decoder that resets it per
+    /// rectangle decodes the first one and then produces garbage, so decode two
+    /// rectangles from one stream and check the second is still right.
+    #[test]
+    fn zrle_zlib_stream_persists_across_rectangles() {
+        let mut first = vec![1u8];
+        first.extend_from_slice(&cp(A));
+        let mut second = vec![1u8];
+        second.extend_from_slice(&cp(B));
+
+        let rects = zrle_rects((2, 2), &[first, second]);
+        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        let mut d = Decoder::new();
+        d.rect(&mut &rects[0][..], &mut s).unwrap();
+        assert_eq!(s.px, vec![A; 4]);
+        d.rect(&mut &rects[1][..], &mut s).unwrap();
+        assert_eq!(s.px, vec![B; 4]);
+    }
+
+    /// Dragging a window makes the source and destination overlap. Copying in place
+    /// front-to-back would smear the first pixel across the whole run.
+    #[test]
+    fn copy_rect_handles_overlapping_source_and_destination() {
+        let mut s = Screen { w: 4, h: 1, px: vec![1, 2, 3, 4] };
+        #[rustfmt::skip]
+        let bytes: [u8; 16] = [
+            0, 1,  0, 0,   // dst x=1, y=0
+            0, 3,  0, 1,   // w=3, h=1
+            0, 0, 0, 1,    // encoding = CopyRect
+            0, 0,  0, 0,   // src x=0, y=0
+        ];
+        Decoder::new().rect(&mut &bytes[..], &mut s).unwrap();
+        assert_eq!(s.px, vec![1, 1, 2, 3]);
+    }
+
+    #[test]
+    fn copy_rect_with_offscreen_source_is_rejected() {
+        let mut s = Screen { w: 4, h: 1, px: vec![1, 2, 3, 4] };
+        let bytes: [u8; 16] = [0, 0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 1, 0, 2, 0, 0];
+        assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
     }
 
     #[test]
     fn rect_outside_the_framebuffer_is_rejected() {
         let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
         let bytes: [u8; 12] = [0, 1, 0, 1, 0, 4, 0, 4, 0, 0, 0, 0];
-        assert!(read_rect(&mut &bytes[..], &mut s).is_err());
+        assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
     }
 
     /// keysym() does range arithmetic on minifb's enum. If a future minifb reorders
