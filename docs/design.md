@@ -63,6 +63,35 @@ The window only re-blits when a frame actually arrived. Pushing an unchanged 108
 buffer 60 times a second is megabytes of scaling and GDI work for nothing, and it holds
 the frame lock the network thread is waiting on.
 
+## Latency
+
+RFB is request-driven: the server sends a frame only when the client has asked for
+one. That makes *when* the client asks the whole story.
+
+The client asks for the next frame the moment an update starts arriving — right after
+reading the rectangle count, before decoding any of it. Waiting until the update is
+decoded and copied leaves the server idle for all of that time, so every frame costs a
+round trip **plus** the client's own work instead of overlapping the two. On a link
+with real latency that is the difference between a session that feels live and one
+that feels like a slideshow. `VNC_NO_PIPELINE=1` turns it off, which is worth having
+because a server with the bug described next will stall if the client pipelines.
+
+The client also copies only the regions an update actually touched into the buffer the
+drawing thread reads. Copying the whole framebuffer is 8MB per frame at 1080p and 33MB
+at 4K, nearly all of it unchanged.
+
+**The server had a race that throttled every client.** It cleared the
+"client wants a frame" flag *after* sending an update. A client that asks for the next
+frame while the current one is still going out — which is what any client wanting more
+than one frame per round trip does — had its request wiped by that store, and the
+session stalled until it happened to ask again. The flag is now consumed before
+capturing, so a request arriving mid-send survives. Measured on loopback with a
+scrolling terminal, that alone took the frame rate from **1 fps to 20**.
+
+That one is worth remembering as a shape: an atomic flag written by one thread and
+cleared by another after a long operation will lose anything that arrives during the
+operation. Consume it up front instead.
+
 ## Things that bite
 
 - **ZRLE's zlib stream spans the connection, not a rectangle.** Restarting it per

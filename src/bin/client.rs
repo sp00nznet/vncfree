@@ -144,6 +144,13 @@ struct Vnc {
     /// clipboard handle itself is not held here because this struct moves between
     /// threads on every reconnect.
     pending_paste: Option<String>,
+    /// Ask for the next frame as soon as one starts arriving, rather than after it
+    /// has been decoded. Off for the one-shot PPM grab, which wants exactly one.
+    pipeline: bool,
+    /// Regions the last update actually touched, so only those need copying to the
+    /// thread that draws. Copying the whole framebuffer is 8MB at 1080p and 33MB at
+    /// 4K, every frame, most of it unchanged.
+    dirty: Vec<(usize, usize, usize, usize)>,
 }
 
 impl Vnc {
@@ -378,6 +385,8 @@ impl Vnc {
             dec: Decoder::new(),
             clip,
             pending_paste: None,
+            pipeline: false,
+            dirty: Vec::new(),
         })
     }
 
@@ -399,8 +408,17 @@ impl Vnc {
             0 => {
                 let _pad = u8r(&mut self.r)?;
                 let rects = u16r(&mut self.r)?;
+                // Ask for the next frame *now*, before decoding this one. Waiting
+                // until the update is decoded and copied leaves the server idle for
+                // all of that time, so every frame costs a round trip plus our own
+                // work rather than overlapping the two.
+                if self.pipeline {
+                    self.request(true)?;
+                }
+                self.dirty.clear();
                 for _ in 0..rects {
-                    self.dec.rect(&mut self.r, &mut self.screen)?;
+                    let touched = self.dec.rect(&mut self.r, &mut self.screen)?;
+                    self.dirty.push(touched);
                 }
                 Ok(true)
             }
@@ -710,9 +728,14 @@ fn session(
     dirty: &AtomicBool,
 ) -> Res<()> {
     let mut board = arboard::Clipboard::new().ok();
-    let mut incremental = false;
+    // One full frame to start with; from here the server is asked for the next one
+    // the moment an update begins arriving.
+    vnc.request(false)?;
+    vnc.pipeline = env::var("VNC_NO_PIPELINE").is_err();
     while alive.load(Ordering::Relaxed) {
-        vnc.request(incremental)?;
+        if !vnc.pipeline {
+            vnc.request(true)?;
+        }
         while !vnc.pump()? {
             if let Some(text) = vnc.pending_paste.take() {
                 if let Some(b) = board.as_mut() {
@@ -727,11 +750,20 @@ fn session(
             f.w = vnc.screen.w;
             f.h = vnc.screen.h;
             f.px = vec![0; f.w * f.h];
+            f.px.copy_from_slice(&vnc.screen.px);
+        } else {
+            // Only the regions this update touched. The rest is unchanged, and
+            // copying it costs 8MB a frame at 1080p for nothing.
+            let stride = f.w;
+            for &(x, y, w, h) in &vnc.dirty {
+                for row in y..y + h {
+                    let o = row * stride + x;
+                    f.px[o..o + w].copy_from_slice(&vnc.screen.px[o..o + w]);
+                }
+            }
         }
-        f.px.copy_from_slice(&vnc.screen.px);
         drop(f);
         dirty.store(true, Ordering::Relaxed);
-        incremental = true;
     }
     Ok(())
 }
@@ -856,7 +888,8 @@ impl Decoder {
         }
     }
 
-    fn rect(&mut self, r: &mut impl Read, s: &mut Screen) -> Res<()> {
+    /// Decode one rectangle, returning the region of the framebuffer it changed.
+    fn rect(&mut self, r: &mut impl Read, s: &mut Screen) -> Res<(usize, usize, usize, usize)> {
         let x = u16r(r)? as usize;
         let y = u16r(r)? as usize;
         let w = u16r(r)? as usize;
@@ -865,6 +898,21 @@ impl Decoder {
         if x + w > s.w || y + h > s.h {
             return Err(format!("rect {x},{y} {w}x{h} outside {}x{} framebuffer", s.w, s.h).into());
         }
+        self.decode(r, s, x, y, w, h, enc)?;
+        Ok((x, y, w, h))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        enc: i32,
+    ) -> Res<()> {
         match enc {
             0 => self.raw(r, s, x, y, w, h),
             1 => self.copy_rect(r, s, x, y, w, h),

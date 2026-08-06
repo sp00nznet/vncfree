@@ -1364,7 +1364,12 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         }
         clip_tick -= 1;
 
-        if !shared.wants.load(Ordering::Relaxed) {
+        // Consume the outstanding request *before* capturing, not after sending.
+        // A client that asks for the next frame while this one is still going out -
+        // which is what any client wanting more than one frame per round trip does -
+        // would otherwise have its request cleared by the store that followed the
+        // send, and the session would stall until it happened to ask again.
+        if !shared.wants.swap(false, Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
@@ -1373,7 +1378,8 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         let reported = cap.grab(&mut cur.px);
         if matches!(reported, Frame::Unchanged) && !full {
             // The screen provably did not move, so there is nothing to diff and
-            // nothing to send. The request stays outstanding.
+            // nothing to send. Put the request back: it is still outstanding.
+            shared.wants.store(true, Ordering::Relaxed);
             continue;
         }
         // Windows reports a *move* only for things like a dragged window. A terminal
@@ -1490,6 +1496,7 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         if parts.is_empty() {
             // An incremental request stays outstanding until something actually
             // changes; answering with zero rectangles would spin the client.
+            shared.wants.store(true, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -1534,7 +1541,6 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         prev.px.copy_from_slice(&cur.px);
         first = false;
         shared.incremental.store(true, Ordering::Relaxed);
-        shared.wants.store(false, Ordering::Relaxed);
     }
     Ok(())
 }

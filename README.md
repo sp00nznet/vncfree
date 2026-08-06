@@ -70,6 +70,7 @@ All environment variables. There is no config file and nothing is written to dis
 | `VNC_RAW_ONLY=1` | Disable ZRLE and CopyRect. Answers "is it my decoder or the server?" |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
 | `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
+| `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |
 
 Credentials come from the environment rather than the command line, because argv is
 visible to every process on the machine.

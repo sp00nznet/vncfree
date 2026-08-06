@@ -16,6 +16,7 @@
 | 11 | RFB 3.3, so macOS's own Screen Sharing client can connect to the server | done |
 | 12 | Desktop Duplication capture, ~20x less CPU on an idle desktop | done |
 | 13 | Dirty and move rectangles, so the framebuffer is not diffed against itself | done |
+| 14 | Latency: pipelined requests, partial copies, and the server request race | done |
 
 ## Ideas, not commitments
 
