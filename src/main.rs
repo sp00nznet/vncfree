@@ -75,6 +75,13 @@ fn vnc_auth(r: &mut impl Read, w: &mut impl Write, password: &str) -> Res<()> {
     Ok(())
 }
 
+/// `VNC_DEBUG=1` prints what was negotiated. Worth having permanently: when a server
+/// refuses you, the useful facts are its version, the security types it offered and
+/// which one we picked, and none of those are visible from the error alone.
+fn debug() -> bool {
+    env::var("VNC_DEBUG").is_ok()
+}
+
 /// A big-endian integer in exactly `len` bytes, left-padded with zeros. Both the
 /// shared secret and the public key are fixed-width on the wire: hashing a secret
 /// that is one byte short silently produces a different AES key, and the only
@@ -116,6 +123,9 @@ fn apple_dh_auth(
     let key_len = u16r(r)? as usize;
     let prime = blob(r, key_len)?;
     let server_pub = blob(r, key_len)?;
+    if debug() {
+        eprintln!("[debug] apple-dh generator={generator} key-length={key_len} bytes");
+    }
 
     let p = BigUint::from_bytes_be(&prime);
     if p == BigUint::from(0u32) {
@@ -168,7 +178,16 @@ struct Vnc {
     dec: Decoder,
 }
 
-fn main() -> Res<()> {
+/// Returning Result from main would print errors with Debug, which escapes the
+/// newlines in our multi-line hints into literal \n. Print them ourselves.
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Res<()> {
     let args: Vec<String> = env::args().collect();
     let Some(addr) = args.get(1) else {
         eprintln!("usage: vncfree <host:port> [out.ppm]");
@@ -221,6 +240,9 @@ impl Vnc {
             return Err(format!("server refused connection: {}", text(&mut r)?).into());
         }
         let types = blob(&mut r, n)?;
+        if debug() {
+            eprintln!("[debug] server version {ver:?}, security types offered {types:?}");
+        }
         let chosen = if types.contains(&1) {
             1 // None
         } else if types.contains(&2) {
@@ -230,6 +252,9 @@ impl Vnc {
         } else {
             return Err(format!("no supported security type in {types:?}").into());
         };
+        if debug() {
+            eprintln!("[debug] chose security type {chosen}");
+        }
         w.write_all(&[chosen])?;
         match chosen {
             2 => {
@@ -249,7 +274,20 @@ impl Vnc {
             _ => {}
         }
         if u32r(&mut r)? != 0 {
-            return Err(format!("authentication failed: {}", text(&mut r)?).into());
+            let why = text(&mut r)?;
+            if chosen == 30 {
+                return Err(format!(
+                    "authentication failed: {why}\n\
+                     The Diffie-Hellman exchange completed, so the Mac read our \
+                     credentials and refused them. Check, on the Mac:\n\
+                     - the account's short name (run `whoami`), not its full name\n\
+                     - System Settings > General > Sharing > Screen Sharing > (i): \
+                     'Allow access for' must include that account\n\
+                     - that the account has a password set and can log in normally"
+                )
+                .into());
+            }
+            return Err(format!("authentication failed: {why}").into());
         }
 
         // --- init ---
