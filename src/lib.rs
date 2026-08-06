@@ -6,6 +6,9 @@
 //! derivation (one side answers the challenge, the other sets it) and the clipboard
 //! text encoding.
 
+#[cfg(windows)]
+pub mod gui;
+
 use std::env;
 use std::io::Read;
 

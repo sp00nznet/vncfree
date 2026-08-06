@@ -530,13 +530,55 @@ fn main() {
     }
 }
 
+/// Ask for a password before serving anything. Shows this machine's address on the
+/// local network so the person at the other end knows what to type.
+///
+/// No public IP is shown. Finding one means asking a third-party server, which sits
+/// badly with a program that promises no telemetry, and putting a DES-authenticated
+/// VNC server on the open internet is not something to encourage with a helpful
+/// label. Tunnel it instead.
+fn ask_for_password(bind: &str) -> Res<Option<(String, String)>> {
+    let note = match vncfree::gui::lan_ip() {
+        Some(ip) => format!(
+            "This machine is {ip} on the local network.\n\
+             Do not port-forward this. Tunnel over SSH or a VPN."
+        ),
+        None => "Could not work out this machine's local address.".to_string(),
+    };
+    let mut fields = vec![
+        vncfree::gui::Field::new("Password", true, true),
+        vncfree::gui::Field::new("Listen on", false, true),
+    ];
+    fields[1].value = bind.to_string();
+    if !vncfree::gui::form("vncfree-server", &note, &mut fields, "Start server") {
+        return Ok(None);
+    }
+    Ok(Some((
+        fields[0].value.clone(),
+        fields[1].value.trim().to_string(),
+    )))
+}
+
 fn run() -> Res<()> {
     win::become_dpi_aware();
 
     // A password is mandatory. An unauthenticated VNC server on a listening port
     // hands the whole desktop to anyone who can reach it, and defaulting to open is
     // exactly the decision that makes remote-access software dangerous.
-    let password = std::env::var("VNC_PASSWORD").unwrap_or_default();
+    let mut password = std::env::var("VNC_PASSWORD").unwrap_or_default();
+    let mut bind = std::env::var("VNC_BIND").unwrap_or_else(|_| "0.0.0.0:5900".into());
+
+    // No password in the environment: ask for one. The dialog's Start button stays
+    // disabled until a password is typed, so there is no path to an open server.
+    if password.is_empty() {
+        match ask_for_password(&bind)? {
+            Some((p, b)) => {
+                password = p;
+                bind = b;
+            }
+            None => return Ok(()), // window closed
+        }
+    }
     if password.is_empty() {
         return Err("set VNC_PASSWORD to a password of up to 8 characters.\n\
                     vncfree-server will not run without one - an open VNC port gives \
@@ -549,7 +591,6 @@ fn run() -> Res<()> {
         eprintln!("warning: VNC auth uses only the first 8 characters of the password");
     }
 
-    let bind = std::env::var("VNC_BIND").unwrap_or_else(|_| "0.0.0.0:5900".into());
     let listener = TcpListener::bind(&bind)?;
     let (w, h) = win::screen_size();
     println!("vncfree-server listening on {bind}, sharing {w}x{h}");

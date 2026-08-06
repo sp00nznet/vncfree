@@ -38,17 +38,23 @@ work is shared with a server — which is the half nobody gives away.
 
 ## Status
 
-Milestone 5 — **done**. A usable remote desktop: live window, keyboard and mouse, Mac
-support, ZRLE compression, shared clipboard, automatic reconnect and a view-only mode.
-Verified end to end against both a real TigerVNC server and real macOS 15.7.3 Screen
-Sharing.
+Milestone 8 — **done**. A client and a server, both with a window you can just double
+click. Verified end to end against a real TigerVNC server, real macOS 15.7.3 Screen
+Sharing, and each other.
+
+Run `vncfree.exe` with no arguments and it asks where to connect. Run
+`vncfree-server.exe` with no password set and it asks for one, with **Start server**
+greyed out until you type it.
+
+Everything is still driveable from a script or a shortcut — the dialogs only appear
+when the arguments and environment variables are absent:
 
 ```
 # live window, full control
-cargo run --release -- 192.168.1.50:5900
+vncfree 192.168.1.50:5900
 
 # headless: grab one frame and exit
-cargo run --release -- 192.168.1.50:5900 frame.ppm
+vncfree 192.168.1.50:5900 frame.ppm
 ```
 
 Credentials come from the `VNC_PASSWORD` and `VNC_USERNAME` env vars (not argv — argv is
@@ -192,7 +198,8 @@ The keysym-to-Command mapping is still spec-only — no key has yet been pressed
 | 5 | Clipboard, automatic reconnect, view-only mode | done |
 | 6 | A server: capture, input injection, clipboard. The part nobody gives away. | done |
 | 7 | Server-side ZRLE, so the server is usable off the LAN too | done |
-| 8 | A GUI for both, so neither needs environment variables or a terminal | next |
+| 8 | A GUI for both, so neither needs environment variables or a terminal | done |
+| 9 | Go public, tag a release, attach the binaries | next |
 
 Saved hosts were considered and dropped: a desktop shortcut with the arguments already
 does it, and a config file format is a lot of surface for no new capability.
@@ -210,6 +217,13 @@ does it, and a config file format is a lot of surface for no new capability.
 - We force our own pixel format (32bpp LE, shifts 16/8/0) at connect time, so every
   pixel arrives as `0x00RRGGBB` — which is also exactly minifb's buffer layout, so
   there is no format-translation layer anywhere in the program.
+- The dialogs are plain Win32, not a UI toolkit. The whole interface is a few labelled
+  text boxes and a button; `egui` and friends would add hundreds of crates and several
+  megabytes to a program whose entire pitch is one small self-contained exe. They cost
+  no new dependencies at all, since `windows-sys` was already here for the server.
+- The dialog raises its DPI awareness per *thread*, not per process, so it renders
+  crisply on a high-DPI screen without changing how the client's session window is
+  treated. Without it the dialog is bitmap-scaled and blurry at 200%.
 - Networking runs on its own thread. An incremental `FramebufferUpdateRequest` blocks
   for as long as the remote screen is idle, and the UI thread must never block on
   that. The two share one `Mutex<Vec<u32>>`.

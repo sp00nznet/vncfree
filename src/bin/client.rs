@@ -161,19 +161,41 @@ fn main() {
     }
 }
 
+/// The connect dialog. Username is only needed for a Mac, so it is not required, and
+/// neither is the password since a server may not ask for one.
+fn ask_where_to_connect() -> Res<Option<Target>> {
+    let mut fields = vec![
+        vncfree::gui::Field::new("Address", false, true),
+        vncfree::gui::Field::new("Username", false, false),
+        vncfree::gui::Field::new("Password", true, false),
+    ];
+    fields[0].value = "192.168.1.10:5900".into();
+    fields[1].value = env::var("VNC_USERNAME").unwrap_or_default();
+    let note = "Address is host:port. Username is only needed for a Mac.";
+    if !vncfree::gui::form("vncfree - connect", note, &mut fields, "Connect") {
+        return Ok(None);
+    }
+    Ok(Some(Target {
+        addr: fields[0].value.trim().to_string(),
+        user: fields[1].value.clone(),
+        pass: fields[2].value.clone(),
+    }))
+}
+
 fn run() -> Res<()> {
     let args: Vec<String> = env::args().collect();
-    let Some(addr) = args.get(1) else {
-        eprintln!("usage: vncfree <host:port> [out.ppm]");
-        eprintln!("  no out.ppm  -> open a live window");
-        eprintln!("  out.ppm     -> grab one frame headless and exit");
-        eprintln!("credentials come from VNC_PASSWORD, plus VNC_USERNAME for a Mac");
-        std::process::exit(2);
-    };
-    let target = Target {
-        addr: addr.clone(),
-        user: env::var("VNC_USERNAME").unwrap_or_default(),
-        pass: env::var("VNC_PASSWORD").unwrap_or_default(),
+    // With no arguments, ask. Arguments and environment variables keep working
+    // untouched so scripts and shortcuts do not suddenly pop up a window.
+    let target = match args.get(1) {
+        Some(addr) => Target {
+            addr: addr.clone(),
+            user: env::var("VNC_USERNAME").unwrap_or_default(),
+            pass: env::var("VNC_PASSWORD").unwrap_or_default(),
+        },
+        None => match ask_where_to_connect()? {
+            Some(t) => t,
+            None => return Ok(()), // window closed
+        },
     };
     let writer: Writer = Arc::new(Mutex::new(None));
     let clip: Clip = Arc::new(Mutex::new(String::new()));
