@@ -557,7 +557,15 @@ fn ask_for_password(bind: &str) -> Res<Option<(String, String)>> {
         vncfree::gui::Field::new("Listen on", false, true),
     ];
     fields[1].value = bind.to_string();
-    if !vncfree::gui::form("vncfree-server", &note, &mut fields, "Start server") {
+    let check: vncfree::gui::Validator =
+        |f| vncfree::gui::check_host_port("Listen on", &f[1].value);
+    if !vncfree::gui::form(
+        "vncfree-server",
+        &note,
+        &mut fields,
+        "Start server",
+        Some(check),
+    ) {
         return Ok(None);
     }
     Ok(Some((

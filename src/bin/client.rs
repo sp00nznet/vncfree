@@ -4,9 +4,10 @@
 //! RFB 3.8 with Raw, CopyRect and ZRLE encodings, and authenticates with either
 //! classic VNC auth or Apple's Diffie-Hellman scheme for macOS.
 //!
-//! Pass an output path as a second argument for a headless one-frame PPM dump.
-//! Configuration is all environment variables: VNC_USERNAME, VNC_PASSWORD,
-//! VNC_VIEW_ONLY, VNC_RAW_ONLY, VNC_DEBUG.
+//! Run with no arguments and it asks where to connect. Given an address it connects
+//! straight away, and a second argument is a path for a headless one-frame PPM dump.
+//! Settings come from the environment: VNC_USERNAME, VNC_PASSWORD, VNC_VIEW_ONLY,
+//! VNC_RAW_ONLY, VNC_DEBUG.
 
 use std::collections::HashMap;
 use std::env;
@@ -152,12 +153,12 @@ impl Vnc {
     }
 }
 
-/// Returning Result from main would print errors with Debug, which escapes the
-/// newlines in our multi-line hints into literal \n. Print them ourselves.
 /// Set once the connect dialog has been used, which means the program was almost
 /// certainly launched by double-clicking and has no console to print to.
 static FROM_GUI: AtomicBool = AtomicBool::new(false);
 
+/// Returning Result from main would print errors with Debug, which escapes the
+/// newlines in our multi-line hints into literal \n. Print them ourselves.
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -177,7 +178,15 @@ fn ask_where_to_connect() -> Res<Option<Target>> {
         vncfree::gui::Field::new("Password", true, false),
     ];
     let note = "Address is host:port, for example 192.168.1.50:5900.";
-    if !vncfree::gui::form("vncfree - connect", note, &mut fields, "Connect") {
+    let check: vncfree::gui::Validator =
+        |f| vncfree::gui::check_host_port("The address", &f[0].value);
+    if !vncfree::gui::form(
+        "vncfree - connect",
+        note,
+        &mut fields,
+        "Connect",
+        Some(check),
+    ) {
         return Ok(None);
     }
     Ok(Some(Target {

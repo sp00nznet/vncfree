@@ -42,10 +42,15 @@ impl Field {
     }
 }
 
+/// Checks the form before it is accepted. Returns a complaint to show the user, or
+/// None to let the dialog close.
+pub type Validator = fn(&[Field]) -> Option<String>;
+
 struct State {
     edits: Vec<HWND>,
     button: HWND,
     fields: *mut Vec<Field>,
+    validate: Option<Validator>,
     ok: bool,
 }
 
@@ -98,6 +103,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 for (f, &e) in fields.iter_mut().zip(&(*st).edits) {
                     f.value = read_text(e);
                 }
+                // Complain and stay open rather than closing on a typo and reporting
+                // it to a window that no longer exists.
+                if let Some(problem) = (*st).validate.and_then(|v| v(fields)) {
+                    alert("vncfree", &problem);
+                    if let Some(&first) = (*st).edits.first() {
+                        SetFocus(first);
+                    }
+                    return 0;
+                }
                 (*st).ok = true;
                 DestroyWindow(hwnd);
             }
@@ -127,7 +141,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 ///
 /// Returns false immediately on a non-Windows build so callers can fall back to the
 /// command line.
-pub fn form(title: &str, note: &str, fields: &mut Vec<Field>, button: &str) -> bool {
+pub fn form(
+    title: &str,
+    note: &str,
+    fields: &mut Vec<Field>,
+    button: &str,
+    validate: Option<Validator>,
+) -> bool {
     unsafe {
         // Per-thread rather than per-process, so the dialog renders crisply on a
         // high-DPI screen without changing how the rest of the program - notably the
@@ -248,6 +268,7 @@ pub fn form(title: &str, note: &str, fields: &mut Vec<Field>, button: &str) -> b
             edits,
             button: btn,
             fields: fields as *mut _,
+            validate,
             ok: false,
         };
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut state as *mut State as isize);
@@ -273,6 +294,28 @@ pub fn form(title: &str, note: &str, fields: &mut Vec<Field>, button: &str) -> b
     }
 }
 
+/// Complain about anything that is obviously not `host:port`. Deliberately only a
+/// syntax check: resolving a name would block the dialog on a DNS lookup, and a host
+/// that does not answer is reported by the connection attempt anyway.
+pub fn check_host_port(what: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Some(format!(
+            "{what} needs a port.\n\n\
+             You typed \"{value}\".\nTry something like {value}:5900"
+        ));
+    };
+    if host.is_empty() {
+        return Some(format!("{what} is missing the host part before the colon."));
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p > 0 => None,
+        _ => Some(format!(
+            "{what} has a bad port.\n\n\"{port}\" is not a number between 1 and 65535."
+        )),
+    }
+}
+
 /// Report a failure in a box. Launched from Explorer there is no console, so an
 /// error printed to stderr goes nowhere and the program just seems to do nothing.
 pub fn alert(title: &str, text: &str) {
@@ -281,7 +324,9 @@ pub fn alert(title: &str, text: &str) {
             null_mut(),
             wide(text).as_ptr(),
             wide(title).as_ptr(),
-            MB_OK | MB_ICONERROR,
+            // Without SETFOREGROUND the box can open behind whatever is on screen,
+            // which looks exactly like the program having silently given up.
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
         );
     }
 }
@@ -313,5 +358,30 @@ mod tests {
         assert!(!ready(&[req("host:5900"), opt("bob"), req("")]));
         assert!(ready(&[req("host:5900"), opt("bob"), req("pw")]));
         assert!(ready(&[]), "a form with no fields is trivially ready");
+    }
+
+    /// The typo that started this: an address with no port at all.
+    #[test]
+    fn a_missing_or_bad_port_is_caught_before_the_dialog_closes() {
+        use super::check_host_port;
+        let m = check_host_port("The address", "192.168.100.").unwrap();
+        assert!(m.contains("needs a port"), "{m}");
+        assert!(m.contains("192.168.100.:5900"), "should suggest a fix: {m}");
+
+        assert!(check_host_port("x", "host:0").unwrap().contains("bad port"));
+        assert!(check_host_port("x", "host:99999")
+            .unwrap()
+            .contains("bad port"));
+        assert!(check_host_port("x", "host:abc")
+            .unwrap()
+            .contains("bad port"));
+        assert!(check_host_port("x", ":5900")
+            .unwrap()
+            .contains("missing the host"));
+
+        assert_eq!(check_host_port("x", "192.168.1.50:5900"), None);
+        assert_eq!(check_host_port("x", "  0.0.0.0:5900  "), None, "trims");
+        assert_eq!(check_host_port("x", "myhost:5900"), None, "names are fine");
+        assert_eq!(check_host_port("x", "host:65535"), None);
     }
 }
