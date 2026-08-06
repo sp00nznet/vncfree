@@ -523,9 +523,16 @@ struct Shared {
     clip: Mutex<String>,
 }
 
+/// Set once the password dialog has been used, which means the program was almost
+/// certainly launched by double-clicking and has no console to print to.
+static FROM_GUI: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
+        if FROM_GUI.load(Ordering::Relaxed) {
+            vncfree::gui::alert("vncfree-server", &e.to_string());
+        }
         std::process::exit(1);
     }
 }
@@ -571,6 +578,7 @@ fn run() -> Res<()> {
     // No password in the environment: ask for one. The dialog's Start button stays
     // disabled until a password is typed, so there is no path to an open server.
     if password.is_empty() {
+        FROM_GUI.store(true, Ordering::Relaxed);
         match ask_for_password(&bind)? {
             Some((p, b)) => {
                 password = p;
@@ -591,7 +599,8 @@ fn run() -> Res<()> {
         eprintln!("warning: VNC auth uses only the first 8 characters of the password");
     }
 
-    let listener = TcpListener::bind(&bind)?;
+    let listener =
+        TcpListener::bind(&bind).map_err(|e| format!("could not listen on {bind}: {e}"))?;
     let (w, h) = win::screen_size();
     println!("vncfree-server listening on {bind}, sharing {w}x{h}");
 

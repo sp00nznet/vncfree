@@ -9,7 +9,10 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetStockObject, COLOR_WINDOW, DEFAULT_GUI_FONT, HBRUSH};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetStockObject, GetSysColorBrush, SetBkMode, COLOR_WINDOW, DEFAULT_GUI_FONT, HBRUSH, HDC,
+    TRANSPARENT,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -99,6 +102,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 DestroyWindow(hwnd);
             }
             0
+        }
+        // Labels otherwise paint themselves with the default dialog-grey brush, which
+        // does not match the window behind them. Draw the text straight onto the
+        // window background instead.
+        WM_CTLCOLORSTATIC => {
+            SetBkMode(wp as HDC, TRANSPARENT as i32);
+            GetSysColorBrush(COLOR_WINDOW) as LRESULT
         }
         WM_CLOSE => {
             DestroyWindow(hwnd);
@@ -260,6 +270,19 @@ pub fn form(title: &str, note: &str, fields: &mut Vec<Field>, button: &str) -> b
         }
         SetThreadDpiAwarenessContext(prev_dpi);
         state.ok
+    }
+}
+
+/// Report a failure in a box. Launched from Explorer there is no console, so an
+/// error printed to stderr goes nowhere and the program just seems to do nothing.
+pub fn alert(title: &str, text: &str) {
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            wide(text).as_ptr(),
+            wide(title).as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 

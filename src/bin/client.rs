@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -154,31 +154,38 @@ impl Vnc {
 
 /// Returning Result from main would print errors with Debug, which escapes the
 /// newlines in our multi-line hints into literal \n. Print them ourselves.
+/// Set once the connect dialog has been used, which means the program was almost
+/// certainly launched by double-clicking and has no console to print to.
+static FROM_GUI: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
+        if FROM_GUI.load(Ordering::Relaxed) {
+            vncfree::gui::alert("vncfree", &e.to_string());
+        }
         std::process::exit(1);
     }
 }
 
-/// The connect dialog. Username is only needed for a Mac, so it is not required, and
-/// neither is the password since a server may not ask for one.
+/// The connect dialog. The address starts empty on purpose: a plausible-looking
+/// placeholder gets left in place and then spends twenty seconds timing out against a
+/// host that does not exist. Empty keeps Connect greyed out until it is a real answer.
 fn ask_where_to_connect() -> Res<Option<Target>> {
     let mut fields = vec![
         vncfree::gui::Field::new("Address", false, true),
-        vncfree::gui::Field::new("Username", false, false),
         vncfree::gui::Field::new("Password", true, false),
     ];
-    fields[0].value = "192.168.1.10:5900".into();
-    fields[1].value = env::var("VNC_USERNAME").unwrap_or_default();
-    let note = "Address is host:port. Username is only needed for a Mac.";
+    let note = "Address is host:port, for example 192.168.1.50:5900.";
     if !vncfree::gui::form("vncfree - connect", note, &mut fields, "Connect") {
         return Ok(None);
     }
     Ok(Some(Target {
         addr: fields[0].value.trim().to_string(),
-        user: fields[1].value.clone(),
-        pass: fields[2].value.clone(),
+        // A Mac authenticates against a macOS account and still needs a username;
+        // there is no box for it, so it comes from the environment.
+        user: env::var("VNC_USERNAME").unwrap_or_default(),
+        pass: fields[1].value.clone(),
     }))
 }
 
@@ -192,10 +199,13 @@ fn run() -> Res<()> {
             user: env::var("VNC_USERNAME").unwrap_or_default(),
             pass: env::var("VNC_PASSWORD").unwrap_or_default(),
         },
-        None => match ask_where_to_connect()? {
-            Some(t) => t,
-            None => return Ok(()), // window closed
-        },
+        None => {
+            FROM_GUI.store(true, Ordering::Relaxed);
+            match ask_where_to_connect()? {
+                Some(t) => t,
+                None => return Ok(()), // window closed
+            }
+        }
     };
     let writer: Writer = Arc::new(Mutex::new(None));
     let clip: Clip = Arc::new(Mutex::new(String::new()));
@@ -219,7 +229,15 @@ impl Vnc {
     /// connection. Handshake writes go direct to the socket and skip the lock.
     fn connect(t: &Target, out: Writer, clip: Clip) -> Res<Vnc> {
         let (addr, username, password) = (&t.addr, &t.user, &t.pass);
-        let tcp = TcpStream::connect(addr)?;
+        // A bounded timeout, because the OS default is around twenty seconds of
+        // nothing at all if the address is wrong.
+        let resolved = addr
+            .to_socket_addrs()
+            .map_err(|e| format!("{addr:?} is not a usable address: {e}"))?
+            .next()
+            .ok_or_else(|| format!("{addr:?} did not resolve to anything"))?;
+        let tcp = TcpStream::connect_timeout(&resolved, std::time::Duration::from_secs(10))
+            .map_err(|e| format!("could not connect to {addr}: {e}"))?;
         tcp.set_nodelay(true)?;
         let mut w = tcp.try_clone()?;
         let mut r = BufReader::new(tcp);
