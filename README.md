@@ -108,6 +108,9 @@ there is no unauthenticated path at all.
   and a remote desktop with no visible pointer is close to unusable.
 - Only changed 64-pixel tiles are sent, with horizontally adjacent tiles merged into
   runs. Without merging a full-screen change at 1080p is 510 separate rectangles.
+- Encodes ZRLE when the client asks for it, falling back to Raw otherwise. A full
+  3840x2160 screen measured **33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a
+  128x reduction** — which is the difference between "LAN only" and actually usable.
 - Input is injected with `SendInput`, and the pointer with `SetPhysicalCursorPos` —
   see the DPI note in "Known limits".
 
@@ -188,7 +191,8 @@ The keysym-to-Command mapping is still spec-only — no key has yet been pressed
 | 4 | Encodings: CopyRect and ZRLE (Raw is ~8 MB/frame at 1080p) | done |
 | 5 | Clipboard, automatic reconnect, view-only mode | done |
 | 6 | A server: capture, input injection, clipboard. The part nobody gives away. | done |
-| 7 | Server-side ZRLE, so the server is usable off the LAN too | next |
+| 7 | Server-side ZRLE, so the server is usable off the LAN too | done |
+| 8 | A GUI for both, so neither needs environment variables or a terminal | next |
 
 Saved hosts were considered and dropped: a desktop shortcut with the arguments already
 does it, and a config file format is a lot of surface for no new capability.
@@ -237,8 +241,10 @@ does it, and a config file format is a lot of surface for no new capability.
   TigerVNC, but macOS Screen Sharing neither applies our `ClientCutText` to its
   pasteboard nor sends `ServerCutText` when its own clipboard changes — it appears to
   use a proprietary extension instead. `VNC_DEBUG=1` will show the message being sent.
-- **The server only sends Raw.** Fine on a LAN, painful over the internet — that is
-  milestone 7. It advertises nothing else, so any client falls back correctly.
+- The server encodes ZRLE and Raw, but not CopyRect, so dragging a window costs real
+  bytes rather than a "copy this block" instruction. It also emits only three of the
+  five ZRLE subencodings (solid, packed palette, raw), skipping the two RLE forms.
+  Both are further squeezes, not compatibility gaps.
 - The server shares the primary monitor only, and does not follow a resolution change
   while a client is connected.
 - Windows DPI gotcha, in case it bites elsewhere: `SendInput` with

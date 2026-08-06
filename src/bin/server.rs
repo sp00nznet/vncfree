@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use flate2::{Compress, Compression, FlushCompress};
 use vncfree::{blob, cut_text_msg, debug, from_latin1, rd, u16r, u32r, u8r, vnc_des};
 use vncfree::{Res, Screen, PIXEL_FORMAT};
 
@@ -302,6 +303,21 @@ impl PixFmt {
             v.to_le_bytes()
         }
     }
+
+    /// A ZRLE "compressed pixel": the same pixel minus its unused byte. This is only
+    /// legal when all the colour fits in the low three bytes, which it does for any
+    /// shift of 16 or less. A client using an exotic layout gets Raw instead.
+    fn cpixel(&self, p: u32) -> Option<[u8; 3]> {
+        if self.rshift > 16 || self.gshift > 16 || self.bshift > 16 {
+            return None;
+        }
+        let b = self.pixel(p);
+        Some(if self.big_endian {
+            [b[1], b[2], b[3]]
+        } else {
+            [b[0], b[1], b[2]]
+        })
+    }
 }
 
 const TILE: usize = 64;
@@ -345,6 +361,134 @@ fn changed_rects(
     rects
 }
 
+/// Encode one 64x64 (or smaller, at the edges) ZRLE tile.
+///
+/// Three of the five subencodings are produced: solid, packed palette and raw. The
+/// two RLE forms are a further squeeze on top and are deliberately skipped - our
+/// client decodes all five, so this only ever costs bytes, never compatibility.
+fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: usize, f: &PixFmt) {
+    let at = |row: usize, col: usize| s.px[(y + row) * s.w + x + col];
+
+    // Distinct colours, giving up once a palette would be too large to be worth it.
+    let mut palette: Vec<u32> = Vec::new();
+    'scan: for row in 0..h {
+        for col in 0..w {
+            let p = at(row, col);
+            if !palette.contains(&p) {
+                if palette.len() == 16 {
+                    palette.clear();
+                    break 'scan;
+                }
+                palette.push(p);
+            }
+        }
+    }
+
+    match palette.len() {
+        // Too many colours to index: spell every pixel out.
+        0 => {
+            out.push(0);
+            for row in 0..h {
+                for col in 0..w {
+                    out.extend_from_slice(&f.cpixel(at(row, col)).unwrap_or([0; 3]));
+                }
+            }
+        }
+        // One colour for the whole tile, which is most of a typical desktop.
+        1 => {
+            out.push(1);
+            out.extend_from_slice(&f.cpixel(palette[0]).unwrap_or([0; 3]));
+        }
+        n => {
+            out.push(n as u8);
+            for c in &palette {
+                out.extend_from_slice(&f.cpixel(*c).unwrap_or([0; 3]));
+            }
+            let bits = match n {
+                2 => 1,
+                3..=4 => 2,
+                _ => 4,
+            };
+            // Indices are packed most-significant-bit first and every row restarts on
+            // a byte boundary.
+            for row in 0..h {
+                let (mut byte, mut used) = (0u8, 0);
+                for col in 0..w {
+                    let idx = palette.iter().position(|&c| c == at(row, col)).unwrap() as u8;
+                    byte |= idx << (8 - bits - used);
+                    used += bits;
+                    if used == 8 {
+                        out.push(byte);
+                        byte = 0;
+                        used = 0;
+                    }
+                }
+                if used > 0 {
+                    out.push(byte);
+                }
+            }
+        }
+    }
+}
+
+/// Push bytes through the connection-wide deflate stream and flush so the client can
+/// decode this rectangle immediately.
+fn deflate(z: &mut Compress, input: &[u8]) -> Res<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 2 + 1024);
+    let mut consumed = 0;
+    while consumed < input.len() {
+        if out.len() == out.capacity() {
+            out.reserve(4096);
+        }
+        let in0 = z.total_in();
+        z.compress_vec(&input[consumed..], &mut out, FlushCompress::None)?;
+        consumed += (z.total_in() - in0) as usize;
+        if z.total_in() == in0 && out.len() < out.capacity() {
+            return Err("deflate stalled".into());
+        }
+    }
+    // Exactly one sync flush. Calling Sync repeatedly emits a fresh marker every time
+    // and never reports being finished, which is an easy infinite loop to write.
+    loop {
+        if out.len() == out.capacity() {
+            out.reserve(4096);
+        }
+        let before = out.len();
+        z.compress_vec(&[], &mut out, FlushCompress::Sync)?;
+        if out.len() < out.capacity() || out.len() == before {
+            return Ok(out);
+        }
+    }
+}
+
+fn zrle_update(
+    z: &mut Compress,
+    s: &Screen,
+    rects: &[(usize, usize, usize, usize)],
+    fmt: &PixFmt,
+) -> Res<Vec<u8>> {
+    let mut out = vec![0u8, 0];
+    out.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+    for &(x, y, w, h) in rects {
+        let mut tiles = Vec::new();
+        for ty in (0..h).step_by(64) {
+            for tx in (0..w).step_by(64) {
+                let (tw, th) = ((w - tx).min(64), (h - ty).min(64));
+                encode_tile(&mut tiles, s, x + tx, y + ty, tw, th, fmt);
+            }
+        }
+        let body = deflate(z, &tiles)?;
+        out.extend_from_slice(&(x as u16).to_be_bytes());
+        out.extend_from_slice(&(y as u16).to_be_bytes());
+        out.extend_from_slice(&(w as u16).to_be_bytes());
+        out.extend_from_slice(&(h as u16).to_be_bytes());
+        out.extend_from_slice(&16i32.to_be_bytes()); // ZRLE
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+    }
+    Ok(out)
+}
+
 fn raw_update(s: &Screen, rects: &[(usize, usize, usize, usize)], fmt: &PixFmt) -> Vec<u8> {
     let mut out = vec![0u8, 0]; // FramebufferUpdate, padding
     out.extend_from_slice(&(rects.len() as u16).to_be_bytes());
@@ -372,6 +516,9 @@ struct Shared {
     wants: AtomicBool,
     /// The client's copy of the screen is valid, so only changes need to go out.
     incremental: AtomicBool,
+    /// The client listed ZRLE in SetEncodings. Sending an encoding a client never
+    /// asked for is a protocol violation, so Raw is the default until it does.
+    zrle: AtomicBool,
     alive: AtomicBool,
     clip: Mutex<String>,
 }
@@ -470,6 +617,7 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
         fmt: Mutex::new(PixFmt::default()),
         wants: AtomicBool::new(false),
         incremental: AtomicBool::new(false),
+        zrle: AtomicBool::new(false),
         alive: AtomicBool::new(true),
         clip: Mutex::new(String::new()),
     });
@@ -511,16 +659,19 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
                 shared.incremental.store(false, Ordering::Relaxed);
             }
             2 => {
-                // SetEncodings. We only ever send Raw, so just consume the list.
                 blob(tcp, 1)?;
                 let n = u16r(tcp)? as usize;
                 let list = blob(tcp, n * 4)?;
+                let encs: Vec<i32> = list
+                    .chunks(4)
+                    .map(|c| i32::from_be_bytes(c.try_into().unwrap()))
+                    .collect();
+                shared.zrle.store(encs.contains(&16), Ordering::Relaxed);
                 if debug() {
-                    let encs: Vec<i32> = list
-                        .chunks(4)
-                        .map(|c| i32::from_be_bytes(c.try_into().unwrap()))
-                        .collect();
-                    eprintln!("[debug] client supports encodings {encs:?}");
+                    eprintln!(
+                        "[debug] client supports encodings {encs:?}, using {}",
+                        if encs.contains(&16) { "ZRLE" } else { "Raw" }
+                    );
                 }
             }
             3 => {
@@ -564,6 +715,10 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
     let mut prev = Screen::new(w, h);
     let mut first = true;
     let cap = win::Capture::new(w, h).ok_or("could not create the capture surface")?;
+    // One deflate stream for the whole connection. ZRLE's zlib state spans the
+    // session, not a rectangle; restarting it per rectangle decodes the first one and
+    // then produces garbage on the client forever.
+    let mut deflater = Compress::new(Compression::default(), true);
 
     let mut board = arboard::Clipboard::new().ok();
     if let Some(b) = board.as_mut() {
@@ -614,7 +769,22 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         }
 
         let fmt = *shared.fmt.lock().unwrap();
-        let msg = raw_update(&cur, &rects, &fmt);
+        // ZRLE needs both the client's blessing and a pixel layout that has a legal
+        // 3-byte CPIXEL; otherwise fall back to Raw, which every client understands.
+        let msg = if shared.zrle.load(Ordering::Relaxed) && fmt.cpixel(0).is_some() {
+            zrle_update(&mut deflater, &cur, &rects, &fmt)?
+        } else {
+            raw_update(&cur, &rects, &fmt)
+        };
+        if debug() {
+            let pixels: usize = rects.iter().map(|r| r.2 * r.3).sum();
+            eprintln!(
+                "[debug] update: {} rect(s), {pixels} px, {} bytes on the wire ({:.1}% of raw)",
+                rects.len(),
+                msg.len(),
+                100.0 * msg.len() as f64 / (pixels * 4).max(1) as f64
+            );
+        }
         shared.out.lock().unwrap().write_all(&msg)?;
 
         prev.px.copy_from_slice(&cur.px);
@@ -707,6 +877,113 @@ mod tests {
         let e = PixFmt::parse(&f).unwrap_err().to_string();
         assert!(e.contains("32bpp"), "{e}");
         assert!(PixFmt::parse(&PIXEL_FORMAT).is_ok());
+    }
+
+    fn tile_of(px: &[u32], w: usize, h: usize) -> Vec<u8> {
+        let s = Screen {
+            w,
+            h,
+            px: px.to_vec(),
+        };
+        let mut out = Vec::new();
+        encode_tile(&mut out, &s, 0, 0, w, h, &PixFmt::default());
+        out
+    }
+
+    #[test]
+    fn a_uniform_tile_becomes_one_solid_pixel() {
+        let out = tile_of(&[0x00AA_BBCC; 16], 4, 4);
+        // Subencoding 1, then a single CPIXEL as B, G, R.
+        assert_eq!(out, vec![1, 0xCC, 0xBB, 0xAA]);
+    }
+
+    #[test]
+    fn two_colours_pack_one_bit_per_pixel_msb_first() {
+        // Row 0 is A,B,A,B and row 1 is B,B,A,A.
+        let (a, b) = (0x0000_0001, 0x0000_0002);
+        let out = tile_of(&[a, b, a, b, b, b, a, a], 4, 2);
+        assert_eq!(out[0], 2, "palette of two");
+        assert_eq!(&out[1..4], &[1, 0, 0], "first palette entry is A");
+        assert_eq!(&out[4..7], &[2, 0, 0], "second is B");
+        // 4 pixels at 1 bit each, MSB first, each row padded to its own byte.
+        assert_eq!(out[7], 0b0101_0000, "row 0: A B A B");
+        assert_eq!(out[8], 0b1100_0000, "row 1: B B A A");
+        assert_eq!(out.len(), 9);
+    }
+
+    /// Four colours need two bits per index, still packed from the top of the byte.
+    #[test]
+    fn four_colours_pack_two_bits_per_pixel() {
+        let out = tile_of(&[1, 2, 3, 4], 4, 1);
+        assert_eq!(out[0], 4, "palette of four");
+        assert_eq!(out.len(), 1 + 4 * 3 + 1, "one packed byte for four pixels");
+        assert_eq!(*out.last().unwrap(), 0b00_01_10_11);
+    }
+
+    /// More than 16 colours cannot be indexed, so the tile falls back to raw pixels.
+    #[test]
+    fn more_than_sixteen_colours_falls_back_to_raw() {
+        let px: Vec<u32> = (0..20u32).collect();
+        let out = tile_of(&px, 20, 1);
+        assert_eq!(out[0], 0, "raw subencoding");
+        assert_eq!(out.len(), 1 + 20 * 3, "three bytes per pixel, no palette");
+    }
+
+    /// CPIXELs drop the unused byte, and an exotic layout has none to drop.
+    #[test]
+    fn cpixel_drops_the_unused_byte_or_refuses() {
+        assert_eq!(
+            PixFmt::default().cpixel(0x00AA_BBCC),
+            Some([0xCC, 0xBB, 0xAA])
+        );
+        let be = PixFmt {
+            big_endian: true,
+            ..PixFmt::default()
+        };
+        assert_eq!(be.cpixel(0x00AA_BBCC), Some([0xAA, 0xBB, 0xCC]));
+        // Colour living in the top three bytes has no 3-byte little-endian form here.
+        let high = PixFmt {
+            big_endian: false,
+            rshift: 24,
+            gshift: 16,
+            bshift: 8,
+        };
+        assert_eq!(high.cpixel(0x00AA_BBCC), None);
+    }
+
+    /// The deflate stream spans the connection, so a second rectangle must not
+    /// restart it - and the helper must terminate, which an over-eager flush loop
+    /// famously does not.
+    #[test]
+    fn deflate_is_streaming_and_terminates() {
+        let mut z = Compress::new(Compression::default(), true);
+        let first = deflate(&mut z, b"hello hello hello").unwrap();
+        let second = deflate(&mut z, b"hello hello hello").unwrap();
+        assert!(!first.is_empty());
+        assert!(!second.is_empty());
+        // The second copy is cheaper because the first is still in the window.
+        assert!(
+            second.len() < first.len(),
+            "{} vs {}",
+            second.len(),
+            first.len()
+        );
+    }
+
+    #[test]
+    fn zrle_rect_header_is_well_formed() {
+        let mut z = Compress::new(Compression::default(), true);
+        let s = Screen::new(4, 4);
+        let msg = zrle_update(&mut z, &s, &[(0, 0, 4, 4)], &PixFmt::default()).unwrap();
+        assert_eq!(msg[0], 0, "FramebufferUpdate");
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 1, "one rectangle");
+        assert_eq!(
+            i32::from_be_bytes(msg[12..16].try_into().unwrap()),
+            16,
+            "ZRLE"
+        );
+        let len = u32::from_be_bytes(msg[16..20].try_into().unwrap()) as usize;
+        assert_eq!(msg.len(), 20 + len, "body length must match the header");
     }
 
     #[test]
