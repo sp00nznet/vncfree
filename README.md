@@ -35,9 +35,10 @@ work is shared with a server — which is the half nobody gives away.
 
 ## Status
 
-Milestone 4 — **done**. A usable remote desktop: live window, keyboard and mouse, Mac
-support, and ZRLE compression so it is usable over a real network. Verified end to end
-against both a real TigerVNC server and real macOS 15.7.3 Screen Sharing.
+Milestone 5 — **done**. A usable remote desktop: live window, keyboard and mouse, Mac
+support, ZRLE compression, shared clipboard, automatic reconnect and a view-only mode.
+Verified end to end against both a real TigerVNC server and real macOS 15.7.3 Screen
+Sharing.
 
 ```
 # live window, full control
@@ -51,6 +52,27 @@ Credentials come from the `VNC_PASSWORD` and `VNC_USERNAME` env vars (not argv �
 visible to every process on the box). `VNC_USERNAME` is only needed for a Mac. Close the
 window to quit; Escape is forwarded to the remote machine, so it can't also be the quit
 key.
+
+Everything is configured with environment variables — there is no config file and
+nothing is written to disk:
+
+| Variable | Effect |
+|---|---|
+| `VNC_PASSWORD` | Password. Required by most servers. |
+| `VNC_USERNAME` | macOS account name. Only needed for a Mac. |
+| `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
+| `VNC_RAW_ONLY=1` | Disable ZRLE and CopyRect. For "is it my decoder or the server?" |
+| `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
+
+**Clipboard** is shared both ways, as Latin-1 with LF endings per the RFB spec, so CRs
+are stripped on the way out and restored on the way in. The local clipboard is polled
+twice a second while the window has focus — which is exactly when it matters, since you
+focus the window to paste into it. Connecting does *not* push your clipboard at the
+remote machine; the poll is seeded at startup so it only sends genuine changes.
+
+**Reconnect** is automatic, with backoff from 1s up to 15s, and the title bar shows
+`[reconnecting]`. A resolution change across the reconnect is handled — the framebuffer
+is reallocated rather than assuming the old size.
 
 Input notes:
 
@@ -136,8 +158,11 @@ The keysym-to-Command mapping is still spec-only — no key has yet been pressed
 | 2 | Input: keyboard + mouse back to the server | done |
 | 3 | Apple Diffie-Hellman auth (type 30), so a Mac needs no setting changed | done |
 | 4 | Encodings: CopyRect and ZRLE (Raw is ~8 MB/frame at 1080p) | done |
-| 5 | Quality-of-life: reconnect, scaling, clipboard, saved hosts | next |
-| 6 | Maybe a server. This is the part people actually can't get for free. | |
+| 5 | Clipboard, automatic reconnect, view-only mode | done |
+| 6 | A server. This is the part people actually can't get for free. | next |
+
+Saved hosts were considered and dropped: a desktop shortcut with the arguments already
+does it, and a config file format is a lot of surface for no new capability.
 
 ## Design notes
 
@@ -179,6 +204,10 @@ The keysym-to-Command mapping is still spec-only — no key has yet been pressed
   image.
 - US keyboard layout. Non-US punctuation needs minifb's character callback rather than
   the static keysym table.
+- **Clipboard does not work against macOS.** Verified working both directions against
+  TigerVNC, but macOS Screen Sharing neither applies our `ClientCutText` to its
+  pasteboard nor sends `ServerCutText` when its own clipboard changes — it appears to
+  use a proprietary extension instead. `VNC_DEBUG=1` will show the message being sent.
 - No TLS. Apple DH protects the credentials in transit but not the session, and
   classic VNC auth is DES and weak by modern standards. Neither encrypts the
   framebuffer or your keystrokes — tunnel over SSH or a VPN if the link isn't trusted.
@@ -214,6 +243,18 @@ keysyms it logs match what you typed, and read the pointer back with
 Note: pass colours as `rgb:20/40/80`, not `#204080`. PowerShell strips `#` from
 native-command arguments, and the resulting silent `xsetroot` failure looks exactly
 like a broken decoder (a black screen).
+
+## Building and releases
+
+```
+cargo build --release
+```
+
+Output is a single self-contained `target/release/vncfree.exe` with no runtime to
+install. CI builds it on every push and runs `cargo fmt --check`, `clippy -D warnings`
+and the tests; pushing a `v*` tag attaches the exe to a GitHub release. GitHub Actions
+is free with unlimited minutes for public repositories, so the binary on the Releases
+page costs nothing to produce and nobody has to trust a build from anywhere else.
 
 ## License
 

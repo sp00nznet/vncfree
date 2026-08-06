@@ -1,6 +1,12 @@
 //! vncfree - a free VNC (RFB) client for Windows.
-//! Milestone 2: live window plus keyboard and mouse.
-//! Pass an output path as a second argument for the headless one-frame PPM dump.
+//!
+//! Live window, keyboard and mouse, shared clipboard, automatic reconnect. Speaks
+//! RFB 3.8 with Raw, CopyRect and ZRLE encodings, and authenticates with either
+//! classic VNC auth or Apple's Diffie-Hellman scheme for macOS.
+//!
+//! Pass an output path as a second argument for a headless one-frame PPM dump.
+//! Configuration is all environment variables: VNC_USERNAME, VNC_PASSWORD,
+//! VNC_VIEW_ONLY, VNC_RAW_ONLY, VNC_DEBUG.
 
 use std::collections::HashMap;
 use std::env;
@@ -23,7 +29,16 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// Shared write half. Both the network thread (update requests) and the UI thread
 /// (input events) write to this socket, and an interleaved write would desync the
 /// protocol, so every whole message goes out under this lock.
-type Writer = Arc<Mutex<TcpStream>>;
+type Writer = Arc<Mutex<Option<TcpStream>>>;
+
+/// Write one whole message. Does nothing while disconnected: input and clipboard
+/// events raised during a reconnect have nowhere to go, and that is not an error.
+fn send(w: &Writer, bytes: &[u8]) -> Res<()> {
+    if let Some(s) = w.lock().unwrap().as_mut() {
+        s.write_all(bytes)?;
+    }
+    Ok(())
+}
 
 fn rd<const N: usize>(s: &mut impl Read) -> Res<[u8; N]> {
     let mut b = [0u8; N];
@@ -113,12 +128,7 @@ fn write_cstr(dst: &mut [u8], s: &str, what: &str) -> Res<()> {
 /// The server sends a generator, a key length, a prime and its public key. We do a
 /// standard DH exchange, MD5 the shared secret into an AES-128 key, and return the
 /// username and password encrypted in a 128-byte blob followed by our public key.
-fn apple_dh_auth(
-    r: &mut impl Read,
-    w: &mut impl Write,
-    username: &str,
-    password: &str,
-) -> Res<()> {
+fn apple_dh_auth(r: &mut impl Read, w: &mut impl Write, username: &str, password: &str) -> Res<()> {
     let generator = u16r(r)?;
     let key_len = u16r(r)? as usize;
     let prime = blob(r, key_len)?;
@@ -170,12 +180,31 @@ struct Screen {
     px: Vec<u32>,
 }
 
+/// Everything needed to open the connection again after it drops.
+struct Target {
+    addr: String,
+    user: String,
+    pass: String,
+}
+
 struct Vnc {
     r: BufReader<TcpStream>,
     w: Writer,
     screen: Screen,
     name: String,
     dec: Decoder,
+    clip: Clip,
+    /// Text the server sent us, waiting to go onto the Windows clipboard. The
+    /// clipboard handle itself is not held here because this struct moves between
+    /// threads on every reconnect.
+    pending_paste: Option<String>,
+}
+
+impl Vnc {
+    fn paste(&mut self, text: String) {
+        *self.clip.lock().unwrap() = text.clone();
+        self.pending_paste = Some(text);
+    }
 }
 
 /// Returning Result from main would print errors with Debug, which escapes the
@@ -196,9 +225,14 @@ fn run() -> Res<()> {
         eprintln!("credentials come from VNC_PASSWORD, plus VNC_USERNAME for a Mac");
         std::process::exit(2);
     };
-    let username = env::var("VNC_USERNAME").unwrap_or_default();
-    let password = env::var("VNC_PASSWORD").unwrap_or_default();
-    let mut vnc = Vnc::connect(addr, &username, &password)?;
+    let target = Target {
+        addr: addr.clone(),
+        user: env::var("VNC_USERNAME").unwrap_or_default(),
+        pass: env::var("VNC_PASSWORD").unwrap_or_default(),
+    };
+    let writer: Writer = Arc::new(Mutex::new(None));
+    let clip: Clip = Arc::new(Mutex::new(String::new()));
+    let mut vnc = Vnc::connect(&target, writer, clip.clone())?;
 
     match args.get(2) {
         Some(out) => {
@@ -208,19 +242,25 @@ fn run() -> Res<()> {
             println!("wrote {} ({}x{})", out, vnc.screen.w, vnc.screen.h);
             Ok(())
         }
-        None => run_window(vnc),
+        None => run_window(vnc, target, clip),
     }
 }
 
 impl Vnc {
-    fn connect(addr: &str, username: &str, password: &str) -> Res<Vnc> {
+    /// `out` is the shared write half. It is published only once the handshake has
+    /// fully succeeded, so the UI thread can never write input into a half-open
+    /// connection. Handshake writes go direct to the socket and skip the lock.
+    fn connect(t: &Target, out: Writer, clip: Clip) -> Res<Vnc> {
+        let (addr, username, password) = (&t.addr, &t.user, &t.pass);
         let tcp = TcpStream::connect(addr)?;
         tcp.set_nodelay(true)?;
         let mut w = tcp.try_clone()?;
         let mut r = BufReader::new(tcp);
 
         // --- version handshake ---
-        let ver = String::from_utf8_lossy(&rd::<12>(&mut r)?).trim_end().to_string();
+        let ver = String::from_utf8_lossy(&rd::<12>(&mut r)?)
+            .trim_end()
+            .to_string();
         // Apple's Screen Sharing announces "RFB 003.889". Replying 003.008 makes it
         // fall back to being a standard 3.8 server, so accept any 003.>=8 here.
         // ponytail: no 3.3/3.7 support - they negotiate SecurityResult differently.
@@ -230,7 +270,9 @@ impl Vnc {
             .and_then(|m| m.parse().ok())
             .ok_or_else(|| format!("not an RFB 3.x server: {ver:?}"))?;
         if minor < 8 {
-            return Err(format!("server speaks {ver:?}; vncfree needs RFB 003.008 or later").into());
+            return Err(
+                format!("server speaks {ver:?}; vncfree needs RFB 003.008 or later").into(),
+            );
         }
         w.write_all(b"RFB 003.008\n")?;
 
@@ -332,8 +374,21 @@ impl Vnc {
             w.write_all(&e.to_be_bytes())?;
         }
 
-        let screen = Screen { w: width, h: height, px: vec![0; width * height] };
-        Ok(Vnc { r, w: Arc::new(Mutex::new(w)), screen, name, dec: Decoder::new() })
+        let screen = Screen {
+            w: width,
+            h: height,
+            px: vec![0; width * height],
+        };
+        *out.lock().unwrap() = Some(w);
+        Ok(Vnc {
+            r,
+            w: out,
+            screen,
+            name,
+            dec: Decoder::new(),
+            clip,
+            pending_paste: None,
+        })
     }
 
     /// Ask for the whole screen. Incremental means "only what changed" - the server
@@ -344,8 +399,7 @@ impl Vnc {
         req.extend_from_slice(&0u16.to_be_bytes());
         req.extend_from_slice(&(self.screen.w as u16).to_be_bytes());
         req.extend_from_slice(&(self.screen.h as u16).to_be_bytes());
-        self.w.lock().unwrap().write_all(&req)?;
-        Ok(())
+        send(&self.w, &req)
     }
 
     /// Read one server message. Returns true if it was a framebuffer update, i.e.
@@ -370,9 +424,14 @@ impl Vnc {
             }
             2 => Ok(false), // Bell, no body
             3 => {
-                // ServerCutText: 3 padding, then a u32-prefixed string
+                // ServerCutText: 3 padding, then a u32-prefixed Latin-1 string.
                 blob(&mut self.r, 3)?;
-                text(&mut self.r)?;
+                let n = u32r(&mut self.r)? as usize;
+                let body = blob(&mut self.r, n)?;
+                if debug() {
+                    eprintln!("[debug] clipboard <- server ({n} bytes)");
+                }
+                self.paste(from_latin1(&body));
                 Ok(false)
             }
             other => Err(format!("unexpected server message type {other}").into()),
@@ -394,7 +453,11 @@ fn keysym(k: Key, shift: bool) -> Option<u32> {
     }
     if (Key0 as u32..=Key9 as u32).contains(&n) {
         let d = (n - Key0 as u32) as usize;
-        return Some(if shift { b")!@#$%^&*("[d] } else { b'0' + d as u8 } as u32);
+        return Some(if shift {
+            b")!@#$%^&*("[d]
+        } else {
+            b'0' + d as u8
+        } as u32);
     }
     if (F1 as u32..=F15 as u32).contains(&n) {
         return Some(0xffbe + (n - F1 as u32));
@@ -479,8 +542,45 @@ fn pointer_msg(mask: u8, x: u16, y: u16) -> [u8; 6] {
     [5, mask, x[0], x[1], y[0], y[1]]
 }
 
+/// ClientCutText (msg 6). RFB clipboard text is ISO 8859-1 with LF line endings, so
+/// characters outside Latin-1 become '?' and the CR of a Windows CRLF is dropped.
+fn cut_text_msg(text: &str) -> Vec<u8> {
+    let body: Vec<u8> = text
+        .chars()
+        .filter(|c| *c != '\r')
+        .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
+        .collect();
+    let mut m = vec![6, 0, 0, 0];
+    m.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    m.extend_from_slice(&body);
+    m
+}
+
+/// The reverse: Latin-1 to a Rust string, putting the CR back so Windows apps see
+/// proper line breaks when pasting.
+fn from_latin1(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| b as char)
+        .collect::<String>()
+        .replace('\n', "\r\n")
+}
+
+/// Remembers the last clipboard text that crossed the link in either direction.
+/// Without it, text received from the server is immediately detected as a local
+/// clipboard change and sent straight back, and the two ends ping-pong forever.
+type Clip = Arc<Mutex<String>>;
+
 struct Input {
     w: Writer,
+    /// `VNC_VIEW_ONLY=1`. Worth having: connecting to a production box and nudging
+    /// the mouse into something is a real way to ruin an afternoon.
+    view_only: bool,
+    clip: Clip,
+    board: Option<arboard::Clipboard>,
+    /// Frames until the next clipboard poll. Reading the Windows clipboard 60 times
+    /// a second is wasteful and fights other applications for the clipboard lock.
+    clip_tick: u32,
     mask: u8,
     pos: (u16, u16),
     /// Key -> the keysym we sent on press. Releases must repeat that exact keysym:
@@ -489,21 +589,83 @@ struct Input {
 }
 
 impl Input {
-    fn new(w: Writer) -> Input {
-        Input { w, mask: 0, pos: (0, 0), held: HashMap::new() }
+    fn new(w: Writer, clip: Clip) -> Input {
+        let view_only = env::var("VNC_VIEW_ONLY").is_ok();
+        if view_only {
+            eprintln!("VNC_VIEW_ONLY set: input will not be sent");
+        }
+        let mut board = match arboard::Clipboard::new() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("clipboard unavailable, sharing disabled: {e}");
+                None
+            }
+        };
+        // Seed with whatever is already on the local clipboard, so the first poll
+        // sees no change. Otherwise merely connecting overwrites the remote
+        // machine's clipboard with ours before you have copied anything.
+        if let Some(b) = board.as_mut() {
+            if let Ok(t) = b.get_text() {
+                *clip.lock().unwrap() = t;
+            }
+        }
+        Input {
+            w,
+            view_only,
+            clip,
+            board,
+            clip_tick: 0,
+            mask: 0,
+            pos: (0, 0),
+            held: HashMap::new(),
+        }
+    }
+
+    /// Send the local clipboard if it changed. Compared against the last text that
+    /// crossed in either direction, so text pasted from the server is not bounced
+    /// straight back at it.
+    fn poll_clipboard(&mut self) -> Res<()> {
+        if self.clip_tick > 0 {
+            self.clip_tick -= 1;
+            return Ok(());
+        }
+        self.clip_tick = 30; // twice a second at 60fps
+        let Some(board) = self.board.as_mut() else {
+            return Ok(());
+        };
+        let Ok(text) = board.get_text() else {
+            return Ok(());
+        };
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut last = self.clip.lock().unwrap();
+        if *last == text {
+            return Ok(());
+        }
+        *last = text.clone();
+        drop(last);
+        if debug() {
+            eprintln!("[debug] clipboard -> server ({} bytes)", text.len());
+        }
+        send(&self.w, &cut_text_msg(&text))
     }
 
     fn key_event(&self, sym: u32, down: bool) -> Res<()> {
-        self.w.lock().unwrap().write_all(&key_msg(sym, down))?;
-        Ok(())
+        send(&self.w, &key_msg(sym, down))
     }
 
     fn pointer_event(&self, mask: u8, x: u16, y: u16) -> Res<()> {
-        self.w.lock().unwrap().write_all(&pointer_msg(mask, x, y))?;
-        Ok(())
+        send(&self.w, &pointer_msg(mask, x, y))
     }
 
     fn pump(&mut self, win: &Window, fb: (usize, usize)) -> Res<()> {
+        // View-only suppresses the clipboard too: ClientCutText overwrites the
+        // remote clipboard, which is still reaching over and changing something.
+        if self.view_only {
+            return Ok(());
+        }
+        self.poll_clipboard()?;
         if let Some((mx, my)) = win.get_mouse_pos(MouseMode::Discard) {
             let (x, y) = to_fb(mx, my, win.get_size(), fb);
             let mut mask = 0u8;
@@ -559,31 +721,85 @@ impl Input {
 
 // ---------------------------------------------------------------- window
 
-fn run_window(mut vnc: Vnc) -> Res<()> {
+/// One connection's lifetime: request updates, decode them, publish frames. Returns
+/// when the link drops, which is normal rather than fatal - the caller reconnects.
+fn session(
+    mut vnc: Vnc,
+    frame: &Arc<Mutex<Screen>>,
+    alive: &AtomicBool,
+    dirty: &AtomicBool,
+) -> Res<()> {
+    let mut board = arboard::Clipboard::new().ok();
+    let mut incremental = false;
+    while alive.load(Ordering::Relaxed) {
+        vnc.request(incremental)?;
+        while !vnc.pump()? {
+            if let Some(text) = vnc.pending_paste.take() {
+                if let Some(b) = board.as_mut() {
+                    let _ = b.set_text(text);
+                }
+            }
+        }
+        let mut f = frame.lock().unwrap();
+        if f.w != vnc.screen.w || f.h != vnc.screen.h {
+            // The remote resolution changed, which happens when a Mac's display
+            // settings change or a different machine answers on reconnect.
+            f.w = vnc.screen.w;
+            f.h = vnc.screen.h;
+            f.px = vec![0; f.w * f.h];
+        }
+        f.px.copy_from_slice(&vnc.screen.px);
+        drop(f);
+        dirty.store(true, Ordering::Relaxed);
+        incremental = true;
+    }
+    Ok(())
+}
+
+fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
     let (w, h) = (vnc.screen.w, vnc.screen.h);
-    let title = format!("{} - vncfree", vnc.name);
-    let frame = Arc::new(Mutex::new(vec![0u32; w * h]));
+    let name = vnc.name.clone();
+    let writer = vnc.w.clone();
+    let frame = Arc::new(Mutex::new(Screen {
+        w,
+        h,
+        px: vec![0; w * h],
+    }));
     let alive = Arc::new(AtomicBool::new(true));
-    let mut input = Input::new(vnc.w.clone());
+    let online = Arc::new(AtomicBool::new(true));
+    let dirty = Arc::new(AtomicBool::new(true));
+    let mut input = Input::new(writer.clone(), clip.clone());
 
     // Network on its own thread: reads block for as long as the remote screen is
     // idle, and the UI thread must never block on that.
-    let (net_frame, net_alive) = (frame.clone(), alive.clone());
+    let (net_frame, net_alive, net_online) = (frame.clone(), alive.clone(), online.clone());
+    let net_dirty = dirty.clone();
     std::thread::spawn(move || {
-        let mut incremental = false;
+        let mut first = Some(vnc);
+        let mut backoff = 1u64;
         while net_alive.load(Ordering::Relaxed) {
-            let step = (|| -> Res<()> {
-                vnc.request(incremental)?;
-                while !vnc.pump()? {}
-                net_frame.lock().unwrap().copy_from_slice(&vnc.screen.px);
-                Ok(())
-            })();
-            if let Err(e) = step {
-                eprintln!("connection lost: {e}");
-                net_alive.store(false, Ordering::Relaxed);
+            let fresh = match first.take() {
+                Some(v) => Ok(v),
+                None => Vnc::connect(&target, writer.clone(), clip.clone()),
+            };
+            match fresh {
+                Ok(v) => {
+                    backoff = 1;
+                    net_online.store(true, Ordering::Relaxed);
+                    if let Err(e) = session(v, &net_frame, &net_alive, &net_dirty) {
+                        eprintln!("connection lost: {e}");
+                    }
+                }
+                Err(e) => eprintln!("reconnect failed: {e}"),
+            }
+            net_online.store(false, Ordering::Relaxed);
+            *writer.lock().unwrap() = None;
+            if !net_alive.load(Ordering::Relaxed) {
                 return;
             }
-            incremental = true;
+            eprintln!("reconnecting in {backoff}s...");
+            std::thread::sleep(std::time::Duration::from_secs(backoff));
+            backoff = (backoff * 2).min(15);
         }
     });
 
@@ -592,18 +808,34 @@ fn run_window(mut vnc: Vnc) -> Res<()> {
         scale_mode: ScaleMode::AspectRatioStretch,
         ..Default::default()
     };
-    let mut window = Window::new(&title, w, h, opts)?;
+    let mut window = Window::new(&format!("{name} - vncfree"), w, h, opts)?;
     window.set_target_fps(60);
 
     // Escape is a key the remote machine wants, so closing the window is the only quit.
+    let mut was_online = true;
+    let mut size = (w, h);
     while window.is_open() && alive.load(Ordering::Relaxed) {
-        if window.is_active() {
-            input.pump(&window, (w, h))?;
+        let up = online.load(Ordering::Relaxed);
+        if up != was_online {
+            let tag = if up { "" } else { " [reconnecting]" };
+            window.set_title(&format!("{name} - vncfree{tag}"));
+            was_online = up;
+        }
+        if window.is_active() && up {
+            input.pump(&window, size)?;
         } else if !input.held.is_empty() {
             input.release_all()?;
         }
-        let px = frame.lock().unwrap();
-        window.update_with_buffer(&px, w, h)?;
+        // Only re-blit when a new frame actually arrived. Pushing an unchanged 1080p
+        // buffer 60 times a second is megabytes of scaling and GDI work for nothing,
+        // and it holds the frame lock the network thread is waiting on.
+        if dirty.swap(false, Ordering::Relaxed) {
+            let f = frame.lock().unwrap();
+            size = (f.w, f.h);
+            window.update_with_buffer(&f.px, f.w, f.h)?;
+        } else {
+            window.update();
+        }
     }
     alive.store(false, Ordering::Relaxed);
     Ok(())
@@ -639,7 +871,9 @@ struct Decoder {
 
 impl Decoder {
     fn new() -> Decoder {
-        Decoder { zlib: flate2::Decompress::new(true) }
+        Decoder {
+            zlib: flate2::Decompress::new(true),
+        }
     }
 
     fn rect(&mut self, r: &mut impl Read, s: &mut Screen) -> Res<()> {
@@ -659,7 +893,15 @@ impl Decoder {
         }
     }
 
-    fn raw(&mut self, r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) -> Res<()> {
+    fn raw(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
         let data = blob(r, w * h * 4)?;
         for row in 0..h {
             for col in 0..w {
@@ -675,7 +917,15 @@ impl Decoder {
     /// Copy a block already on screen somewhere else - what a server sends when you
     /// drag a window or scroll. Source and destination overlap constantly, so the
     /// rows go via a scratch buffer rather than being copied in place.
-    fn copy_rect(&mut self, r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) -> Res<()> {
+    fn copy_rect(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
         let sx = u16r(r)? as usize;
         let sy = u16r(r)? as usize;
         if sx + w > s.w || sy + h > s.h {
@@ -716,7 +966,15 @@ impl Decoder {
         }
     }
 
-    fn zrle(&mut self, r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) -> Res<()> {
+    fn zrle(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
         let n = u32r(r)? as usize;
         let compressed = blob(r, n)?;
         let data = self.inflate(&compressed, w * h * 3)?;
@@ -764,7 +1022,7 @@ fn zrle_tile(r: &mut impl Read, s: &mut Screen, x: usize, y: usize, w: usize, h:
                 _ => 4,
             };
             for row in 0..h {
-                let line = blob(r, (w * bits + 7) / 8)?;
+                let line = blob(r, (w * bits).div_ceil(8))?;
                 for col in 0..w {
                     let bit = col * bits;
                     let idx = (line[bit / 8] >> (8 - bits - bit % 8)) & ((1 << bits) - 1);
@@ -861,16 +1119,16 @@ mod tests {
         assert_eq!(
             block[..],
             [
-                0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70,
-                0xb4, 0xc5, 0x5a
+                0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+                0xc5, 0x5a
             ]
         );
         let md5: [u8; 16] = Md5::digest(b"abc").into();
         assert_eq!(
             md5,
             [
-                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28,
-                0xe1, 0x7f, 0x72
+                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1,
+                0x7f, 0x72
             ]
         );
     }
@@ -956,7 +1214,11 @@ mod tests {
 
     #[test]
     fn raw_rect_lands_at_the_right_offset() {
-        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
         #[rustfmt::skip]
         let bytes: [u8; 16] = [
             0, 1,  0, 1,          // x=1, y=1
@@ -992,8 +1254,12 @@ mod tests {
                 consumed += (c.total_in() - in0) as usize;
                 assert!(c.total_in() > in0, "compressor stalled on input");
             }
-            c.compress_vec(&[], &mut z, flate2::FlushCompress::Sync).unwrap();
-            assert!(z.len() < z.capacity(), "flush filled the buffer; reserve more");
+            c.compress_vec(&[], &mut z, flate2::FlushCompress::Sync)
+                .unwrap();
+            assert!(
+                z.len() < z.capacity(),
+                "flush filled the buffer; reserve more"
+            );
             let mut m = Vec::new();
             m.extend_from_slice(&0u16.to_be_bytes()); // x
             m.extend_from_slice(&0u16.to_be_bytes()); // y
@@ -1008,7 +1274,11 @@ mod tests {
     }
 
     fn decode_one(payload: Vec<u8>) -> Vec<u32> {
-        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
         let rects = zrle_rects((2, 2), &[payload]);
         Decoder::new().rect(&mut &rects[0][..], &mut s).unwrap();
         s.px
@@ -1068,7 +1338,11 @@ mod tests {
         t.extend_from_slice(&cp(A));
         t.push(200); // run of 201 into a 4-pixel tile
         let rects = zrle_rects((2, 2), &[t]);
-        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
         assert!(Decoder::new().rect(&mut &rects[0][..], &mut s).is_err());
     }
 
@@ -1083,7 +1357,11 @@ mod tests {
         second.extend_from_slice(&cp(B));
 
         let rects = zrle_rects((2, 2), &[first, second]);
-        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
         let mut d = Decoder::new();
         d.rect(&mut &rects[0][..], &mut s).unwrap();
         assert_eq!(s.px, vec![A; 4]);
@@ -1095,7 +1373,11 @@ mod tests {
     /// front-to-back would smear the first pixel across the whole run.
     #[test]
     fn copy_rect_handles_overlapping_source_and_destination() {
-        let mut s = Screen { w: 4, h: 1, px: vec![1, 2, 3, 4] };
+        let mut s = Screen {
+            w: 4,
+            h: 1,
+            px: vec![1, 2, 3, 4],
+        };
         #[rustfmt::skip]
         let bytes: [u8; 16] = [
             0, 1,  0, 0,   // dst x=1, y=0
@@ -1109,14 +1391,22 @@ mod tests {
 
     #[test]
     fn copy_rect_with_offscreen_source_is_rejected() {
-        let mut s = Screen { w: 4, h: 1, px: vec![1, 2, 3, 4] };
+        let mut s = Screen {
+            w: 4,
+            h: 1,
+            px: vec![1, 2, 3, 4],
+        };
         let bytes: [u8; 16] = [0, 0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 1, 0, 2, 0, 0];
         assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
     }
 
     #[test]
     fn rect_outside_the_framebuffer_is_rejected() {
-        let mut s = Screen { w: 2, h: 2, px: vec![0; 4] };
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
         let bytes: [u8; 12] = [0, 1, 0, 1, 0, 4, 0, 4, 0, 0, 0, 0];
         assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
     }
@@ -1157,6 +1447,29 @@ mod tests {
         assert_eq!(pointer_msg(0, 640, 480), [5, 0, 0x02, 0x80, 0x01, 0xe0]);
         assert_eq!(pointer_msg(1, 1, 1), [5, 1, 0, 1, 0, 1]); // left button down
         assert_eq!(pointer_msg(8, 0, 0), [5, 8, 0, 0, 0, 0]); // wheel up
+    }
+
+    #[test]
+    fn clipboard_text_converts_to_and_from_latin1() {
+        // Header is type 6, three padding bytes, then a big-endian length.
+        assert_eq!(cut_text_msg("hi"), vec![6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
+        // Windows CRLF must go out as bare LF - RFB has no CR.
+        assert_eq!(cut_text_msg("a\r\nb")[8..], [b'a', b'\n', b'b']);
+        // Outside Latin-1 becomes '?' rather than mangling the byte count.
+        assert_eq!(
+            cut_text_msg("caf\u{e9} \u{4e2d}")[8..],
+            [b'c', b'a', b'f', 0xe9, b' ', b'?']
+        );
+        // A 2-byte char must not be counted as 2 bytes in the length field.
+        assert_eq!(
+            u32::from_be_bytes(cut_text_msg("\u{4e2d}")[4..8].try_into().unwrap()),
+            1
+        );
+
+        // Coming back the other way, LF regains its CR so Windows apps paste right.
+        assert_eq!(from_latin1(b"a\nb"), "a\r\nb");
+        assert_eq!(from_latin1(&[0xe9]), "\u{e9}");
+        assert_eq!(from_latin1(b""), "");
     }
 
     #[test]

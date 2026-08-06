@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 aes = "0.8"
+arboard = { version = "3.6.1", default-features = false }
 # Only dep. VNC auth is DES-ECB with a bit-reversed key; hand-rolling DES is not lazy.
 des = "0.8"
 flate2 = "1.1.9"
