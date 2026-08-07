@@ -72,6 +72,7 @@ All environment variables. There is no config file.
 | `VNC_ENCODING` | Client only. `raw`, `tight` or `zrle` to ask for exactly one. Answers "is it my decoder or the server?" |
 | `VNC_QUALITY` | Client only, `0`–`9`. Lets a Tight server send lossy JPEG, which is much smaller on a slow link. Unset means lossless. |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
+| `VNC_TIMING=1` | Client only. Print each second's breakdown: frame rate, where the time went, bytes off the wire, and input-to-picture. Answers `why is this slow` with numbers. |
 | `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
 | `VNC_MONITOR=all` | Server only. Share every display as one screen, not just the primary. |
 | `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |

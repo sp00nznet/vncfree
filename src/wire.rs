@@ -20,6 +20,14 @@ use std::sync::{Arc, Mutex};
 /// alike, so everything below is written once.
 pub type Tls = Arc<Mutex<rustls::Connection>>;
 
+/// Bytes taken off the socket since the process started.
+///
+/// Counted here because this is the only place that sees the real thing: above this,
+/// TLS and the encodings have already changed the shape of it. Whether a slow session
+/// is short of bandwidth or waiting on the far end's encoder is not a guess worth
+/// making, and this is the number that settles it.
+pub static BYTES_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// rustls is built here with `ring` and nothing else, so the provider is passed
 /// explicitly rather than installed into a process-wide slot. One less piece of global
 /// state, and it fails to compile rather than at runtime if that ever changes.
@@ -60,7 +68,9 @@ pub struct WireRead {
 impl Read for WireRead {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let Some(tls) = self.tls.clone() else {
-            return self.sock.read(out);
+            let n = self.sock.read(out)?;
+            BYTES_IN.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            return Ok(n);
         };
         while self.at == self.plain.len() {
             {
@@ -92,6 +102,7 @@ impl Read for WireRead {
                 // and it must not be holding a lock the other thread needs to send a
                 // mouse movement.
                 self.raw_len = self.sock.read(&mut self.raw)?;
+                BYTES_IN.fetch_add(self.raw_len as u64, std::sync::atomic::Ordering::Relaxed);
                 self.raw_at = 0;
                 if self.raw_len == 0 {
                     return Ok(0);

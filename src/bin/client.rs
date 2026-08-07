@@ -14,7 +14,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aes::cipher::generic_array::GenericArray;
@@ -595,7 +595,15 @@ impl Vnc {
     /// Read one server message. Returns true if it was a framebuffer update, i.e.
     /// the screen changed and is worth showing.
     fn pump(&mut self) -> Res<bool> {
-        match u8r(&mut self.r)? {
+        // Blocked here until the server has something to say. Separating this from the
+        // work that follows is the whole question: if this is never long, the server is
+        // always ahead of us, we are the bottleneck, and what is on screen is however
+        // far behind the queue has grown.
+        let t = std::time::Instant::now();
+        let msg = u8r(&mut self.r)?;
+        tick(&TIMING.wait_us, &TIMING.wait_max_us, t);
+        let work = std::time::Instant::now();
+        match msg {
             0 => {
                 let _pad = u8r(&mut self.r)?;
                 let rects = u16r(&mut self.r)?;
@@ -611,6 +619,23 @@ impl Vnc {
                 for _ in 0..rects {
                     let touched = self.dec.rect(&mut self.r, &mut self.screen)?;
                     self.dirty.push(touched);
+                }
+                tick(&TIMING.work_us, &TIMING.work_max_us, work);
+                // How much of the screen this update actually redrew, which is how a
+                // server that resends everything for a one-character change gives
+                // itself away.
+                let px: usize = self.dirty.iter().map(|&(_, _, w, h)| w * h).sum();
+                TIMING.px.fetch_add(px as u64, Ordering::Relaxed);
+                TIMING.rects.fetch_add(rects as u64, Ordering::Relaxed);
+                // Something was typed or clicked and this is the first picture since.
+                let sent = INPUT_AT.swap(0, Ordering::Relaxed);
+                if sent != 0 {
+                    add(
+                        &TIMING.echo_us,
+                        &TIMING.echo_max_us,
+                        now_us().saturating_sub(sent),
+                    );
+                    TIMING.echoes.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(true)
             }
@@ -959,10 +984,12 @@ impl Input {
     }
 
     fn key_event(&self, sym: u32, down: bool) -> Res<()> {
+        input_sent();
         send(&self.w, &key_msg(sym, down))
     }
 
     fn pointer_event(&self, mask: u8, x: u16, y: u16) -> Res<()> {
+        input_sent();
         send(&self.w, &pointer_msg(mask, x, y))
     }
 
@@ -1156,6 +1183,184 @@ impl Input {
 
 // ---------------------------------------------------------------- window
 
+/// Where a session's time actually goes.
+///
+/// "Slow" on a remote desktop has several possible causes that feel identical from the
+/// outside, and reasoning about which one it is has a poor record. Every field here is
+/// recorded as a total *and* a worst case, because a stall is invisible in an average:
+/// three seconds of nothing followed by a burst averages out to something unremarkable.
+///
+/// The one that matters most is `gap`, the longest a single pass of the UI loop took.
+/// Keyboard input is only read when that loop runs, so however long it stalls for is
+/// exactly how late a keystroke is noticed - and this is measured, not deduced.
+#[derive(Default)]
+struct Timing {
+    loops: AtomicU64,
+    frames: AtomicU64,
+    gap_us: AtomicU64,
+    gap_max_us: AtomicU64,
+    blit_us: AtomicU64,
+    blit_max_us: AtomicU64,
+    ui_lock_us: AtomicU64,
+    ui_lock_max_us: AtomicU64,
+    input_us: AtomicU64,
+    decode_us: AtomicU64,
+    decode_max_us: AtomicU64,
+    /// Blocked waiting for the server to say something.
+    wait_us: AtomicU64,
+    wait_max_us: AtomicU64,
+    /// Turning the bytes of an update into pixels, once they have arrived.
+    work_us: AtomicU64,
+    work_max_us: AtomicU64,
+    /// Input to picture: the number the person at the keyboard actually feels.
+    echo_us: AtomicU64,
+    echo_max_us: AtomicU64,
+    echoes: AtomicU64,
+    /// Pixels redrawn and rectangles sent, to catch a server resending the world.
+    px: AtomicU64,
+    rects: AtomicU64,
+    /// Which encoding the server actually used, per rectangle.
+    enc_raw: AtomicU64,
+    enc_copy: AtomicU64,
+    enc_zrle: AtomicU64,
+    enc_tight: AtomicU64,
+    enc_other: AtomicU64,
+    copy_us: AtomicU64,
+    copy_max_us: AtomicU64,
+    net_lock_us: AtomicU64,
+    net_lock_max_us: AtomicU64,
+}
+
+static TIMING: Timing = Timing {
+    loops: AtomicU64::new(0),
+    frames: AtomicU64::new(0),
+    gap_us: AtomicU64::new(0),
+    gap_max_us: AtomicU64::new(0),
+    blit_us: AtomicU64::new(0),
+    blit_max_us: AtomicU64::new(0),
+    ui_lock_us: AtomicU64::new(0),
+    ui_lock_max_us: AtomicU64::new(0),
+    input_us: AtomicU64::new(0),
+    decode_us: AtomicU64::new(0),
+    decode_max_us: AtomicU64::new(0),
+    wait_us: AtomicU64::new(0),
+    wait_max_us: AtomicU64::new(0),
+    work_us: AtomicU64::new(0),
+    work_max_us: AtomicU64::new(0),
+    echo_us: AtomicU64::new(0),
+    echo_max_us: AtomicU64::new(0),
+    echoes: AtomicU64::new(0),
+    px: AtomicU64::new(0),
+    rects: AtomicU64::new(0),
+    enc_raw: AtomicU64::new(0),
+    enc_copy: AtomicU64::new(0),
+    enc_zrle: AtomicU64::new(0),
+    enc_tight: AtomicU64::new(0),
+    enc_other: AtomicU64::new(0),
+    copy_us: AtomicU64::new(0),
+    copy_max_us: AtomicU64::new(0),
+    net_lock_us: AtomicU64::new(0),
+    net_lock_max_us: AtomicU64::new(0),
+};
+
+/// Add one measurement to a total and its worst case.
+fn tick(total: &AtomicU64, max: &AtomicU64, at: std::time::Instant) -> u64 {
+    add(total, max, at.elapsed().as_micros() as u64)
+}
+
+fn add(total: &AtomicU64, max: &AtomicU64, us: u64) -> u64 {
+    total.fetch_add(us, Ordering::Relaxed);
+    max.fetch_max(us, Ordering::Relaxed);
+    us
+}
+
+/// Microseconds since this process started caring, for measuring across threads where
+/// an `Instant` cannot be shared through an atomic.
+fn now_us() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+        + 1
+}
+
+/// `VNC_TIMING=1` prints where each second went. Separate from VNC_DEBUG, which answers
+/// a different question - what was negotiated - and would be unreadable with two lines
+/// a second of measurements mixed into it.
+fn timing() -> bool {
+    env::var("VNC_TIMING").is_ok()
+}
+
+/// When the oldest input that has not yet produced a picture was sent, or 0.
+///
+/// This is the number the person at the keyboard actually experiences: press a key,
+/// wait, see it. Everything else here is a component of it.
+static INPUT_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Note that input has gone out, if nothing is already outstanding. Keeping the
+/// *oldest* unanswered one is deliberate: during a burst of typing the interesting
+/// question is how far behind the screen has fallen, not how recent the last key was.
+fn input_sent() {
+    let _ = INPUT_AT.compare_exchange(0, now_us(), Ordering::Relaxed, Ordering::Relaxed);
+}
+
+impl Timing {
+    /// Print the last second and start another. Averages are per occurrence; the `max`
+    /// column is the single worst one, which is where a stutter shows itself.
+    fn report(&self, secs: f64) {
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        let (loops, frames) = (take(&self.loops).max(1), take(&self.frames));
+        let per = |total: u64, n: u64| total as f64 / n.max(1) as f64 / 1000.0;
+        let ms = |a: &AtomicU64| take(a) as f64 / 1000.0;
+        eprintln!(
+            "[time] {:.0} ui/s, {:.0} fps | loop gap {:.1}/{:.0}ms | blit {:.1}/{:.0}ms | \
+             ui lock {:.1}/{:.0}ms | input {:.2}ms | decode {:.1}/{:.0}ms | \
+             copy {:.1}/{:.0}ms | net lock {:.1}/{:.0}ms | WAIT {:.1}/{:.0}ms | \
+             WORK {:.1}/{:.0}ms | {:.0}kpx/frame in {:.1} rects | ECHO {:.0}/{:.0}ms x{}   (avg/max)",
+            loops as f64 / secs,
+            frames as f64 / secs,
+            per(take(&self.gap_us), loops),
+            ms(&self.gap_max_us),
+            per(take(&self.blit_us), loops),
+            ms(&self.blit_max_us),
+            per(take(&self.ui_lock_us), loops),
+            ms(&self.ui_lock_max_us),
+            per(take(&self.input_us), loops),
+            per(take(&self.decode_us), frames),
+            ms(&self.decode_max_us),
+            per(take(&self.copy_us), frames),
+            ms(&self.copy_max_us),
+            per(take(&self.net_lock_us), frames),
+            ms(&self.net_lock_max_us),
+            per(take(&self.wait_us), frames),
+            ms(&self.wait_max_us),
+            per(take(&self.work_us), frames),
+            ms(&self.work_max_us),
+            take(&self.px) as f64 / frames.max(1) as f64 / 1000.0,
+            take(&self.rects) as f64 / frames.max(1) as f64,
+            {
+                let n = take(&self.echoes);
+                self.echoes.store(n, Ordering::Relaxed);
+                per(take(&self.echo_us), n)
+            },
+            ms(&self.echo_max_us),
+            take(&self.echoes),
+        );
+        let bytes = vncfree::wire::BYTES_IN.swap(0, Ordering::Relaxed);
+        eprintln!(
+            "[time]   {:.2} MB/s off the wire ({:.0} KB/frame) | encodings: raw {} copyrect {} zrle {} tight {} other {}",
+            bytes as f64 / secs / 1_000_000.0,
+            bytes as f64 / frames.max(1) as f64 / 1000.0,
+            take(&self.enc_raw),
+            take(&self.enc_copy),
+            take(&self.enc_zrle),
+            take(&self.enc_tight),
+            take(&self.enc_other),
+        );
+    }
+}
+
 /// One connection's lifetime: request updates, decode them, publish frames. Returns
 /// when the link drops, which is normal rather than fatal - the caller reconnects.
 fn session(
@@ -1173,6 +1378,7 @@ fn session(
         if !vnc.pipeline {
             vnc.request(true)?;
         }
+        let t = std::time::Instant::now();
         while !vnc.pump()? {
             if let Some(text) = vnc.pending_paste.take() {
                 if let Some(b) = board.as_mut() {
@@ -1180,7 +1386,15 @@ fn session(
                 }
             }
         }
+        // Reading and decoding. Includes waiting for the server, so on an idle screen
+        // this is mostly the wait, not the work.
+        tick(&TIMING.decode_us, &TIMING.decode_max_us, t);
+        TIMING.frames.fetch_add(1, Ordering::Relaxed);
+
+        let t = std::time::Instant::now();
         let mut f = frame.lock().unwrap();
+        tick(&TIMING.net_lock_us, &TIMING.net_lock_max_us, t);
+        let t = std::time::Instant::now();
         if f.w != vnc.screen.w || f.h != vnc.screen.h {
             // The remote resolution changed, which happens when a Mac's display
             // settings change or a different machine answers on reconnect.
@@ -1199,6 +1413,7 @@ fn session(
                 }
             }
         }
+        tick(&TIMING.copy_us, &TIMING.copy_max_us, t);
         drop(f);
         dirty.store(true, Ordering::Relaxed);
     }
@@ -1274,6 +1489,8 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res
     let mut under: Vec<u32> = Vec::new();
     let mut was_at: Option<(i32, i32)> = None;
     let mut hiding_pointer = false;
+    let mut loop_at = std::time::Instant::now();
+    let mut report_at = std::time::Instant::now();
     while window.is_open() && alive.load(Ordering::Relaxed) {
         let up = online.load(Ordering::Relaxed);
         if up != was_online {
@@ -1281,11 +1498,25 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res
             window.set_title(&format!("{name} - vncfree{tag}"));
             was_online = up;
         }
+        // How long the previous pass took, end to end. Keyboard input is only read
+        // when this loop runs, so this *is* the input latency the person feels.
+        tick(&TIMING.gap_us, &TIMING.gap_max_us, loop_at);
+        loop_at = std::time::Instant::now();
+        TIMING.loops.fetch_add(1, Ordering::Relaxed);
+        if timing() && report_at.elapsed() >= std::time::Duration::from_secs(1) {
+            TIMING.report(report_at.elapsed().as_secs_f64());
+            report_at = std::time::Instant::now();
+        }
+
+        let t = std::time::Instant::now();
         if window.is_active() && up {
             input.pump(&window, size)?;
         } else if !input.held.is_empty() {
             input.release_all()?;
         }
+        TIMING
+            .input_us
+            .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Where the pointer is now, in the remote screen's coordinates. Redraw when it
         // moves even if no frame arrived, because locally-drawn is the whole point:
         // waiting for the server would put the round trip straight back.
@@ -1297,7 +1528,9 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res
         // buffer 60 times a second is megabytes of scaling and GDI work for nothing,
         // and it holds the frame lock the network thread is waiting on.
         if dirty.swap(false, Ordering::Relaxed) || moved {
+            let t = std::time::Instant::now();
             let mut f = frame.lock().unwrap();
+            tick(&TIMING.ui_lock_us, &TIMING.ui_lock_max_us, t);
             size = (f.w, f.h);
             // Painted and taken straight back off around the blit, so the buffer the
             // network thread writes into never contains a pointer. Leaving it there
@@ -1313,10 +1546,14 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res
             if let Some((x, y)) = at {
                 shape.draw(&mut f, x, y, &mut under);
             }
+            let t = std::time::Instant::now();
             window.update_with_buffer(&f.px, f.w, f.h)?;
+            tick(&TIMING.blit_us, &TIMING.blit_max_us, t);
             restore(&mut f, &mut under);
         } else {
+            let t = std::time::Instant::now();
             window.update();
+            tick(&TIMING.blit_us, &TIMING.blit_max_us, t);
         }
     }
     alive.store(false, Ordering::Relaxed);
@@ -1557,6 +1794,18 @@ impl Decoder {
         if x + w > s.w || y + h > s.h {
             return Err(format!("rect {x},{y} {w}x{h} outside {}x{} framebuffer", s.w, s.h).into());
         }
+        // Which encoding a server actually chose, and how much screen it redrew with
+        // it. A full screen as Raw is eight megabytes; the same screen as ZRLE is a
+        // couple of hundred kilobytes, and the difference between those two is the
+        // difference between a usable session and an unusable one.
+        let slot = match enc {
+            0 => &TIMING.enc_raw,
+            1 => &TIMING.enc_copy,
+            7 => &TIMING.enc_tight,
+            16 => &TIMING.enc_zrle,
+            _ => &TIMING.enc_other,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
         self.decode(r, s, x, y, w, h, enc)?;
         Ok((x, y, w, h))
     }
