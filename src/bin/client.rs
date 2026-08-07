@@ -7,7 +7,7 @@
 //! Run with no arguments and it asks where to connect. Given an address it connects
 //! straight away, and a second argument is a path for a headless one-frame PPM dump.
 //! Settings come from the environment: VNC_USERNAME, VNC_PASSWORD, VNC_VIEW_ONLY,
-//! VNC_RAW_ONLY, VNC_DEBUG.
+//! VNC_ENCODING, VNC_DEBUG.
 
 use std::collections::HashMap;
 use std::env;
@@ -472,19 +472,55 @@ impl Vnc {
 
         // SetEncodings, most preferred first. Raw is always last so that a server
         // supporting neither of the others still works - the fallback is automatic.
-        // ponytail: no Tight. It needs four persistent zlib streams and a JPEG
-        // decoder, and ZRLE already gets most of the win. Add it if a real server
-        // turns out to offer Tight but not ZRLE.
-        let encodings: Vec<i32> = if env::var("VNC_RAW_ONLY").is_ok() {
-            eprintln!("VNC_RAW_ONLY set: requesting Raw only");
-            vec![0]
-        } else {
-            // -223 is DesktopSize: not an encoding but a way for the server to say
-            // the screen resolution changed. Without asking for it, a server that
-            // changes resolution has no way to tell us and the session is stuck at
-            // the old size.
-            vec![16, 1, 0, -223] // ZRLE, CopyRect, Raw, DesktopSize
+        //
+        // Asking for exactly one of them is how "is it my decoder or the server?" gets
+        // answered, and how one encoding is checked against another: grab the same
+        // still screen twice and the two files must be byte-identical.
+        let encodings: Vec<i32> = match env::var("VNC_ENCODING").unwrap_or_default().as_str() {
+            "raw" => {
+                eprintln!("VNC_ENCODING=raw: requesting Raw only");
+                vec![0]
+            }
+            "tight" => {
+                eprintln!("VNC_ENCODING=tight: requesting Tight only");
+                vec![7, 0]
+            }
+            "zrle" => {
+                eprintln!("VNC_ENCODING=zrle: requesting ZRLE only");
+                vec![16, 0]
+            }
+            "" => {
+                // -223 is DesktopSize: not an encoding but a way for the server to say
+                // the screen resolution changed. Without asking for it, a server that
+                // changes resolution has no way to tell us and the session is stuck at
+                // the old size.
+                //
+                // ZRLE before Tight on purpose. A server offering both - TigerVNC does
+                // - keeps giving us lossless ZRLE, and Tight is there for the servers
+                // that do not speak ZRLE at all, where the fallback would otherwise be
+                // Raw. Tight is the only thing here that can arrive lossy, and only
+                // because a server chose to send JPEG.
+                vec![16, 7, 1, 0, -223] // ZRLE, Tight, CopyRect, Raw, DesktopSize
+            }
+            other => {
+                return Err(format!("VNC_ENCODING={other:?}: expected raw, tight or zrle").into())
+            }
         };
+
+        // Asking for a quality level tells a Tight server it may send JPEG, which is
+        // lossy and much smaller. Unset means lossless, because a remote desktop is
+        // mostly text and JPEG makes a mess of text. The levels are pseudo-encodings
+        // -32 (worst) to -23 (best).
+        let mut encodings = encodings;
+        if let Ok(q) = env::var("VNC_QUALITY") {
+            let level: i32 = q
+                .parse()
+                .ok()
+                .filter(|l| (0..=9).contains(l))
+                .ok_or_else(|| format!("VNC_QUALITY={q:?}: expected 0 to 9"))?;
+            eprintln!("VNC_QUALITY={level}: allowing the server to send lossy JPEG");
+            encodings.push(-32 + level);
+        }
         w.write_all(&[2, 0])?;
         w.write_all(&(encodings.len() as u16).to_be_bytes())?;
         for e in &encodings {
@@ -587,7 +623,7 @@ impl Vnc {
 ///
 /// minifb identifies keys by *scancode*, so `Key::Key2` is the key in that physical
 /// position whatever is printed on it. Which character that produces is the keyboard
-/// layout's business, and the table below only knows the US one — on a UK keyboard the
+/// layout's business, and the table below only knows the US one - on a UK keyboard the
 /// same key is `"` rather than `@`, and on a German one `@` is not reachable without
 /// AltGr at all. Windows has already applied the layout, the dead keys and AltGr by the
 /// time it sends `WM_CHAR`, so for anything that produces a character that is where the
@@ -626,7 +662,7 @@ fn types_a_character(k: Key) -> bool {
 ///
 /// The printable half assumes a US layout and is used for two things: keys held with
 /// Ctrl or Alt, where the shortcut matters more than the character, and typing the
-/// clipboard. Ordinary typing goes via the character callback instead — see
+/// clipboard. Ordinary typing goes via the character callback instead - see
 /// `types_a_character` above.
 fn keysym(k: Key, shift: bool) -> Option<u32> {
     use Key::*;
@@ -924,7 +960,7 @@ impl Input {
         let ctrl = win.is_key_down(Key::LeftCtrl) || win.is_key_down(Key::RightCtrl);
         let alt = win.is_key_down(Key::LeftAlt) || win.is_key_down(Key::RightAlt);
 
-        // AltGr is how most layouts outside the US reach @, € and the like, and Windows
+        // AltGr is how most layouts outside the US reach @ and the euro sign, and Windows
         // reports it as right Alt *plus a synthetic left Ctrl*. Forwarding those would
         // turn every AltGr character into a Ctrl-Alt shortcut on the far end, so while
         // it is down the modifiers it invents are held back and only the character it
@@ -1207,6 +1243,48 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
 
 /// A ZRLE "compressed pixel". Our pixel format puts all the colour in the low 3
 /// bytes, so CPIXELs drop the unused fourth byte: little-endian B, G, R.
+/// A Tight pixel. Three bytes, and - unlike ZRLE's CPIXEL, which keeps the byte order
+/// of the pixel format - the spec states these are red, green and blue in that order.
+/// Reusing the CPIXEL reader here swaps every red and blue on screen.
+fn tpixel(r: &mut impl Read) -> Res<u32> {
+    let b = rd::<3>(r)?;
+    Ok((b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32)
+}
+
+/// Tight's own length format: seven bits per byte, low group first, with the top bit
+/// meaning another byte follows. Three bytes at most.
+fn compact_len(r: &mut impl Read) -> Res<usize> {
+    let b0 = u8r(r)? as usize;
+    let mut len = b0 & 0x7f;
+    if b0 & 0x80 != 0 {
+        let b1 = u8r(r)? as usize;
+        len |= (b1 & 0x7f) << 7;
+        if b1 & 0x80 != 0 {
+            len |= (u8r(r)? as usize) << 14;
+        }
+    }
+    Ok(len)
+}
+
+/// Pull the next block out of a zlib stream that spans the whole connection.
+fn inflate(z: &mut flate2::Decompress, input: &[u8], expect: usize) -> Res<Vec<u8>> {
+    let mut out = Vec::with_capacity(expect + 4096);
+    let mut consumed = 0;
+    loop {
+        // decompress_vec only writes into spare capacity; it never grows the Vec.
+        if out.len() == out.capacity() {
+            out.reserve(expect.max(4096));
+        }
+        let (in0, out0) = (z.total_in(), z.total_out());
+        z.decompress_vec(&input[consumed..], &mut out, flate2::FlushDecompress::None)?;
+        consumed += (z.total_in() - in0) as usize;
+        // No input taken and no output produced means the stream is drained.
+        if z.total_in() == in0 && z.total_out() == out0 {
+            return Ok(out);
+        }
+    }
+}
+
 fn cpixel(r: &mut impl Read) -> Res<u32> {
     let b = rd::<3>(r)?;
     Ok((b[2] as u32) << 16 | (b[1] as u32) << 8 | b[0] as u32)
@@ -1229,12 +1307,17 @@ struct Decoder {
     /// ZRLE's zlib stream spans the whole connection, not one rectangle. Resetting
     /// it per rectangle decodes the first one and then produces garbage forever.
     zlib: flate2::Decompress,
+    /// Tight has four of them, also spanning the connection, and the server picks one
+    /// per rectangle and restarts whichever it likes. Four rather than one so that
+    /// different kinds of content each keep a dictionary suited to them.
+    tight: [flate2::Decompress; 4],
 }
 
 impl Decoder {
     fn new() -> Decoder {
         Decoder {
             zlib: flate2::Decompress::new(true),
+            tight: std::array::from_fn(|_| flate2::Decompress::new(true)),
         }
     }
 
@@ -1278,6 +1361,7 @@ impl Decoder {
         match enc {
             0 => self.raw(r, s, x, y, w, h),
             1 => self.copy_rect(r, s, x, y, w, h),
+            7 => self.tight(r, s, x, y, w, h),
             16 => self.zrle(r, s, x, y, w, h),
             _ => {
                 // Anything else carries a body whose length only that encoding
@@ -1346,26 +1430,218 @@ impl Decoder {
     }
 
     /// Feed one rectangle's bytes through the connection-wide zlib stream.
-    fn inflate(&mut self, input: &[u8], expect: usize) -> Res<Vec<u8>> {
-        let mut out = Vec::with_capacity(expect + 4096);
-        let mut consumed = 0;
-        loop {
-            // decompress_vec only writes into spare capacity; it never grows the Vec.
-            if out.len() == out.capacity() {
-                out.reserve(expect.max(4096));
-            }
-            let (in0, out0) = (self.zlib.total_in(), self.zlib.total_out());
-            self.zlib.decompress_vec(
-                &input[consumed..],
-                &mut out,
-                flate2::FlushDecompress::None,
-            )?;
-            consumed += (self.zlib.total_in() - in0) as usize;
-            // No input taken and no output produced means the stream is drained.
-            if self.zlib.total_in() == in0 && self.zlib.total_out() == out0 {
-                return Ok(out);
+    /// Tight (encoding 7), which is what most third-party servers reach for first.
+    ///
+    /// The rectangle opens with one control byte: the low nibble restarts any of the
+    /// four zlib streams, and the high nibble says what follows.
+    fn tight(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
+        let ctl = u8r(r)?;
+        for (i, z) in self.tight.iter_mut().enumerate() {
+            if ctl & (1 << i) != 0 {
+                z.reset(true);
             }
         }
+        if debug() {
+            // Which form a server actually chose is otherwise invisible, and a decoder
+            // can look correct simply by never being handed the hard cases.
+            let what = match ctl >> 4 {
+                0x08 => "fill".to_string(),
+                0x09 => "jpeg".to_string(),
+                t if t >= 0x0a => format!("bad type {t:#x}"),
+                t if t & 0x04 == 0 => format!("basic copy, stream {}", t & 3),
+                t => format!("basic filtered, stream {}", t & 3),
+            };
+            eprintln!("[debug] tight {w}x{h}: {what}");
+        }
+        match ctl >> 4 {
+            // Fill: one colour for the whole rectangle, and no compression involved.
+            0x08 => {
+                let c = tpixel(r)?;
+                for row in 0..h {
+                    let o = (y + row) * s.w + x;
+                    s.px[o..o + w].fill(c);
+                }
+                Ok(())
+            }
+            0x09 => self.tight_jpeg(r, s, x, y, w, h),
+            // 0x0A is TightPng, which is a different encoding number and not this one.
+            t @ 0x0a.. => {
+                Err(format!("tight compression type {t:#x} is not part of the encoding").into())
+            }
+            t => {
+                let stream = (t & 0x03) as usize;
+                // Without the flag the filter is Copy, and no byte is sent for it.
+                let filter = if t & 0x04 != 0 { u8r(r)? } else { 0 };
+                self.tight_basic(r, s, x, y, w, h, stream, filter)
+            }
+        }
+    }
+
+    /// The compressed forms: raw pixels, a palette, or a gradient prediction.
+    #[allow(clippy::too_many_arguments)]
+    fn tight_basic(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        stream: usize,
+        filter: u8,
+    ) -> Res<()> {
+        // The palette itself is *not* compressed. It sits between the filter byte and
+        // the compressed block, so it has to be read before the length is known.
+        let palette = match filter {
+            1 => {
+                let n = u8r(r)? as usize + 1;
+                let mut p = Vec::with_capacity(n);
+                for _ in 0..n {
+                    p.push(tpixel(r)?);
+                }
+                Some(p)
+            }
+            0 | 2 => None,
+            f => {
+                return Err(
+                    format!("tight filter {f} is not one of copy, palette or gradient").into(),
+                )
+            }
+        };
+
+        let expect = match &palette {
+            // Two colours are packed one bit per pixel, each row padded to a byte.
+            Some(p) if p.len() == 2 => w.div_ceil(8) * h,
+            Some(_) => w * h,
+            None => w * h * 3,
+        };
+
+        // Below a dozen bytes the server does not bother compressing, and sends no
+        // length either - the rectangle's size already says how much there is.
+        let data = if expect < 12 {
+            blob(r, expect)?
+        } else {
+            let n = compact_len(r)?;
+            let z = blob(r, n)?;
+            inflate(&mut self.tight[stream], &z, expect)?
+        };
+        if data.len() < expect {
+            return Err(format!("tight rect wanted {expect} bytes, got {}", data.len()).into());
+        }
+
+        match &palette {
+            Some(pal) if pal.len() == 2 => {
+                let stride = w.div_ceil(8);
+                for row in 0..h {
+                    for col in 0..w {
+                        let bit = data[row * stride + col / 8] >> (7 - col % 8) & 1;
+                        s.px[(y + row) * s.w + x + col] = pal[bit as usize];
+                    }
+                }
+            }
+            Some(pal) => {
+                for row in 0..h {
+                    for col in 0..w {
+                        let i = data[row * w + col] as usize;
+                        let c = pal
+                            .get(i)
+                            .ok_or_else(|| format!("tight palette index {i} of {}", pal.len()))?;
+                        s.px[(y + row) * s.w + x + col] = *c;
+                    }
+                }
+            }
+            // Gradient: each component is predicted from the pixels to the left, above
+            // and above-left, and what arrives is the difference from that prediction.
+            None if filter == 2 => {
+                let (mut prev, mut cur) = (vec![0u8; w * 3], vec![0u8; w * 3]);
+                for row in 0..h {
+                    for col in 0..w {
+                        for c in 0..3 {
+                            let left = if col > 0 {
+                                cur[(col - 1) * 3 + c] as i32
+                            } else {
+                                0
+                            };
+                            let up = prev[col * 3 + c] as i32;
+                            let upleft = if col > 0 {
+                                prev[(col - 1) * 3 + c] as i32
+                            } else {
+                                0
+                            };
+                            let guess = (left + up - upleft).clamp(0, 255);
+                            // Wrapping on purpose: the difference was taken mod 256.
+                            cur[col * 3 + c] = (data[(row * w + col) * 3 + c] as i32 + guess) as u8;
+                        }
+                        s.px[(y + row) * s.w + x + col] = (cur[col * 3] as u32) << 16
+                            | (cur[col * 3 + 1] as u32) << 8
+                            | cur[col * 3 + 2] as u32;
+                    }
+                    std::mem::swap(&mut prev, &mut cur);
+                }
+            }
+            // Copy: the pixels as they are.
+            None => {
+                for row in 0..h {
+                    for col in 0..w {
+                        let p = (row * w + col) * 3;
+                        s.px[(y + row) * s.w + x + col] =
+                            (data[p] as u32) << 16 | (data[p + 1] as u32) << 8 | data[p + 2] as u32;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A JPEG image covering the rectangle. This is the one lossy thing vncfree will
+    /// display, and only ever because a server chose to send it.
+    fn tight_jpeg(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
+        let n = compact_len(r)?;
+        let data = blob(r, n)?;
+        let mut dec = jpeg_decoder::Decoder::new(&data[..]);
+        let px = dec.decode()?;
+        let info = dec.info().ok_or("a JPEG rectangle with no header")?;
+        if info.width as usize != w || info.height as usize != h {
+            return Err(format!(
+                "JPEG is {}x{} but the rectangle is {w}x{h}",
+                info.width, info.height
+            )
+            .into());
+        }
+        // Servers send colour, but a greyscale JPEG is legal and cheap to allow for.
+        let step = match info.pixel_format {
+            jpeg_decoder::PixelFormat::RGB24 => 3,
+            jpeg_decoder::PixelFormat::L8 => 1,
+            f => return Err(format!("JPEG pixel format {f:?} is not supported").into()),
+        };
+        for row in 0..h {
+            for col in 0..w {
+                let p = (row * w + col) * step;
+                let (r8, g8, b8) = if step == 3 {
+                    (px[p], px[p + 1], px[p + 2])
+                } else {
+                    (px[p], px[p], px[p])
+                };
+                s.px[(y + row) * s.w + x + col] = (r8 as u32) << 16 | (g8 as u32) << 8 | b8 as u32;
+            }
+        }
+        Ok(())
     }
 
     fn zrle(
@@ -1379,7 +1655,7 @@ impl Decoder {
     ) -> Res<()> {
         let n = u32r(r)? as usize;
         let compressed = blob(r, n)?;
-        let data = self.inflate(&compressed, w * h * 3)?;
+        let data = inflate(&mut self.zlib, &compressed, w * h * 3)?;
         let mut d: &[u8] = &data;
         // 64x64 tiles in raster order; the right and bottom edges may be smaller.
         for ty in (0..h).step_by(64) {
@@ -1826,6 +2102,298 @@ mod tests {
         assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
     }
 
+    /// Build the 12-byte rectangle header Tight bodies hang off.
+    fn tight_rect(w: usize, h: usize, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u16.to_be_bytes()); // x
+        v.extend_from_slice(&0u16.to_be_bytes()); // y
+        v.extend_from_slice(&(w as u16).to_be_bytes());
+        v.extend_from_slice(&(h as u16).to_be_bytes());
+        v.extend_from_slice(&7i32.to_be_bytes()); // Tight
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn blank(w: usize, h: usize) -> Screen {
+        Screen {
+            w,
+            h,
+            px: vec![0; w * h],
+        }
+    }
+
+    /// Tight's length header, as a server would write it.
+    fn compact(n: usize) -> Vec<u8> {
+        if n < 0x80 {
+            vec![n as u8]
+        } else if n < 0x4000 {
+            vec![(n & 0x7f) as u8 | 0x80, (n >> 7) as u8]
+        } else {
+            vec![
+                (n & 0x7f) as u8 | 0x80,
+                ((n >> 7) & 0x7f) as u8 | 0x80,
+                (n >> 14) as u8,
+            ]
+        }
+    }
+
+    /// One block of a persistent zlib stream, flushed so the far end can read it back
+    /// without waiting for more.
+    fn deflate(z: &mut flate2::Compress, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + 1024);
+        z.compress_vec(data, &mut out, flate2::FlushCompress::Sync)
+            .unwrap();
+        out
+    }
+
+    /// A whole rectangle in one colour, and the byte order trap: TPIXEL is red, green,
+    /// blue, where ZRLE's CPIXEL in the very same decoder is blue, green, red. Reusing
+    /// the wrong one swaps every red and blue on screen and still decodes cleanly.
+    #[test]
+    fn tight_fill_is_one_colour_in_rgb_order() {
+        let mut s = blank(3, 2);
+        let body = [0x80, 0x11, 0x22, 0x33];
+        let touched = Decoder::new()
+            .rect(&mut &tight_rect(3, 2, &body)[..], &mut s)
+            .unwrap();
+        assert_eq!(touched, (0, 0, 3, 2));
+        assert!(s.px.iter().all(|&p| p == 0x0011_2233), "{:06x?}", s.px);
+    }
+
+    /// Under twelve bytes a server sends the pixels as they are: no length, no zlib.
+    #[test]
+    fn tight_copy_below_the_threshold_is_uncompressed() {
+        let mut s = blank(2, 1);
+        // Control byte 0: stream 0, no filter byte, so Copy. Then 2 pixels of 3 bytes.
+        let body = [0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff];
+        Decoder::new()
+            .rect(&mut &tight_rect(2, 1, &body)[..], &mut s)
+            .unwrap();
+        assert_eq!(s.px, vec![0x00ff_0000, 0x0000_00ff]);
+    }
+
+    /// Above it, a compact length and a zlib block off the stream the control byte named.
+    #[test]
+    fn tight_copy_above_the_threshold_is_deflated() {
+        let (w, h) = (4, 2);
+        let px: Vec<u8> = (0..w * h * 3).map(|i| (i * 7) as u8).collect();
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &px);
+
+        let mut body = vec![0x00]; // stream 0, Copy
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        for i in 0..w * h {
+            let e = (px[i * 3] as u32) << 16 | (px[i * 3 + 1] as u32) << 8 | px[i * 3 + 2] as u32;
+            assert_eq!(s.px[i], e, "pixel {i}");
+        }
+    }
+
+    /// Two colours are one bit per pixel, most significant first, and every row starts
+    /// on a fresh byte. A row that is not a multiple of eight wide is where that goes
+    /// wrong, so this one is nine across.
+    #[test]
+    fn tight_two_colour_palette_is_bit_packed_per_row() {
+        let (w, h) = (9, 2);
+        // Row 0: 101010101, row 1: 010101010 - each padded out to two bytes. Four
+        // bytes in total, which is under the threshold, so they go as they are.
+        let data = [0b1010_1010, 0b1000_0000, 0b0101_0101, 0b0000_0000];
+
+        // 0x40: basic compression, stream 0, and a filter byte follows.
+        let mut body = vec![0x40, 0x01, 0x01]; // filter Palette, two colours
+        body.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60]); // two TPIXELs
+        body.extend_from_slice(&data);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        let (a, b) = (0x0010_2030, 0x0040_5060);
+        assert_eq!(&s.px[..w], &[b, a, b, a, b, a, b, a, b], "row 0");
+        assert_eq!(&s.px[w..], &[a, b, a, b, a, b, a, b, a], "row 1");
+    }
+
+    /// More than two colours is a whole byte of index per pixel.
+    #[test]
+    fn tight_palette_indexes_one_byte_per_pixel() {
+        let (w, h) = (4, 3);
+        let data: Vec<u8> = (0..w * h).map(|i| (i % 3) as u8).collect();
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &data);
+
+        let mut body = vec![0x40, 0x01, 0x02]; // filter Palette, three colours
+        body.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0, 3]);
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        let pal = [0x0001_0000, 0x0000_0200, 0x0000_0003];
+        for i in 0..w * h {
+            assert_eq!(s.px[i], pal[i % 3], "pixel {i}");
+        }
+    }
+
+    /// An out-of-range palette index is a corrupt stream, not something to index with.
+    #[test]
+    fn tight_palette_index_past_the_end_is_refused() {
+        let (w, h) = (4, 3);
+        let data = vec![9u8; w * h];
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &data);
+        let mut body = vec![0x40, 0x01, 0x02];
+        body.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0, 3]);
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        assert!(Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .is_err());
+    }
+
+    /// The gradient filter sends the difference from a prediction made out of the
+    /// pixels left, above and above-left. All-zero differences mean every pixel is
+    /// exactly its own prediction, which for the first row and column is black.
+    #[test]
+    fn tight_gradient_predicts_from_its_neighbours() {
+        let (w, h) = (4, 3);
+        let mut want = vec![0u32; w * h];
+        let mut diff = vec![0u8; w * h * 3];
+        // Work out what a server would send for a known picture, then check the
+        // decoder puts that picture back.
+        let picture: Vec<[u8; 3]> = (0..w * h)
+            .map(|i| [(i * 17) as u8, (i * 5) as u8, (255 - i * 9) as u8])
+            .collect();
+        for row in 0..h {
+            for col in 0..w {
+                for c in 0..3 {
+                    let left = if col > 0 {
+                        picture[row * w + col - 1][c] as i32
+                    } else {
+                        0
+                    };
+                    let up = if row > 0 {
+                        picture[(row - 1) * w + col][c] as i32
+                    } else {
+                        0
+                    };
+                    let upleft = if col > 0 && row > 0 {
+                        picture[(row - 1) * w + col - 1][c] as i32
+                    } else {
+                        0
+                    };
+                    let guess = (left + up - upleft).clamp(0, 255);
+                    diff[(row * w + col) * 3 + c] =
+                        (picture[row * w + col][c] as i32 - guess) as u8;
+                }
+                let p = picture[row * w + col];
+                want[row * w + col] = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+            }
+        }
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &diff);
+        let mut body = vec![0x40, 0x02]; // filter Gradient
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        assert_eq!(s.px, want);
+    }
+
+    /// The four streams are independent and span the connection, and the server
+    /// restarts whichever it likes with the low nibble of the control byte. Getting
+    /// that wrong decodes the first rectangle and then produces garbage, which is the
+    /// same trap ZRLE's single stream already has a note about.
+    #[test]
+    fn tight_streams_are_separate_and_resettable() {
+        let (w, h) = (4, 2);
+        let one: Vec<u8> = (0..w * h * 3).map(|i| i as u8).collect();
+        let two: Vec<u8> = (0..w * h * 3).map(|i| (200 - i) as u8).collect();
+        let mut dec = Decoder::new();
+
+        // Stream 1 carries two blocks in a row: the second only decodes if the first
+        // left the dictionary in place.
+        let mut z1 = flate2::Compress::new(flate2::Compression::default(), true);
+        for want in [&one, &two] {
+            let block = deflate(&mut z1, want);
+            let mut body = vec![0x01 << 4]; // stream 1, Copy, no reset
+            body.extend_from_slice(&compact(block.len()));
+            body.extend_from_slice(&block);
+            let mut s = blank(w, h);
+            dec.rect(&mut &tight_rect(w, h, &body)[..], &mut s).unwrap();
+            assert_eq!(
+                s.px[0],
+                (want[0] as u32) << 16 | (want[1] as u32) << 8 | want[2] as u32
+            );
+        }
+
+        // Now restart stream 1 and send a fresh one down it.
+        let mut z1b = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z1b, &one);
+        let mut body = vec![0x01 << 4 | 0x02]; // stream 1, and reset stream 1
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+        let mut s = blank(w, h);
+        dec.rect(&mut &tight_rect(w, h, &body)[..], &mut s).unwrap();
+        assert_eq!(
+            s.px[0],
+            (one[0] as u32) << 16 | (one[1] as u32) << 8 | one[2] as u32
+        );
+    }
+
+    #[test]
+    fn compact_lengths_take_one_to_three_bytes() {
+        assert_eq!(compact_len(&mut &[0x7f][..]).unwrap(), 127);
+        assert_eq!(compact_len(&mut &compact(127)[..]).unwrap(), 127);
+        assert_eq!(compact_len(&mut &compact(128)[..]).unwrap(), 128);
+        assert_eq!(compact_len(&mut &compact(16383)[..]).unwrap(), 16383);
+        assert_eq!(compact_len(&mut &compact(16384)[..]).unwrap(), 16384);
+        assert_eq!(compact_len(&mut &compact(1 << 20)[..]).unwrap(), 1 << 20);
+        // And the byte counts themselves, since the encoder above is ours too.
+        assert_eq!(compact(127).len(), 1);
+        assert_eq!(compact(128).len(), 2);
+        assert_eq!(compact(16384).len(), 3);
+    }
+
+    /// A real JPEG from a real encoder, in four quadrants. Lossy, so the check is
+    /// approximate - but a red and blue the wrong way round is not approximate.
+    #[test]
+    fn tight_jpeg_decodes_with_the_channels_the_right_way_round() {
+        let jpeg = include_bytes!("../../tests/fixtures/quadrants.jpg");
+        let mut body = vec![0x09 << 4];
+        body.extend_from_slice(&compact(jpeg.len()));
+        body.extend_from_slice(jpeg);
+
+        let mut s = blank(16, 16);
+        Decoder::new()
+            .rect(&mut &tight_rect(16, 16, &body)[..], &mut s)
+            .unwrap();
+
+        let at = |x: usize, y: usize| {
+            let p = s.px[y * 16 + x];
+            ((p >> 16) as i32, (p >> 8 & 0xff) as i32, (p & 0xff) as i32)
+        };
+        let near = |got: (i32, i32, i32), want: (i32, i32, i32), what: &str| {
+            let d = (got.0 - want.0).abs() + (got.1 - want.1).abs() + (got.2 - want.2).abs();
+            assert!(d < 60, "{what}: got {got:?}, wanted about {want:?}");
+        };
+        near(at(3, 3), (220, 20, 20), "top left is red");
+        near(at(12, 3), (20, 200, 20), "top right is green");
+        near(at(3, 12), (20, 20, 220), "bottom left is blue");
+        near(at(12, 12), (240, 240, 240), "bottom right is white");
+    }
+
     /// keysym() does range arithmetic on minifb's enum. If a future minifb reorders
     /// these variants that arithmetic silently produces wrong keys, so pin it here.
     #[test]
@@ -1934,9 +2502,9 @@ mod tests {
     fn characters_become_the_right_keysyms() {
         // Latin-1 is its own keysym: 'a', and the UK pound sign.
         assert_eq!(sym_for_char('a' as u32), Some(0x61));
-        assert_eq!(sym_for_char('£' as u32), Some(0xa3));
+        assert_eq!(sym_for_char('\u{a3}' as u32), Some(0xa3), "pound sign");
         // Beyond that, the Unicode block. The euro is the one every AltGr layout has.
-        assert_eq!(sym_for_char('€' as u32), Some(0x0100_20ac));
+        assert_eq!(sym_for_char('\u{20ac}' as u32), Some(0x0100_20ac), "euro");
         // Control codes are keys, handled by the table, and must not arrive twice.
         assert_eq!(sym_for_char(0x0d), None, "Enter");
         assert_eq!(sym_for_char(0x08), None, "Backspace");

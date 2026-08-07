@@ -27,14 +27,34 @@ like a broken decoder — a black screen.
 
 ## Checking an encoding is right
 
-Grab the same screen twice, once with `VNC_RAW_ONLY=1` and once without, and compare
-the files. They must be byte-identical. Take a third Raw grab to prove the screen was
-static, otherwise a difference might just be the clock ticking.
+Grab the same screen twice with `VNC_ENCODING` set to `raw` and then to the encoding
+under test, and compare the files. They must be byte-identical. Take a third Raw grab
+to prove the screen was static, otherwise a difference might just be the clock ticking.
 
 That is how the client's ZRLE decoder and the server's ZRLE encoder were both checked:
 identical output at 3840x2160, with the debug line confirming which encoding was
 actually negotiated. Without that confirmation the comparison passes trivially when the
 server quietly falls back to Raw.
+
+### Tight, against TigerVNC
+
+A decoder can look correct simply by never being handed the hard cases, so `VNC_DEBUG`
+prints which form each Tight rectangle used. Driving TigerVNC through all of them is a
+matter of changing what is on the screen:
+
+```sh
+DISPLAY=:1 xsetroot -solid 'rgb:20/40/80'                      # fill
+DISPLAY=:1 xsetroot -mod 3 5 -fg 'rgb:ff/20/40' -bg 'rgb:10/80/c0'   # palette
+convert -size 800x600 plasma:fractal /tmp/p.png
+DISPLAY=:1 display -window root /tmp/p.png                     # basic copy
+```
+
+Each of those came back byte-identical to the same screen as Raw. JPEG needs one more
+step: TigerVNC only sends it when the client asks for a lossy quality level, so
+`VNC_QUALITY=5` is what makes that path reachable at all. It cannot be compared for
+equality — it is lossy — so compare the mean channel error instead. Around 4 out of 255
+on a plasma image is JPEG doing its job; a swapped red and blue, or a misframed blob,
+is not a small number.
 
 ## Traps in the test harness itself
 

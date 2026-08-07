@@ -30,6 +30,7 @@ Only where hand-rolling would be reckless:
 | `arboard` | Clipboard, with the image-format support turned off. |
 | `windows-sys` | Screen capture, input injection and the dialogs. |
 | `rustls`, `rcgen`, `sha2` | TLS, the self-signed certificate it presents, and the fingerprint of it. Built with `ring` rather than `aws-lc-rs` so the build needs no cmake or nasm. |
+| `jpeg-decoder` | Client only. Tight rectangles can arrive as JPEG, and a baseline JPEG decoder is not a thing to hand-roll. Default features off, so it brings no thread pool. |
 | `windows` | Desktop Duplication only. It is COM, and `windows-sys` has no COM support — several hundred lines of hand-written vtable calls in unsafe code, against a crate that brings reference counting and `QueryInterface`. Worth it when the alternative is managing COM lifetimes by hand. |
 
 RFB itself is hand-rolled over `std::net::TcpStream` — the spec is small and the crates
@@ -111,6 +112,39 @@ A client that never asked for -223 cannot be told, and there is no way to keep s
 it correctly. That session ends with an explanatory error, which is honest and lands
 somewhere useful — a reconnect negotiates the new size properly, and vncfree's own
 client reconnects by itself.
+
+## Tight, and why only one direction
+
+The client decodes Tight; the server does not produce it. That asymmetry is the whole
+point of implementing it. Plenty of servers speak Tight and not ZRLE — TightVNC's own
+among them — and against those the client used to fall all the way back to Raw. Going
+the other way buys nothing: our server already sends ZRLE, which is a comparable size
+and lossless, and encoding Tight properly means carrying a JPEG *encoder*.
+
+The format is fiddlier than ZRLE and most of the fiddliness is silent:
+
+- **TPIXEL is red, green, blue.** ZRLE's CPIXEL, in the same decoder, is blue, green,
+  red — it keeps the byte order of the pixel format, while Tight's spec states the
+  order outright. Reusing the ZRLE reader swaps every red and blue and still decodes
+  perfectly cleanly.
+- **Four zlib streams**, each spanning the connection like ZRLE's one, with the server
+  restarting whichever it likes via the low nibble of the control byte.
+- **The palette is not compressed.** It sits between the filter byte and the compressed
+  block, so it has to be read before the block's length is even known.
+- **Under twelve bytes nothing is compressed and no length is sent** — the rectangle's
+  own size says how much there is. A small rectangle takes a different path through the
+  decoder than a large one containing the same picture.
+- **Two-colour palettes are one bit per pixel with every row padded to a byte**, so a
+  rectangle whose width is not a multiple of eight is where that goes wrong.
+
+Because a decoder can pass by never being handed the hard cases, `VNC_DEBUG` prints
+which form each rectangle used, and [testing.md](testing.md) records how to make a real
+TigerVNC send each one.
+
+JPEG is the only lossy thing vncfree will ever display, and only because a server chose
+to send it. The client does not ask for a quality level unless told to, which is what
+keeps TigerVNC sending lossless Tight; `VNC_QUALITY` is there for a link slow enough
+that the trade is worth making.
 
 ## Keyboard layouts belong to Windows, not to us
 

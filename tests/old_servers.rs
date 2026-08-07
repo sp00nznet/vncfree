@@ -131,7 +131,7 @@ fn one_frame_from(minor: u32) -> String {
         .arg(addr.to_string())
         .arg(&out)
         .env("VNC_PASSWORD", PASSWORD)
-        .env("VNC_RAW_ONLY", "1")
+        .env("VNC_ENCODING", "raw")
         .env_remove("VNC_TLS")
         .env_remove("VNC_USERNAME")
         .status()

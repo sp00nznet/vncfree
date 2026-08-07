@@ -39,6 +39,7 @@ rustls = { version = "0.23.43", default-features = false, features = ["ring", "s
 rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"] }
 rustls-pki-types = "1.15.1"
 sha2 = "0.11.0"
+jpeg-decoder = { version = "0.3.2", default-features = false }
 
 # Screen capture, input injection and the dialogs. windows-sys is the plain binding
 # crate and is all the flat C API needs.

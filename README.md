@@ -68,7 +68,8 @@ All environment variables. There is no config file and nothing is written to dis
 | `VNC_BIND` | Server only. Where to listen; default `0.0.0.0:5900`. |
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
 | `VNC_TLS` | `offer` (default), `require` or `off`. On the client, `require` refuses to connect to a server that will not encrypt. |
-| `VNC_RAW_ONLY=1` | Disable ZRLE and CopyRect. Answers "is it my decoder or the server?" |
+| `VNC_ENCODING` | Client only. `raw`, `tight` or `zrle` to ask for exactly one. Answers "is it my decoder or the server?" |
+| `VNC_QUALITY` | Client only, `0`–`9`. Lets a Tight server send lossy JPEG, which is much smaller on a slow link. Unset means lossless. |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
 | `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
 | `VNC_MONITOR=all` | Server only. Share every display as one screen, not just the primary. |
@@ -83,7 +84,7 @@ visible to every process on the machine.
 |---|---|
 | **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode. **Ctrl-Shift-V** types the local clipboard at the remote machine, for servers that will not share one |
 | **Server** | Desktop Duplication capture with the cursor, keyboard and mouse injection, clipboard, mandatory password. An idle desktop costs about 20x less CPU than the `BitBlt` it falls back to |
-| **Encodings** | Raw, CopyRect, ZRLE. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
+| **Encodings** | Raw, CopyRect, ZRLE, and Tight for servers that speak nothing else. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
 | **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
 | **Encryption** | TLS 1.3 over VeNCrypt, on by default, with the password exchanged inside it. `VNC_TLS=require` refuses to fall back |
 | **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, macOS's own client, and itself |
@@ -118,9 +119,12 @@ authentication, so there is no unauthenticated path at all.
   channel (port 3283) rather than on the VNC connection — established by watching both
   directions and Apple's own client. **Ctrl-Shift-V types the local clipboard at the
   remote machine instead**, which works anywhere. See [docs/macos.md](docs/macos.md).
-- No Tight encoding, and the server's CopyRect covers vertical scrolling but not a
-  window dragged sideways. Compatibility is unaffected — these cost bytes, not
-  connections.
+- **Tight is decode-only.** The client reads it, so servers that offer nothing better
+  are no longer stuck on Raw; the server still sends ZRLE, which is a comparable size
+  and lossless. Encoding Tight well means a JPEG *encoder*, which is a lot of weight
+  for a squeeze on top of what is already there.
+- The server's CopyRect covers vertical scrolling but not a window dragged sideways.
+  Compatibility is unaffected — that costs bytes, not connections.
 - The server shares the primary monitor by default; `VNC_MONITOR=all` shares every
   display as one screen. **That has not been tested against a real second monitor** —
   only one display was attached to the development machine — and sharing more than one

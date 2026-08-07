@@ -24,6 +24,7 @@
 | 19 | TLS, via VeNCrypt, so the session is not readable by anyone on the network | done |
 | 20 | Client-side RFB 3.3 and 3.7, so old servers are not locked out either | done |
 | 21 | Non-US keyboard layouts, via the layout Windows has already applied | done |
+| 22 | Tight decoding, so servers that speak nothing better are not stuck on Raw | done |
 
 ## Ideas, not commitments
 
@@ -33,8 +34,9 @@ Roughly in the order they would earn their keep:
   sharing over Apple Remote Desktop's channel on port 3283, not over VNC at all, so
   there is nothing to implement on the RFB side. See [macos.md](macos.md). A bridge
   over SSH using `pbcopy`/`pbpaste` would be a fraction of the effort if it is wanted.
-- **Tight encoding.** Four persistent zlib streams and a JPEG decoder for a squeeze on
-  top of ZRLE. Low value, high effort.
+- **Tight *encoding*, on the server.** The client decodes it now; producing it means a
+  JPEG encoder, for a squeeze on top of the ZRLE the server already sends. Low value,
+  high weight.
 - **Somewhere to keep a known fingerprint.** TLS is in, but the certificate is
   self-signed and comparing the two printed fingerprints is a manual step. Remembering
   one per host, the way SSH does, would make a changed certificate something the
