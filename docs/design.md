@@ -12,6 +12,7 @@ side answers the challenge, the other sets it) and the clipboard text encoding.
 
 ```
 src/lib.rs         shared protocol
+src/wire.rs        the transport: a socket, or a socket with TLS over it
 src/gui.rs         the native dialog, shared
 src/bin/client.rs  viewer
 src/bin/server.rs  screen sharing
@@ -28,6 +29,7 @@ Only where hand-rolling would be reckless:
 | `minifb` | A window and a `u32` framebuffer to blit into. Nothing else. |
 | `arboard` | Clipboard, with the image-format support turned off. |
 | `windows-sys` | Screen capture, input injection and the dialogs. |
+| `rustls`, `rcgen`, `sha2` | TLS, the self-signed certificate it presents, and the fingerprint of it. Built with `ring` rather than `aws-lc-rs` so the build needs no cmake or nasm. |
 | `windows` | Desktop Duplication only. It is COM, and `windows-sys` has no COM support — several hundred lines of hand-written vtable calls in unsafe code, against a crate that brings reference counting and `QueryInterface`. Worth it when the alternative is managing COM lifetimes by hand. |
 
 RFB itself is hand-rolled over `std::net::TcpStream` — the spec is small and the crates
@@ -109,6 +111,72 @@ A client that never asked for -223 cannot be told, and there is no way to keep s
 it correctly. That session ends with an explanatory error, which is honest and lands
 somewhere useful — a reconnect negotiates the new size properly, and vncfree's own
 client reconnects by itself.
+
+## TLS, and the one thing it cannot do
+
+The session is encrypted with TLS 1.3, negotiated through VeNCrypt (security type 19)
+and using the X509Vnc subtype: TLS first, then the ordinary VNC password exchange
+inside it.
+
+VeNCrypt's other TLS subtypes authenticate the server with **anonymous**
+Diffie-Hellman. That encrypts the traffic and offers no way whatsoever to tell whether
+you are talking to the server or to someone relaying for it, which is why no current
+TLS library implements it — rustls included. A self-signed certificate is the same
+amount of trust with a fingerprint attached that can actually be compared, so that is
+what this uses.
+
+The certificate is generated when the server starts, not per connection, and not
+loaded from disk. Per connection would give a different fingerprint on every reconnect,
+which is not something anyone can check against anything; from disk would mean writing
+a private key out, and this program deliberately writes nothing. The consequence is
+that the fingerprint is stable for as long as the server is running and changes when it
+restarts.
+
+The client accepts whatever certificate it is shown. That reads like a hole and is
+worth being exact about: there is no certificate authority for a program somebody
+started on a desktop five minutes ago, so refusing unsigned certificates would mean
+refusing every server. The choice is not between trusting it and verifying it, it is
+between trusting it and staying unencrypted. Signatures are still checked properly —
+skipping those would let anyone replay a certificate they hold no key for, which is
+weaker again. What closes the gap is the fingerprint printed at both ends.
+
+Both ends default to *offering* encryption rather than requiring it, because a client
+that has never heard of VeNCrypt still has to be able to connect — macOS's own viewer
+speaks RFB 3.3, which has no security negotiation at all. That leaves a downgrade open:
+anyone in the middle can strip the encrypted option from a list that also contains an
+unencrypted one. `VNC_TLS=require` removes the choice, at either end.
+
+### The transport is two halves, not one stream
+
+Everything above `src/wire.rs` reads and writes through `impl Read` and `impl Write`
+and never learns which it got. That is the only reason TLS was a contained change: the
+protocol code did not move.
+
+What did have to change is how the two halves are obtained. Both programs run a reader
+and a writer concurrently and used to get them by duplicating the socket with
+`try_clone`. A TLS session cannot be duplicated — rustls keeps one connection object
+holding the state for both directions. So each half keeps its own socket handle and
+they share the session behind a mutex, which means the blocking wait for bytes still
+happens *outside* the lock and only the encryption and decryption are serialised. A
+reader parked on an idle screen must never be able to stop the other thread sending a
+mouse movement, and there is a test that fails if that inverts.
+
+Three things in rustls's low-level API cost real time here, all of which produce
+symptoms that point somewhere else entirely:
+
+- **It caps the plaintext it will buffer** — 64KB by default — and then accepts no
+  more. A framebuffer update is routinely larger, so handing it a whole frame fails
+  partway with `failed to write whole buffer`, which reads as a network fault. Fill,
+  flush to the socket, repeat.
+- **`read_tls` takes only as much ciphertext as it can hold**, which is regularly less
+  than one socket read returned. Dropping the remainder corrupts the stream from that
+  point on, and it surfaces as a decrypt failure much later, with nothing pointing at
+  the read that lost the bytes.
+- **`read_tls` and `process_new_packets` must alternate.** Two reads in a row fail with
+  `message buffer full`.
+
+Each of those was found by a test that now stays: a 300KB write, a message split across
+records, and a blocked reader that must not block a writer.
 
 ## Costing the ZRLE subencodings instead of guessing
 

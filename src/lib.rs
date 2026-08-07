@@ -8,6 +8,7 @@
 
 #[cfg(windows)]
 pub mod gui;
+pub mod wire;
 
 use std::env;
 use std::io::Read;

@@ -67,6 +67,7 @@ All environment variables. There is no config file and nothing is written to dis
 | `VNC_USERNAME` | macOS account name. Only needed for a Mac. |
 | `VNC_BIND` | Server only. Where to listen; default `0.0.0.0:5900`. |
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
+| `VNC_TLS` | `offer` (default), `require` or `off`. On the client, `require` refuses to connect to a server that will not encrypt. |
 | `VNC_RAW_ONLY=1` | Disable ZRLE and CopyRect. Answers "is it my decoder or the server?" |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
 | `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
@@ -84,6 +85,7 @@ visible to every process on the machine.
 | **Server** | Desktop Duplication capture with the cursor, keyboard and mouse injection, clipboard, mandatory password. An idle desktop costs about 20x less CPU than the `BitBlt` it falls back to |
 | **Encodings** | Raw, CopyRect, ZRLE. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
 | **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
+| **Encryption** | TLS 1.3 over VeNCrypt, on by default, with the password exchanged inside it. `VNC_TLS=require` refuses to fall back |
 | **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, macOS's own client, and itself |
 
 The server speaks RFB 3.3 as well as 3.8, so **the viewer built into every Mac can
@@ -96,10 +98,20 @@ authentication, so there is no unauthenticated path at all.
 
 ## Known limits
 
-- **No TLS.** Apple DH protects the credentials in transit but not the session, and
-  classic VNC auth is DES and weak by modern standards. Neither encrypts the
-  framebuffer or your keystrokes — **tunnel over SSH or a VPN if the link isn't
-  trusted**, and don't port-forward this to the internet.
+- **TLS encrypts the session but does not prove who is on the other end.** Both ends
+  print the certificate's fingerprint; if they match, nobody is sitting in the middle.
+  Nothing checks that for you, because there is no certificate authority for a program
+  someone started on a desktop five minutes ago. A server that offers both encrypted
+  and unencrypted connections can also be pushed to the unencrypted one by someone in
+  the middle — `VNC_TLS=require` at either end removes that choice. **Still don't
+  port-forward this to the internet**: tunnel over SSH or a VPN.
+- **Encryption needs both ends to be vncfree.** VeNCrypt's other TLS modes use
+  anonymous Diffie-Hellman, which cannot detect anyone in the middle at all and which
+  no current TLS library implements; vncfree speaks the X509 form instead. Against
+  another client or server the connection falls back to plain VNC auth, which is DES
+  and weak by modern standards.
+- **A Mac connection is not encrypted.** macOS offers Apple Diffie-Hellman, not
+  VeNCrypt. That protects the credentials in transit but not the session.
 - **Clipboard does not work against macOS, and cannot.** It works both directions
   against TigerVNC, but macOS puts clipboard sharing on Apple Remote Desktop's own
   channel (port 3283) rather than on the VNC connection — established by watching both

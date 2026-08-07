@@ -32,7 +32,7 @@ use vncfree::{
 /// Shared write half. Both the network thread (update requests) and the UI thread
 /// (input events) write to this socket, and an interleaved write would desync the
 /// protocol, so every whole message goes out under this lock.
-type Writer = Arc<Mutex<Option<TcpStream>>>;
+type Writer = Arc<Mutex<Option<vncfree::wire::WireWrite>>>;
 
 /// Write one whole message. Does nothing while disconnected: input and clipboard
 /// events raised during a reconnect have nowhere to go, and that is not an error.
@@ -126,6 +126,58 @@ fn apple_dh_auth(r: &mut impl Read, w: &mut impl Write, username: &str, password
     Ok(())
 }
 
+/// The VeNCrypt sub-negotiation, up to the point where TLS takes over. Returns the two
+/// encrypted halves and the server certificate's fingerprint.
+///
+/// Only the X509 subtypes are usable here. VeNCrypt's plain TLS types authenticate with
+/// anonymous Diffie-Hellman, which offers no defence against someone sitting in the
+/// middle and which rustls does not implement. A server offering only those is refused
+/// with an explanation rather than silently downgraded.
+fn vencrypt(
+    tcp: &mut TcpStream,
+) -> Res<(vncfree::wire::WireRead, vncfree::wire::WireWrite, String)> {
+    const X509_VNC: u32 = 261;
+
+    let theirs = rd::<2>(tcp)?;
+    if theirs[0] != 0 || theirs[1] < 2 {
+        return Err(format!(
+            "server speaks VeNCrypt {}.{}, and vncfree needs 0.2",
+            theirs[0], theirs[1]
+        )
+        .into());
+    }
+    tcp.write_all(&[0, 2])?;
+    if u8r(tcp)? != 0 {
+        return Err("server rejected VeNCrypt 0.2".into());
+    }
+
+    let n = u8r(tcp)? as usize;
+    let list = blob(tcp, n * 4)?;
+    let subtypes: Vec<u32> = list
+        .chunks(4)
+        .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+        .collect();
+    if debug() {
+        eprintln!("[debug] VeNCrypt subtypes offered {subtypes:?}");
+    }
+    if !subtypes.contains(&X509_VNC) {
+        return Err(format!(
+            "server offers VeNCrypt subtypes {subtypes:?}, none of which vncfree can \
+             use. It needs X509Vnc (261): the TLS* subtypes authenticate with anonymous \
+             Diffie-Hellman, which cannot detect anyone sitting in the middle of the \
+             connection and which no current TLS library will do."
+        )
+        .into());
+    }
+    tcp.write_all(&X509_VNC.to_be_bytes())?;
+    // Unlike every other acknowledgement in RFB, *one* means success here.
+    if u8r(tcp)? != 1 {
+        return Err("server refused the X509Vnc subtype it had just offered".into());
+    }
+
+    vncfree::wire::client(tcp.try_clone()?)
+}
+
 /// Everything needed to open the connection again after it drops.
 struct Target {
     addr: String,
@@ -134,7 +186,7 @@ struct Target {
 }
 
 struct Vnc {
-    r: BufReader<TcpStream>,
+    r: BufReader<vncfree::wire::WireRead>,
     w: Writer,
     screen: Screen,
     name: String,
@@ -254,14 +306,17 @@ impl Vnc {
             .map_err(|e| format!("{addr:?} is not a usable address: {e}"))?
             .next()
             .ok_or_else(|| format!("{addr:?} did not resolve to anything"))?;
-        let tcp = TcpStream::connect_timeout(&resolved, std::time::Duration::from_secs(10))
+        let mut tcp = TcpStream::connect_timeout(&resolved, std::time::Duration::from_secs(10))
             .map_err(|e| format!("could not connect to {addr}: {e}"))?;
         tcp.set_nodelay(true)?;
-        let mut w = tcp.try_clone()?;
-        let mut r = BufReader::new(tcp);
 
+        // Everything up to the security type is read straight off the socket rather
+        // than through a BufReader. A BufReader takes whatever has arrived, and if the
+        // security handshake is about to hand the connection over to TLS, bytes it read
+        // ahead into its own buffer are bytes the TLS session never sees.
+        //
         // --- version handshake ---
-        let ver = String::from_utf8_lossy(&rd::<12>(&mut r)?)
+        let ver = String::from_utf8_lossy(&rd::<12>(&mut tcp)?)
             .trim_end()
             .to_string();
         // Apple's Screen Sharing announces "RFB 003.889". Replying 003.008 makes it
@@ -277,18 +332,28 @@ impl Vnc {
                 format!("server speaks {ver:?}; vncfree needs RFB 003.008 or later").into(),
             );
         }
-        w.write_all(b"RFB 003.008\n")?;
+        tcp.write_all(b"RFB 003.008\n")?;
 
         // --- security handshake ---
-        let n = u8r(&mut r)? as usize;
+        let n = u8r(&mut tcp)? as usize;
         if n == 0 {
-            return Err(format!("server refused connection: {}", text(&mut r)?).into());
+            return Err(format!("server refused connection: {}", text(&mut tcp)?).into());
         }
-        let types = blob(&mut r, n)?;
+        let types = blob(&mut tcp, n)?;
         if debug() {
             eprintln!("[debug] server version {ver:?}, security types offered {types:?}");
         }
-        let chosen = if types.contains(&1) {
+        let want_tls = env::var("VNC_TLS").unwrap_or_default() == "require";
+        // VeNCrypt first: it is the only one of these that encrypts anything.
+        let chosen = if types.contains(&19) {
+            19 // VeNCrypt: TLS, then one of the others inside it
+        } else if want_tls {
+            return Err(format!(
+                "VNC_TLS=require is set and this server does not offer VeNCrypt; it \
+                 offered security types {types:?}"
+            )
+            .into());
+        } else if types.contains(&1) {
             1 // None
         } else if types.contains(&2) {
             2 // VNC auth: DES, 8-character passwords, no username
@@ -300,7 +365,24 @@ impl Vnc {
         if debug() {
             eprintln!("[debug] chose security type {chosen}");
         }
-        w.write_all(&[chosen])?;
+        tcp.write_all(&[chosen])?;
+
+        // VeNCrypt hands the connection to TLS and then runs one of the ordinary
+        // security types inside it, so `chosen` becomes whatever that turns out to be.
+        let (reader, mut w, chosen) = if chosen == 19 {
+            let (r, w, print) = vencrypt(&mut tcp)?;
+            eprintln!("session encrypted; certificate {print}");
+            eprintln!(
+                "  compare that against the line the server printed - if they \
+                       differ, something is sitting between you and it"
+            );
+            (r, w, 2)
+        } else {
+            let (r, w) = vncfree::wire::plain(tcp)?;
+            (r, w, chosen)
+        };
+        let mut r = BufReader::new(reader);
+
         match chosen {
             2 => {
                 if password.is_empty() {

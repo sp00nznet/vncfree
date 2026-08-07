@@ -8,7 +8,7 @@
 //! both landing in a DIB that already holds 0x00RRGGBB pixels, so the framebuffer
 //! needs no conversion. Input is injected with SendInput.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1173,7 +1173,7 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
 
 /// Shared between a client's reader thread and its sender thread.
 struct Shared {
-    out: Mutex<TcpStream>,
+    out: Mutex<vncfree::wire::WireWrite>,
     fmt: Mutex<PixFmt>,
     /// The client has an outstanding FramebufferUpdateRequest. RFB is request-driven:
     /// nothing may be sent until one arrives.
@@ -1217,7 +1217,8 @@ fn ask_for_password(bind: &str) -> Res<Option<(String, String)>> {
     let note = match vncfree::gui::lan_ip() {
         Some(ip) => format!(
             "This machine is {ip} on the local network.\n\
-             Do not port-forward this. Tunnel over SSH or a VPN."
+             Sessions are encrypted, but do not port-forward this.\n\
+             Tunnel over SSH or a VPN."
         ),
         None => "Could not work out this machine's local address.".to_string(),
     };
@@ -1276,21 +1277,39 @@ fn run() -> Res<()> {
         eprintln!("warning: VNC auth uses only the first 8 characters of the password");
     }
 
+    // One certificate for the life of the server, so the fingerprint printed here is
+    // the one every client will see and can be compared against.
+    let tls_mode = TlsMode::from_env()?;
+    let me = match tls_mode {
+        TlsMode::Off => None,
+        _ => Some(Arc::new(vncfree::wire::Identity::new()?)),
+    };
+
     let listener =
         TcpListener::bind(&bind).map_err(|e| format!("could not listen on {bind}: {e}"))?;
     let (ox, oy, w, h) = win::share_region();
     println!("vncfree-server listening on {bind}, sharing {w}x{h}");
+    match &me {
+        Some(me) => println!(
+            "TLS certificate {}\n  \
+             the client prints the same line - if they differ, something is sitting \
+             between you and it",
+            me.fingerprint
+        ),
+        None => println!("VNC_TLS=off: this session will not be encrypted"),
+    }
 
     for stream in listener.incoming() {
         let stream = stream?;
         let password = password.clone();
+        let me = me.clone();
         let peer = stream
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_default();
         std::thread::spawn(move || {
             println!("client connected: {peer}");
-            match serve(stream, &password, ox, oy, w, h) {
+            match serve(stream, &password, me.as_deref(), ox, oy, w, h) {
                 Ok(()) => println!("client {peer} disconnected"),
                 Err(e) => println!("client {peer} finished: {e}"),
             }
@@ -1299,7 +1318,15 @@ fn run() -> Res<()> {
     Ok(())
 }
 
-fn serve(mut tcp: TcpStream, password: &str, ox: i32, oy: i32, w: usize, h: usize) -> Res<()> {
+fn serve(
+    mut tcp: TcpStream,
+    password: &str,
+    me: Option<&vncfree::wire::Identity>,
+    ox: i32,
+    oy: i32,
+    w: usize,
+    h: usize,
+) -> Res<()> {
     tcp.set_nodelay(true)?;
 
     // --- version ---
@@ -1320,34 +1347,66 @@ fn serve(mut tcp: TcpStream, password: &str, ox: i32, oy: i32, w: usize, h: usiz
         .unwrap_or(3);
     let old = minor < 7;
 
-    // --- security: VNC auth only, because a password is always required ---
+    // --- security ---
+    // Whichever type is chosen, the password is checked the same way afterwards; all
+    // that differs is whether the rest of the session is encrypted.
+    let tls_mode = TlsMode::from_env()?;
+    let mut encrypted = false;
     if old {
         // 3.3 has no negotiation: the server states the type as a u32, and that is it.
+        // There is no way to offer TLS to a client this old.
+        if tls_mode == TlsMode::Require {
+            return Err(
+                "a client asked for RFB 3.3, which cannot negotiate TLS, and \
+                        VNC_TLS=require is set"
+                    .into(),
+            );
+        }
         tcp.write_all(&2u32.to_be_bytes())?;
     } else {
-        tcp.write_all(&[1, 2])?; // a list of one: 2 = VNC auth
-        if u8r(&mut tcp)? != 2 {
-            return refuse(
-                &mut tcp,
-                old,
-                b"vncfree-server only offers VNC authentication",
-            );
+        let mut offer = vec![2u8]; // 2 = VNC auth, unencrypted
+        if tls_mode != TlsMode::Off {
+            offer.insert(0, 19); // 19 = VeNCrypt
+        }
+        if tls_mode == TlsMode::Require {
+            offer.retain(|&t| t == 19);
+        }
+        tcp.write_all(&[offer.len() as u8])?;
+        tcp.write_all(&offer)?;
+        match u8r(&mut tcp)? {
+            19 if tls_mode != TlsMode::Off => encrypted = true,
+            2 if tls_mode != TlsMode::Require => {}
+            other => {
+                return refuse(
+                    &mut tcp,
+                    old,
+                    format!("security type {other} was not offered").as_bytes(),
+                )
+            }
         }
     }
 
+    // From here on everything goes through the wire halves, which are either the plain
+    // socket or the same socket with TLS over it.
+    let (reader, mut out) = match (encrypted, me) {
+        (true, Some(me)) => vencrypt(&mut tcp, me)?,
+        _ => vncfree::wire::plain(tcp)?,
+    };
+    let mut r = std::io::BufReader::new(reader);
+
     let mut challenge = [0u8; 16];
     getrandom::fill(&mut challenge)?;
-    tcp.write_all(&challenge)?;
-    let answer = rd::<16>(&mut tcp)?;
+    out.write_all(&challenge)?;
+    let answer = rd::<16>(&mut r)?;
     let mut expected = challenge;
     vnc_des(&mut expected, password);
     if answer != expected {
-        return refuse(&mut tcp, old, b"authentication failed");
+        return refuse(&mut out, old, b"authentication failed");
     }
-    tcp.write_all(&0u32.to_be_bytes())?; // SecurityResult: OK
+    out.write_all(&0u32.to_be_bytes())?; // SecurityResult: OK
 
     // --- init ---
-    let _shared_flag = u8r(&mut tcp)?;
+    let _shared_flag = u8r(&mut r)?;
     let name = format!("{} (vncfree)", hostname());
     let mut init = Vec::new();
     init.extend_from_slice(&(w as u16).to_be_bytes());
@@ -1355,10 +1414,10 @@ fn serve(mut tcp: TcpStream, password: &str, ox: i32, oy: i32, w: usize, h: usiz
     init.extend_from_slice(&PIXEL_FORMAT);
     init.extend_from_slice(&(name.len() as u32).to_be_bytes());
     init.extend_from_slice(name.as_bytes());
-    tcp.write_all(&init)?;
+    out.write_all(&init)?;
 
     let shared = Arc::new(Shared {
-        out: Mutex::new(tcp.try_clone()?),
+        out: Mutex::new(out),
         fmt: Mutex::new(PixFmt::default()),
         wants: AtomicBool::new(false),
         incremental: AtomicBool::new(false),
@@ -1379,14 +1438,77 @@ fn serve(mut tcp: TcpStream, password: &str, ox: i32, oy: i32, w: usize, h: usiz
         sender.alive.store(false, Ordering::Relaxed);
     });
 
-    let result = read_client(&mut tcp, &shared, ox, oy);
+    let result = read_client(&mut r, &shared, ox, oy);
     shared.alive.store(false, Ordering::Relaxed);
     result
 }
 
+/// Whether this server offers, insists on, or refuses to encrypt.
+#[derive(PartialEq, Clone, Copy)]
+enum TlsMode {
+    /// Offer both VeNCrypt and plain VNC auth, and let the client pick. The default,
+    /// because a client that has never heard of VeNCrypt still has to be able to
+    /// connect - macOS's own viewer among them.
+    Offer,
+    /// Offer VeNCrypt only. Anyone in the middle of the connection can strip an
+    /// encrypted option out of a list that also contains an unencrypted one, so a
+    /// session that must be private cannot be left to the client to choose.
+    Require,
+    Off,
+}
+
+impl TlsMode {
+    fn from_env() -> Res<TlsMode> {
+        match std::env::var("VNC_TLS").unwrap_or_default().as_str() {
+            "" | "offer" => Ok(TlsMode::Offer),
+            "require" => Ok(TlsMode::Require),
+            "off" => Ok(TlsMode::Off),
+            other => Err(format!("VNC_TLS={other:?}: expected offer, require or off").into()),
+        }
+    }
+}
+
+/// The VeNCrypt sub-negotiation, up to the point where TLS takes over.
+///
+/// Only X509Vnc is offered. The other half of VeNCrypt's TLS types authenticate the
+/// server with anonymous Diffie-Hellman instead of a certificate, which no modern TLS
+/// library will do - anonymous key exchange has no defence against someone sitting in
+/// the middle at all, and rustls does not implement it. A self-signed certificate is
+/// the same amount of trust with a fingerprint attached that can actually be compared.
+fn vencrypt(
+    tcp: &mut TcpStream,
+    me: &vncfree::wire::Identity,
+) -> Res<(vncfree::wire::WireRead, vncfree::wire::WireWrite)> {
+    const X509_VNC: u32 = 261;
+
+    tcp.write_all(&[0, 2])?; // the version we speak
+    let theirs = rd::<2>(tcp)?;
+    if theirs[0] != 0 || theirs[1] < 2 {
+        tcp.write_all(&[1])?; // non-zero: no version in common
+        return Err(format!(
+            "client speaks VeNCrypt {}.{}, and this server needs 0.2",
+            theirs[0], theirs[1]
+        )
+        .into());
+    }
+    tcp.write_all(&[0])?; // zero: that version is fine
+
+    tcp.write_all(&[1])?; // a list of one subtype
+    tcp.write_all(&X509_VNC.to_be_bytes())?;
+    let chosen = u32r(tcp)?;
+    if chosen != X509_VNC {
+        // Unlike every other acknowledgement in RFB, *one* means success here.
+        tcp.write_all(&[0])?;
+        return Err(format!("client asked for VeNCrypt subtype {chosen}, not X509Vnc").into());
+    }
+    tcp.write_all(&[1])?;
+
+    vncfree::wire::server(tcp.try_clone()?, me)
+}
+
 /// Say no. RFB 3.7 added the explanatory string; sending one to a 3.3 client would be
 /// unexpected bytes on a connection it thinks is finished.
-fn refuse(tcp: &mut TcpStream, old: bool, reason: &[u8]) -> Res<()> {
+fn refuse(tcp: &mut impl Write, old: bool, reason: &[u8]) -> Res<()> {
     tcp.write_all(&1u32.to_be_bytes())?;
     if !old {
         tcp.write_all(&(reason.len() as u32).to_be_bytes())?;
@@ -1395,7 +1517,7 @@ fn refuse(tcp: &mut TcpStream, old: bool, reason: &[u8]) -> Res<()> {
     Err(String::from_utf8_lossy(reason).into_owned().into())
 }
 
-fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, ox: i32, oy: i32) -> Res<()> {
+fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> Res<()> {
     let mut mask = 0u8;
     let mut shift_held = false;
     let mut board = arboard::Clipboard::new().ok();

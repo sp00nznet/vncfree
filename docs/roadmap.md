@@ -21,6 +21,7 @@
 | 16 | Following a resolution change, via the DesktopSize pseudo-encoding | done |
 | 17 | Multi-monitor: `VNC_MONITOR=all` shares every display as one screen | done |
 | 18 | The last two ZRLE subencodings, and costing all five instead of guessing | done |
+| 19 | TLS, via VeNCrypt, so the session is not readable by anyone on the network | done |
 
 ## Ideas, not commitments
 
@@ -37,5 +38,8 @@ Roughly in the order they would earn their keep:
   turns out to refuse us.
 - **Tight encoding.** Four persistent zlib streams and a JPEG decoder for a squeeze on
   top of ZRLE. Low value, high effort.
-- **TLS.** Neither auth scheme encrypts the session. Tunnelling over SSH or a VPN is
-  the honest answer today, and VeNCrypt would be the proper fix.
+- **Somewhere to keep a known fingerprint.** TLS is in, but the certificate is
+  self-signed and comparing the two printed fingerprints is a manual step. Remembering
+  one per host, the way SSH does, would make a changed certificate something the
+  program notices rather than something the user has to. It needs a file on disk, which
+  is a promise this program currently makes a point of not breaking.
