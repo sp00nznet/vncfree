@@ -75,6 +75,7 @@ All environment variables. There is no config file.
 | `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
 | `VNC_MONITOR=all` | Server only. Share every display as one screen, not just the primary. |
 | `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |
+| `VNC_NO_CONTINUOUS=1` | Client only. Keep asking for each frame instead of letting the server send them unprompted. For servers that offer that and then mishandle it. |
 
 Credentials come from the environment rather than the command line, because argv is
 visible to every process on the machine.

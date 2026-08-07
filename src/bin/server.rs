@@ -1188,6 +1188,9 @@ struct Shared {
     /// The client asked for DesktopSize, so it can be told the resolution changed.
     /// One that did not has no way to follow, and the session has to end instead.
     resize: AtomicBool,
+    /// The client turned on continuous updates, so frames go out as the screen changes
+    /// rather than once per request. Saves a round trip per frame.
+    continuous: AtomicBool,
     alive: AtomicBool,
     clip: Mutex<String>,
 }
@@ -1428,6 +1431,7 @@ fn serve(
         out: Mutex::new(out),
         fmt: Mutex::new(PixFmt::default()),
         wants: AtomicBool::new(false),
+        continuous: AtomicBool::new(false),
         incremental: AtomicBool::new(false),
         zrle: AtomicBool::new(false),
         copyrect: AtomicBool::new(false),
@@ -1558,6 +1562,13 @@ fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> R
                         if encs.contains(&1) { " + CopyRect" } else { "" }
                     );
                 }
+                // There is no field anywhere that says "this server does continuous
+                // updates". Sending an unprompted EndOfContinuousUpdates *is* the
+                // announcement, and a client that has never heard of it ignores an
+                // unknown message type. Ours replies by turning them on.
+                if encs.contains(&-313) {
+                    shared.out.lock().unwrap().write_all(&[150])?;
+                }
             }
             3 => {
                 let incremental = u8r(tcp)? != 0;
@@ -1566,6 +1577,25 @@ fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> R
                     shared.incremental.store(false, Ordering::Relaxed);
                 }
                 shared.wants.store(true, Ordering::Relaxed);
+            }
+            150 => {
+                // EnableContinuousUpdates: a flag, then the region. We always answer
+                // for the whole screen, so the region is read and discarded like the
+                // one on an ordinary update request.
+                let on = u8r(tcp)? != 0;
+                blob(tcp, 8)?;
+                shared.continuous.store(on, Ordering::Relaxed);
+                if debug() {
+                    eprintln!(
+                        "[debug] continuous updates {}",
+                        if on { "on" } else { "off" }
+                    );
+                }
+                if !on {
+                    // Turning them off has to be acknowledged, or the client cannot
+                    // know which updates were still in flight when it asked.
+                    shared.out.lock().unwrap().write_all(&[150])?;
+                }
             }
             4 => {
                 let down = u8r(tcp)? != 0;
@@ -1652,12 +1682,15 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
         }
         clip_tick -= 1;
 
+        // With continuous updates the client has said "just send me changes", so there
+        // is no request to wait for and none to consume.
+        let continuous = shared.continuous.load(Ordering::Relaxed);
         // Consume the outstanding request *before* capturing, not after sending.
         // A client that asks for the next frame while this one is still going out -
         // which is what any client wanting more than one frame per round trip does -
         // would otherwise have its request cleared by the store that followed the
         // send, and the session would stall until it happened to ask again.
-        if !shared.wants.swap(false, Ordering::Relaxed) {
+        if !continuous && !shared.wants.swap(false, Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
@@ -1695,7 +1728,13 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
         if matches!(reported, Frame::Unchanged) && !full {
             // The screen provably did not move, so there is nothing to diff and
             // nothing to send. Put the request back: it is still outstanding.
-            shared.wants.store(true, Ordering::Relaxed);
+            if !continuous {
+                shared.wants.store(true, Ordering::Relaxed);
+            } else {
+                // Nothing to hold on to instead, so this is also what stops the loop
+                // spinning on an idle desktop.
+                std::thread::sleep(Duration::from_millis(10));
+            }
             continue;
         }
         // Windows reports a *move* only for things like a dragged window. A terminal
@@ -1819,7 +1858,9 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
         if parts.is_empty() {
             // An incremental request stays outstanding until something actually
             // changes; answering with zero rectangles would spin the client.
-            shared.wants.store(true, Ordering::Relaxed);
+            if !continuous {
+                shared.wants.store(true, Ordering::Relaxed);
+            }
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }

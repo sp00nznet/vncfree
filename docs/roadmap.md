@@ -1,4 +1,4 @@
-﻿# Roadmap
+# Roadmap
 
 | # | Milestone | State |
 |---|-----------|-------|
@@ -26,6 +26,7 @@
 | 21 | Non-US keyboard layouts, via the layout Windows has already applied | done |
 | 22 | Tight decoding, so servers that speak nothing better are not stuck on Raw | done |
 | 23 | A remembered certificate per host, so a changed one is refused | done |
+| 24 | Continuous updates, so the server stops waiting to be asked for each frame | done |
 
 ## Ideas, not commitments
 

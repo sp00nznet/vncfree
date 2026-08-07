@@ -199,6 +199,8 @@ struct Vnc {
     /// Ask for the next frame as soon as one starts arriving, rather than after it
     /// has been decoded. Off for the one-shot PPM grab, which wants exactly one.
     pipeline: bool,
+    /// The server is sending changes as they happen, so there is nothing to request.
+    continuous: bool,
     /// Regions the last update actually touched, so only those need copying to the
     /// thread that draws. Copying the whole framebuffer is 8MB at 1080p and 33MB at
     /// 4K, every frame, most of it unchanged.
@@ -476,7 +478,11 @@ impl Vnc {
         // Asking for exactly one of them is how "is it my decoder or the server?" gets
         // answered, and how one encoding is checked against another: grab the same
         // still screen twice and the two files must be byte-identical.
-        let encodings: Vec<i32> = match env::var("VNC_ENCODING").unwrap_or_default().as_str() {
+        // ZRLE before Tight on purpose. A server offering both - TigerVNC does - keeps
+        // giving us lossless ZRLE, and Tight is there for the servers that do not speak
+        // ZRLE at all, where the fallback would otherwise be Raw. Tight is the only one
+        // that can arrive lossy, and only because a server chose to send JPEG.
+        let mut encodings: Vec<i32> = match env::var("VNC_ENCODING").unwrap_or_default().as_str() {
             "raw" => {
                 eprintln!("VNC_ENCODING=raw: requesting Raw only");
                 vec![0]
@@ -489,29 +495,27 @@ impl Vnc {
                 eprintln!("VNC_ENCODING=zrle: requesting ZRLE only");
                 vec![16, 0]
             }
-            "" => {
-                // -223 is DesktopSize: not an encoding but a way for the server to say
-                // the screen resolution changed. Without asking for it, a server that
-                // changes resolution has no way to tell us and the session is stuck at
-                // the old size.
-                //
-                // ZRLE before Tight on purpose. A server offering both - TigerVNC does
-                // - keeps giving us lossless ZRLE, and Tight is there for the servers
-                // that do not speak ZRLE at all, where the fallback would otherwise be
-                // Raw. Tight is the only thing here that can arrive lossy, and only
-                // because a server chose to send JPEG.
-                vec![16, 7, 1, 0, -223] // ZRLE, Tight, CopyRect, Raw, DesktopSize
-            }
+            "" => vec![16, 7, 1, 0], // ZRLE, Tight, CopyRect, Raw
             other => {
                 return Err(format!("VNC_ENCODING={other:?}: expected raw, tight or zrle").into())
             }
         };
 
+        // The pseudo-encodings go on whatever was chosen above, because they are not
+        // encodings at all and the knob above is for isolating a *decoder*. Dropping
+        // them with it would mean testing Raw could not follow a resolution change.
+        //
+        //   -223 DesktopSize: how a server says the screen resolution changed. Without
+        //        asking, a server that changes size has no way to tell us and the
+        //        session is stuck at the old one.
+        //   -313 ContinuousUpdates: a server that supports it stops waiting to be asked
+        //        for each frame, which takes a round trip out of every one.
+        encodings.extend_from_slice(&[-223, -313]);
+
         // Asking for a quality level tells a Tight server it may send JPEG, which is
         // lossy and much smaller. Unset means lossless, because a remote desktop is
         // mostly text and JPEG makes a mess of text. The levels are pseudo-encodings
         // -32 (worst) to -23 (best).
-        let mut encodings = encodings;
         if let Ok(q) = env::var("VNC_QUALITY") {
             let level: i32 = q
                 .parse()
@@ -542,8 +546,26 @@ impl Vnc {
             clip,
             pending_paste: None,
             pipeline: false,
+            continuous: false,
             dirty: Vec::new(),
         })
+    }
+
+    /// Ask the server to send changes as they happen instead of waiting to be asked
+    /// each time. Only sent once the server has said it supports this, by sending
+    /// EndOfContinuousUpdates of its own accord.
+    fn enable_continuous(&mut self) -> Res<()> {
+        let mut msg = vec![150u8, 1]; // 1 = enable
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&(self.screen.w as u16).to_be_bytes());
+        msg.extend_from_slice(&(self.screen.h as u16).to_be_bytes());
+        send(&self.w, &msg)?;
+        self.continuous = true;
+        if debug() {
+            eprintln!("[debug] continuous updates enabled; no longer asking per frame");
+        }
+        Ok(())
     }
 
     /// Ask for the whole screen. Incremental means "only what changed" - the server
@@ -567,8 +589,9 @@ impl Vnc {
                 // Ask for the next frame *now*, before decoding this one. Waiting
                 // until the update is decoded and copied leaves the server idle for
                 // all of that time, so every frame costs a round trip plus our own
-                // work rather than overlapping the two.
-                if self.pipeline {
+                // work rather than overlapping the two. With continuous updates there
+                // is nothing to ask for at all - the server is already sending.
+                if self.pipeline && !self.continuous {
                     self.request(true)?;
                 }
                 self.dirty.clear();
@@ -587,6 +610,15 @@ impl Vnc {
                 Ok(false)
             }
             2 => Ok(false), // Bell, no body
+            150 => {
+                // EndOfContinuousUpdates. Unprompted, this is how a server announces it
+                // supports them at all; in reply to a disable it means the last update
+                // has been sent. Either way it carries no body.
+                if !self.continuous && env::var("VNC_NO_CONTINUOUS").is_err() {
+                    self.enable_continuous()?;
+                }
+                Ok(false)
+            }
             3 => {
                 // ServerCutText: 3 padding, then a u32-prefixed Latin-1 string.
                 blob(&mut self.r, 3)?;

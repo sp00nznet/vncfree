@@ -80,6 +80,16 @@ with real latency that is the difference between a session that feels live and o
 that feels like a slideshow. `VNC_NO_PIPELINE=1` turns it off, which is worth having
 because a server with the bug described next will stall if the client pipelines.
 
+Continuous updates (-313) remove the request from the loop entirely: the server sends
+changes as they happen and the client stops asking. There is no field anywhere that
+advertises server support — an unprompted `EndOfContinuousUpdates` *is* the
+announcement, and a client that has never heard of it simply ignores an unknown message
+type, which is what makes the offer safe to make to anyone.
+
+That saving is invisible on loopback, where the round trip it removes costs nothing, and
+a frame-rate comparison there measures noise. It is worth exactly one round trip per
+frame, which is the whole point on a link that has any.
+
 The client also copies only the regions an update actually touched into the buffer the
 drawing thread reads. Copying the whole framebuffer is 8MB per frame at 1080p and 33MB
 at 4K, nearly all of it unchanged.
