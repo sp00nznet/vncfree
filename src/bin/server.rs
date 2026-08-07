@@ -49,7 +49,7 @@ mod dxgi {
     }
 
     impl Duplicator {
-        pub fn new(w: usize, h: usize) -> Res<Duplicator> {
+        pub fn new(ox: i32, oy: i32, w: usize, h: usize) -> Res<Duplicator> {
             unsafe {
                 let mut device = None;
                 let mut context = None;
@@ -85,14 +85,17 @@ mod dxgi {
                     if super::debug() {
                         eprintln!("[debug] dxgi output {i}: {ow}x{oh} at {},{}", r.left, r.top);
                     }
-                    // The primary display is the one whose top-left is the origin.
-                    if r.left == 0 && r.top == 0 && ow == w && oh == h {
+                    // Duplication covers one output, so it can only serve a shared
+                    // region that is exactly one monitor - the same one, in the same
+                    // place. Sharing several monitors matches nothing here and falls
+                    // back to BitBlt.
+                    if r.left == ox && r.top == oy && ow == w && oh == h {
                         chosen = Some(output);
                         break;
                     }
                 }
                 let output = chosen.ok_or_else(|| {
-                    format!("no duplicable output matches the primary display at {w}x{h}")
+                    format!("no single output matches the shared region {w}x{h} at {ox},{oy}")
                 })?;
                 let output1: IDXGIOutput1 = output.cast()?;
                 let dupl = output1.DuplicateOutput(&device)?;
@@ -281,12 +284,36 @@ mod win {
         }
     }
 
-    pub fn screen_size() -> (usize, usize) {
+    /// The region to share, in physical screen coordinates: origin then size.
+    ///
+    /// `VNC_MONITOR=all` shares every display as one wide screen. The default is the
+    /// primary only, deliberately: sharing more of someone's desk than they asked for
+    /// is not a good surprise, and the framebuffer of three monitors is three times
+    /// the pixels to encode and send.
+    ///
+    /// The virtual desktop's origin is not necessarily 0,0 - a monitor placed to the
+    /// left of the primary gives it a negative x - so the origin has to be carried
+    /// around rather than assumed.
+    pub fn share_region() -> (i32, i32, usize, usize) {
         unsafe {
-            (
-                GetSystemMetrics(SM_CXSCREEN) as usize,
-                GetSystemMetrics(SM_CYSCREEN) as usize,
-            )
+            if std::env::var("VNC_MONITOR")
+                .map(|v| v == "all")
+                .unwrap_or(false)
+            {
+                (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN) as usize,
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN) as usize,
+                )
+            } else {
+                (
+                    0,
+                    0,
+                    GetSystemMetrics(SM_CXSCREEN) as usize,
+                    GetSystemMetrics(SM_CYSCREEN) as usize,
+                )
+            }
         }
     }
 
@@ -299,6 +326,10 @@ mod win {
     pub struct Capture {
         w: usize,
         h: usize,
+        /// Where the shared region starts on the physical desktop. Zero for the
+        /// primary display, and possibly negative when sharing every monitor.
+        ox: i32,
+        oy: i32,
         screen: HDC,
         mem: HDC,
         bitmap: HBITMAP,
@@ -315,7 +346,7 @@ mod win {
     }
 
     impl Capture {
-        pub fn new(w: usize, h: usize) -> Option<Capture> {
+        pub fn new(ox: i32, oy: i32, w: usize, h: usize) -> Option<Capture> {
             unsafe {
                 let screen = GetDC(null_mut());
                 let mem = CreateCompatibleDC(screen);
@@ -340,6 +371,10 @@ mod win {
                 // fail - no GPU access from this session, a driver that declines,
                 // another program already duplicating - so GDI stays as the fallback
                 // rather than being ripped out.
+                // ponytail: duplication is per-output, so it only covers a shared
+                // region that is exactly one monitor. Sharing several falls back to
+                // BitBlt, which costs the idle-CPU and dirty-rectangle wins. Running
+                // one duplicator per output and compositing them is the upgrade.
                 let dxgi = if std::env::var("VNC_CAPTURE")
                     .map(|v| v == "gdi")
                     .unwrap_or(false)
@@ -347,7 +382,7 @@ mod win {
                     eprintln!("VNC_CAPTURE=gdi: using BitBlt");
                     None
                 } else {
-                    match super::dxgi::Duplicator::new(w, h) {
+                    match super::dxgi::Duplicator::new(ox, oy, w, h) {
                         Ok(d) => Some(d),
                         Err(e) => {
                             eprintln!("desktop duplication unavailable, using BitBlt: {e}");
@@ -362,6 +397,8 @@ mod win {
                 Some(Capture {
                     w,
                     h,
+                    ox,
+                    oy,
                     screen,
                     mem,
                     bitmap,
@@ -384,8 +421,12 @@ mod win {
         pub fn grab(&mut self, dst: &mut [u32]) -> super::Frame {
             unsafe {
                 let rows = std::slice::from_raw_parts_mut(self.bits, self.w * self.h);
+                // The source offset is the shared region's origin on the desktop,
+                // which is not 0,0 when a monitor sits left of or above the primary.
                 let blit = |c: &Capture| {
-                    BitBlt(c.mem, 0, 0, c.w as i32, c.h as i32, c.screen, 0, 0, SRCCOPY);
+                    BitBlt(
+                        c.mem, 0, 0, c.w as i32, c.h as i32, c.screen, c.ox, c.oy, SRCCOPY,
+                    );
                 };
 
                 let mut parts = Vec::new();
@@ -435,9 +476,11 @@ mod win {
                 if GetCursorInfo(&mut ci) != 0 && ci.flags == CURSOR_SHOWING {
                     let mut ii: ICONINFO = zeroed();
                     if GetIconInfo(ci.hCursor, &mut ii) != 0 {
+                        // The cursor position is on the desktop; the DIB starts at the
+                        // shared region's origin.
                         let (x, y) = (
-                            ci.ptScreenPos.x - ii.xHotspot as i32,
-                            ci.ptScreenPos.y - ii.yHotspot as i32,
+                            ci.ptScreenPos.x - ii.xHotspot as i32 - self.ox,
+                            ci.ptScreenPos.y - ii.yHotspot as i32 - self.oy,
                         );
                         DrawIconEx(self.mem, x, y, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
                         if !ii.hbmColor.is_null() {
@@ -588,9 +631,12 @@ mod win {
     /// its 0..65535 range maps onto the *logical* desktop, so on a 200% display every
     /// coordinate lands at half the intended position. SetPhysicalCursorPos takes
     /// physical pixels directly and still raises the usual mouse-move messages.
-    pub fn move_pointer(x: u16, y: u16, _w: usize, _h: usize) {
+    pub fn move_pointer(x: u16, y: u16, ox: i32, oy: i32) {
         unsafe {
-            SetPhysicalCursorPos(x as i32, y as i32);
+            // The client's coordinates are relative to the shared region, which does
+            // not start at the desktop's origin when a monitor sits left of the
+            // primary - there, x=0 is a negative desktop coordinate.
+            SetPhysicalCursorPos(ox + x as i32, oy + y as i32);
         }
     }
 
@@ -1152,7 +1198,7 @@ fn run() -> Res<()> {
 
     let listener =
         TcpListener::bind(&bind).map_err(|e| format!("could not listen on {bind}: {e}"))?;
-    let (w, h) = win::screen_size();
+    let (ox, oy, w, h) = win::share_region();
     println!("vncfree-server listening on {bind}, sharing {w}x{h}");
 
     for stream in listener.incoming() {
@@ -1164,7 +1210,7 @@ fn run() -> Res<()> {
             .unwrap_or_default();
         std::thread::spawn(move || {
             println!("client connected: {peer}");
-            match serve(stream, &password, w, h) {
+            match serve(stream, &password, ox, oy, w, h) {
                 Ok(()) => println!("client {peer} disconnected"),
                 Err(e) => println!("client {peer} finished: {e}"),
             }
@@ -1173,7 +1219,7 @@ fn run() -> Res<()> {
     Ok(())
 }
 
-fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
+fn serve(mut tcp: TcpStream, password: &str, ox: i32, oy: i32, w: usize, h: usize) -> Res<()> {
     tcp.set_nodelay(true)?;
 
     // --- version ---
@@ -1245,7 +1291,7 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
 
     let sender = shared.clone();
     std::thread::spawn(move || {
-        if let Err(e) = send_frames(&sender, w, h) {
+        if let Err(e) = send_frames(&sender, ox, oy, w, h) {
             if sender.alive.load(Ordering::Relaxed) {
                 eprintln!("sender stopped: {e}");
             }
@@ -1253,7 +1299,7 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
         sender.alive.store(false, Ordering::Relaxed);
     });
 
-    let result = read_client(&mut tcp, &shared, w, h);
+    let result = read_client(&mut tcp, &shared, ox, oy);
     shared.alive.store(false, Ordering::Relaxed);
     result
 }
@@ -1269,7 +1315,7 @@ fn refuse(tcp: &mut TcpStream, old: bool, reason: &[u8]) -> Res<()> {
     Err(String::from_utf8_lossy(reason).into_owned().into())
 }
 
-fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
+fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, ox: i32, oy: i32) -> Res<()> {
     let mut mask = 0u8;
     let mut shift_held = false;
     let mut board = arboard::Clipboard::new().ok();
@@ -1323,7 +1369,7 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
             5 => {
                 let now = u8r(tcp)?;
                 let (x, y) = (u16r(tcp)?, u16r(tcp)?);
-                win::move_pointer(x, y, w, h);
+                win::move_pointer(x, y, ox, oy);
                 win::buttons(mask, now);
                 mask = now;
             }
@@ -1357,12 +1403,12 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
     Ok(())
 }
 
-fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
-    let (mut w, mut h) = (w, h);
+fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Res<()> {
+    let (mut ox, mut oy, mut w, mut h) = (ox, oy, w, h);
     let mut cur = Screen::new(w, h);
     let mut prev = Screen::new(w, h);
     let mut first = true;
-    let mut cap = win::Capture::new(w, h).ok_or("could not create the capture surface")?;
+    let mut cap = win::Capture::new(ox, oy, w, h).ok_or("could not create the capture surface")?;
     // One deflate stream for the whole connection. ZRLE's zlib state spans the
     // session, not a rectangle; restarting it per rectangle decodes the first one and
     // then produces garbage on the client forever.
@@ -1409,8 +1455,8 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         // The desktop can change resolution underneath us, and everything from the
         // capture surface to the client's framebuffer is sized for the old one.
         let mut resized = false;
-        let now = win::screen_size();
-        if now != (w, h) && now.0 > 0 && now.1 > 0 {
+        let now = win::share_region();
+        if now != (ox, oy, w, h) && now.2 > 0 && now.3 > 0 {
             if !shared.resize.load(Ordering::Relaxed) {
                 // Nothing in the protocol lets us tell this client. Ending the session
                 // is the honest move: a reconnect negotiates the new size properly,
@@ -1418,15 +1464,19 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
                 return Err(format!(
                     "screen changed from {w}x{h} to {}x{} and this client did not ask \
                      for DesktopSize; reconnect to pick up the new size",
-                    now.0, now.1
+                    now.2, now.3
                 )
                 .into());
             }
-            println!("screen resolution changed to {}x{}", now.0, now.1);
-            (w, h) = now;
+            println!(
+                "shared region is now {}x{} at {},{}",
+                now.2, now.3, now.0, now.1
+            );
+            (ox, oy, w, h) = now;
             cur = Screen::new(w, h);
             prev = Screen::new(w, h);
-            cap = win::Capture::new(w, h).ok_or("could not recreate the capture surface")?;
+            cap =
+                win::Capture::new(ox, oy, w, h).ok_or("could not recreate the capture surface")?;
             resized = true;
         }
 

@@ -70,6 +70,7 @@ All environment variables. There is no config file and nothing is written to dis
 | `VNC_RAW_ONLY=1` | Disable ZRLE and CopyRect. Answers "is it my decoder or the server?" |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
 | `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
+| `VNC_MONITOR=all` | Server only. Share every display as one screen, not just the primary. |
 | `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |
 
 Credentials come from the environment rather than the command line, because argv is
@@ -108,9 +109,13 @@ authentication, so there is no unauthenticated path at all.
 - No Tight encoding, and the server's CopyRect covers vertical scrolling but not a
   window dragged sideways. Compatibility is unaffected — these cost bytes, not
   connections.
-- The server shares the primary monitor only. It does follow a resolution change, but
-  a client that did not ask for DesktopSize cannot be told, so that session ends and
-  has to reconnect — vncfree's own client reconnects by itself.
+- The server shares the primary monitor by default; `VNC_MONITOR=all` shares every
+  display as one screen. **That has not been tested against a real second monitor** —
+  only one display was attached to the development machine — and sharing more than one
+  falls back to `BitBlt`, because Desktop Duplication works per output.
+- The server follows a resolution change, but a client that did not ask for
+  DesktopSize cannot be told, so that session ends and has to reconnect — vncfree's own
+  client reconnects by itself.
 - US keyboard layout for non-alphanumeric keys.
 
 ## Documentation
