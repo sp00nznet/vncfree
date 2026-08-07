@@ -940,11 +940,31 @@ fn changed_rects(
     rects
 }
 
-/// Encode one 64x64 (or smaller, at the edges) ZRLE tile.
+/// How many bytes `write_run` will spend on a run of this length.
+fn run_bytes(len: usize) -> usize {
+    1 + (len - 1) / 255
+}
+
+/// A ZRLE run length: one less than the length, in 255-sized instalments, so a run of
+/// 256 goes out as 255 then 0. Only ever called for runs of two or more.
+fn write_run(out: &mut Vec<u8>, len: usize) {
+    let mut left = len - 1;
+    while left >= 255 {
+        out.push(255);
+        left -= 255;
+    }
+    out.push(left as u8);
+}
+
+/// Encode one 64x64 (or smaller, at the edges) ZRLE tile, picking whichever of the
+/// five subencodings is smallest for it: solid, packed palette, plain RLE, palette
+/// RLE, or raw.
 ///
-/// Three of the five subencodings are produced: solid, packed palette and raw. The
-/// two RLE forms are a further squeeze on top and are deliberately skipped - our
-/// client decodes all five, so this only ever costs bytes, never compatibility.
+/// Every subencoding is legal for every tile, so rather than guess from thresholds,
+/// each one is *costed* from the colours and runs already counted and the cheapest
+/// wins. Thresholds are where this kind of code goes wrong quietly: a rule of thumb
+/// tuned on a photo picks a form five times too big for a terminal, and nothing ever
+/// reports it, because the output is still correct.
 fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: usize, f: &PixFmt) {
     let at = |row: usize, col: usize| s.px[(y + row) * s.w + x + col];
 
@@ -954,7 +974,10 @@ fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: u
         for col in 0..w {
             let p = at(row, col);
             if !palette.contains(&p) {
-                if palette.len() == 16 {
+                // 127 rather than 16: the packed form stops at 16, but palette RLE
+                // indexes up to 127, and a tile with 40 colours in long runs is much
+                // better off there than spelled out pixel by pixel.
+                if palette.len() == 127 {
                     palette.clear();
                     break 'scan;
                 }
@@ -963,48 +986,105 @@ fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: u
         }
     }
 
-    match palette.len() {
-        // Too many colours to index: spell every pixel out.
-        0 => {
-            out.push(0);
-            for row in 0..h {
-                for col in 0..w {
-                    out.extend_from_slice(&f.cpixel(at(row, col)).unwrap_or([0; 3]));
-                }
+    // Runs of one colour, in the order the pixels go out. Counted once and used by
+    // every estimate below.
+    let mut runs: Vec<(u32, usize)> = Vec::new();
+    for row in 0..h {
+        for col in 0..w {
+            let p = at(row, col);
+            match runs.last_mut() {
+                Some((c, n)) if *c == p => *n += 1,
+                _ => runs.push((p, 1)),
             }
         }
-        // One colour for the whole tile, which is most of a typical desktop.
-        1 => {
-            out.push(1);
-            out.extend_from_slice(&f.cpixel(palette[0]).unwrap_or([0; 3]));
+    }
+
+    let n = palette.len();
+    let bits = match n {
+        2 => 1,
+        3..=4 => 2,
+        _ => 4,
+    };
+
+    // What each form would cost in bytes, not counting the subencoding byte they all
+    // pay. MAX means this tile cannot use that form at all.
+    let raw = 3 * w * h;
+    let plain_rle: usize = runs.iter().map(|(_, l)| 3 + run_bytes(*l)).sum();
+    let palette_rle = match n {
+        // A lone pixel carries an index and no length, which is where this form beats
+        // spelling the colour out per run.
+        2..=127 => {
+            3 * n
+                + runs
+                    .iter()
+                    .map(|(_, l)| if *l == 1 { 1 } else { 1 + run_bytes(*l) })
+                    .sum::<usize>()
         }
-        n => {
-            out.push(n as u8);
-            for c in &palette {
-                out.extend_from_slice(&f.cpixel(*c).unwrap_or([0; 3]));
-            }
-            let bits = match n {
-                2 => 1,
-                3..=4 => 2,
-                _ => 4,
-            };
-            // Indices are packed most-significant-bit first and every row restarts on
-            // a byte boundary.
-            for row in 0..h {
-                let (mut byte, mut used) = (0u8, 0);
-                for col in 0..w {
-                    let idx = palette.iter().position(|&c| c == at(row, col)).unwrap() as u8;
-                    byte |= idx << (8 - bits - used);
-                    used += bits;
-                    if used == 8 {
-                        out.push(byte);
-                        byte = 0;
-                        used = 0;
-                    }
-                }
-                if used > 0 {
+        _ => usize::MAX,
+    };
+    let packed = match n {
+        // Every row restarts on a byte boundary, so the padding is per row, not per
+        // tile - it is most of the cost of a narrow edge tile.
+        2..=16 => 3 * n + h * (w * bits).div_ceil(8),
+        _ => usize::MAX,
+    };
+    let best = raw.min(plain_rle).min(palette_rle).min(packed);
+
+    if n == 1 {
+        // One colour for the whole tile, which is most of a typical desktop, and
+        // three bytes beats anything else here by construction.
+        out.push(1);
+        out.extend_from_slice(&f.cpixel(palette[0]).unwrap_or([0; 3]));
+    } else if best == packed {
+        out.push(n as u8);
+        for c in &palette {
+            out.extend_from_slice(&f.cpixel(*c).unwrap_or([0; 3]));
+        }
+        // Indices are packed most-significant-bit first.
+        for row in 0..h {
+            let (mut byte, mut used) = (0u8, 0);
+            for col in 0..w {
+                let idx = palette.iter().position(|&c| c == at(row, col)).unwrap() as u8;
+                byte |= idx << (8 - bits - used);
+                used += bits;
+                if used == 8 {
                     out.push(byte);
+                    byte = 0;
+                    used = 0;
                 }
+            }
+            if used > 0 {
+                out.push(byte);
+            }
+        }
+    } else if best == palette_rle {
+        out.push(128 + n as u8);
+        for c in &palette {
+            out.extend_from_slice(&f.cpixel(*c).unwrap_or([0; 3]));
+        }
+        for (colour, len) in &runs {
+            let idx = palette.iter().position(|c| c == colour).unwrap() as u8;
+            if *len == 1 {
+                out.push(idx);
+            } else {
+                out.push(idx | 0x80);
+                write_run(out, *len);
+            }
+        }
+    } else if best == plain_rle {
+        // Too many colours to index, but the pixels still come in runs - a window
+        // border over a busy background, where a photo or a gradient would not.
+        out.push(128);
+        for (colour, len) in &runs {
+            out.extend_from_slice(&f.cpixel(*colour).unwrap_or([0; 3]));
+            write_run(out, *len);
+        }
+    } else {
+        // Nothing repeats enough to be worth describing. Spell every pixel out.
+        out.push(0);
+        for row in 0..h {
+            for col in 0..w {
+                out.extend_from_slice(&f.cpixel(at(row, col)).unwrap_or([0; 3]));
             }
         }
     }
@@ -1775,21 +1855,77 @@ mod tests {
     }
 
     /// Four colours need two bits per index, still packed from the top of the byte.
+    /// Sixteen pixels rather than four, because at four the palette costs more than
+    /// the pixels it indexes and raw is genuinely the smaller answer.
     #[test]
     fn four_colours_pack_two_bits_per_pixel() {
-        let out = tile_of(&[1, 2, 3, 4], 4, 1);
+        let px: Vec<u32> = (0..4).flat_map(|_| [1, 2, 3, 4]).collect();
+        let out = tile_of(&px, 16, 1);
         assert_eq!(out[0], 4, "palette of four");
-        assert_eq!(out.len(), 1 + 4 * 3 + 1, "one packed byte for four pixels");
-        assert_eq!(*out.last().unwrap(), 0b00_01_10_11);
+        assert_eq!(out.len(), 1 + 4 * 3 + 4, "four pixels to the byte");
+        assert_eq!(out[13], 0b00_01_10_11);
     }
 
-    /// More than 16 colours cannot be indexed, so the tile falls back to raw pixels.
+    /// Every pixel a different colour and no runs at all: nothing to index and
+    /// nothing to run-length, so raw genuinely is the smallest.
     #[test]
-    fn more_than_sixteen_colours_falls_back_to_raw() {
-        let px: Vec<u32> = (0..20u32).collect();
-        let out = tile_of(&px, 20, 1);
+    fn all_different_colours_falls_back_to_raw() {
+        let px: Vec<u32> = (0..200u32).collect();
+        let out = tile_of(&px, 200, 1);
         assert_eq!(out[0], 0, "raw subencoding");
-        assert_eq!(out.len(), 1 + 20 * 3, "three bytes per pixel, no palette");
+        assert_eq!(out.len(), 1 + 200 * 3, "three bytes per pixel, no palette");
+    }
+
+    /// Too many colours to index, but arriving in long runs: plain RLE, which this
+    /// encoder previously could not produce at all.
+    #[test]
+    fn many_colours_in_long_runs_use_plain_rle() {
+        // 200 colours of 20 pixels each: 4000 pixels in 200 runs.
+        let px: Vec<u32> = (0..200u32)
+            .flat_map(|c| std::iter::repeat_n(c + 1, 20))
+            .collect();
+        let out = tile_of(&px, 4000, 1);
+        assert_eq!(out[0], 128, "plain RLE");
+        // Per run: three bytes of colour, then one length byte for a run of 20.
+        assert_eq!(out.len(), 1 + 200 * 4);
+        assert_eq!(out[4], 19, "the length is one *less* than the run");
+        assert!(out.len() < 1 + 4000 * 3, "and it beats raw handily");
+    }
+
+    /// Palette RLE earns its keep between 17 and 127 colours: too many for the packed
+    /// form, few enough to index, and repeating enough that an index per run beats a
+    /// colour per run. Twenty colours, each appearing in ten separate runs.
+    #[test]
+    fn repeating_colours_in_runs_use_palette_rle() {
+        let px: Vec<u32> = (0..10)
+            .flat_map(|_| (0..20u32).flat_map(|c| std::iter::repeat_n(c + 1, 5)))
+            .collect();
+        let out = tile_of(&px, 1000, 1);
+        assert_eq!(out[0], 128 + 20, "palette RLE, twenty colours");
+        // Subencoding, twenty CPIXELs, then an index and a length for each of 200 runs.
+        assert_eq!(out.len(), 1 + 20 * 3 + 200 * 2);
+        assert_eq!(out[61], 0x80, "index 0 with the run bit set");
+        assert_eq!(out[62], 4, "one less than five");
+        assert!(out.len() < 1 + 200 * 4, "and it beats a colour per run");
+    }
+
+    /// A run longer than 255 goes out in instalments, ended by a byte under 255.
+    #[test]
+    fn long_runs_are_split_into_instalments() {
+        let mut out = Vec::new();
+        write_run(&mut out, 2);
+        assert_eq!(out, [1]);
+        out.clear();
+        write_run(&mut out, 256);
+        assert_eq!(out, [255, 0], "255, then the remainder");
+        out.clear();
+        write_run(&mut out, 600);
+        assert_eq!(out, [255, 255, 89]);
+        assert_eq!(
+            1 + 255 + 255 + 89,
+            600,
+            "which is what the client will add up"
+        );
     }
 
     /// CPIXELs drop the unused byte, and an exotic layout has none to drop.

@@ -110,6 +110,29 @@ it correctly. That session ends with an explanatory error, which is honest and l
 somewhere useful — a reconnect negotiates the new size properly, and vncfree's own
 client reconnects by itself.
 
+## Costing the ZRLE subencodings instead of guessing
+
+Every one of ZRLE's five subencodings is legal for every tile, so the encoder has to
+choose. The obvious way is a rule of thumb — "few enough runs, use RLE" — and it is
+wrong in a way that never shows up: the output stays perfectly valid, so a threshold
+tuned on one kind of picture quietly picks a form several times too big for another.
+An early gate here would have sent a two-colour tile as palette RLE at roughly five
+times the size of the bit-packed form it should have used.
+
+So each form is *costed* in bytes from the palette and the runs, both of which are
+counted once, and the cheapest wins. It is less code than the thresholds it replaced
+and there is nothing left to tune.
+
+The costing is also what decides how far the palette scan runs. The packed form
+indexes at most 16 colours, but palette RLE indexes up to 127, so the scan goes to 127
+— a tile with 40 colours arriving in runs is far better off indexed than spelled out.
+That is the band where palette RLE earns its keep at all: below 17 colours the packed
+form is almost always smaller, and above 127 there is no palette to index.
+
+Measured against the same pixels on a real desktop, the two new forms take about 3–5%
+off a full frame. Modest, because a desktop full of photographs and antialiased text
+has few long runs; flat-coloured content is where they pay.
+
 ## Things that bite
 
 - **ZRLE's zlib stream spans the connection, not a rectangle.** Restarting it per
@@ -194,8 +217,6 @@ adjacent rectangles routinely cover a region between them.
   being dragged sideways. Finding arbitrary movement is motion estimation, which is
   expensive to do and dangerous to get wrong; the Desktop Duplication API hands out
   move rectangles for free and is the right way in if this ever matters.
-- **The two RLE ZRLE subencodings.** The encoder emits solid, packed palette and raw.
-  The client decodes all five, so this only ever costs bytes, never compatibility.
 - **Saved hosts.** A desktop shortcut with the arguments already does it, and a config
   file format is a lot of surface for no new capability.
 - **A public IP readout in the server dialog.** Finding one means asking a third-party

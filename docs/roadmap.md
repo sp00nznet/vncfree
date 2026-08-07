@@ -19,6 +19,8 @@
 | 14 | Latency: pipelined requests, partial copies, and the server request race | done |
 | 15 | Ctrl-Shift-V types the clipboard, for servers that will not share one | done |
 | 16 | Following a resolution change, via the DesktopSize pseudo-encoding | done |
+| 17 | Multi-monitor: `VNC_MONITOR=all` shares every display as one screen | done |
+| 18 | The last two ZRLE subencodings, and costing all five instead of guessing | done |
 
 ## Ideas, not commitments
 
@@ -28,18 +30,11 @@ Roughly in the order they would earn their keep:
   sharing over Apple Remote Desktop's channel on port 3283, not over VNC at all, so
   there is nothing to implement on the RFB side. See [macos.md](macos.md). A bridge
   over SSH using `pbcopy`/`pbpaste` would be a fraction of the effort if it is wanted.
-- **The two remaining ZRLE subencodings.** Plain and palette RLE, on top of the solid,
-  packed-palette and raw forms the encoder already produces. Bytes, not compatibility.
-- **Multi-monitor.** The server shares the primary display only. Duplication is already
-  per-output, so most of the work is deciding what to do about a client that expects
-  one rectangular screen.
 - **Non-US keyboard layouts.** Punctuation currently comes from a static US keysym
   table; minifb's character callback would handle the rest.
 - **Client-side RFB 3.3 and 3.7.** The server speaks 3.3 so macOS's viewer can connect;
   the client still requires 3.8 or later from a server. Worth doing if something real
   turns out to refuse us.
-- **Older RFB versions.** 3.3 and 3.7 negotiate security differently. Only worth doing
-  if something real turns out to refuse us.
 - **Tight encoding.** Four persistent zlib streams and a JPEG decoder for a squeeze on
   top of ZRLE. Low value, high effort.
 - **TLS.** Neither auth scheme encrypts the session. Tunnelling over SSH or a VPN is
