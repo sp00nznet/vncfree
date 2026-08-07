@@ -14,13 +14,22 @@ jobs:
   # A published advisory against anything in the tree is something to find out about
   # from CI rather than from a user. Separate from the build so a new advisory reports
   # itself without also failing the binaries.
+  #
+  # A prebuilt cargo-audit rather than rustsec/audit-check: the action spends three and
+  # a half minutes compiling the tool on every run, and wants permission to write check
+  # runs that this workflow otherwise has no reason to hold.
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # Fails on a vulnerability. Warnings - an unmaintained crate, say - are printed
+      # and do not fail: minifb pulls in `instant`, which is unmaintained and is not
+      # even in the Windows dependency graph, so failing on that would train us to
+      # ignore this job.
+      - run: cargo audit
 
   windows:
     runs-on: windows-latest
