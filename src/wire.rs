@@ -1,4 +1,4 @@
-﻿//! The transport underneath RFB: a plain socket, or the same socket with TLS over it.
+//! The transport underneath RFB: a plain socket, or the same socket with TLS over it.
 //!
 //! Everything above this reads and writes through `impl Read` / `impl Write` and does
 //! not care which it got.
@@ -186,36 +186,167 @@ fn shake(sock: &mut TcpStream, c: &mut rustls::Connection) -> Res<()> {
     Ok(())
 }
 
-/// What the server identifies itself with, made once when it starts and used for every
-/// connection after that.
+/// The one directory vncfree writes to: the server's certificate, and the client's
+/// note of which certificate it has seen from which host.
 ///
-/// The certificate is self-signed, and it is generated rather than loaded because a
-/// persistent one would mean writing a private key to disk and this program
-/// deliberately writes nothing. Making it once per server rather than once per
-/// connection is what lets the fingerprint be printed at startup and compared: a
-/// certificate regenerated for every connection would show a different fingerprint on
-/// every reconnect, which is not something anyone can check against anything.
+/// Two files, both deletable, and nothing else is ever written anywhere. `VNC_STATE`
+/// moves the directory — pointing it at `.` keeps everything beside the executable, for
+/// running off a stick — or turns it off entirely, which makes the server's certificate
+/// last only as long as the process and stops the client remembering anything.
+pub fn state_dir() -> Option<std::path::PathBuf> {
+    match std::env::var("VNC_STATE") {
+        Ok(v) if v == "off" => None,
+        Ok(v) => Some(std::path::PathBuf::from(v)),
+        // No APPDATA is not an error worth failing a connection over; it just means
+        // there is nowhere to remember things.
+        Err(_) => std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("vncfree")),
+    }
+}
+
+/// What the server identifies itself with: one self-signed certificate, made on first
+/// run and kept, used for every connection from then on.
+///
+/// Keeping it is the whole reason the fingerprint is worth printing. A certificate made
+/// fresh each time the server starts shows a different fingerprint after every restart,
+/// so a client that remembered the old one would cry wolf on every ordinary restart —
+/// and a check that fires constantly for innocent reasons is one people learn to click
+/// past, which is worse than not checking at all.
 pub struct Identity {
     cfg: Arc<rustls::ServerConfig>,
     pub fingerprint: String,
+    /// True if this one will be gone when the process exits.
+    pub ephemeral: bool,
 }
 
 impl Identity {
     pub fn new() -> Res<Identity> {
+        let path = state_dir().map(|d| d.join("server-cert"));
+        if let Some(p) = &path {
+            match std::fs::read(p) {
+                Ok(saved) => match Identity::build(&saved, false) {
+                    Ok(id) => return Ok(id),
+                    Err(e) => eprintln!(
+                        "{} is not a usable certificate ({e}); making a new one",
+                        p.display()
+                    ),
+                },
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    eprintln!("could not read {}: {e}", p.display())
+                }
+                Err(_) => {}
+            }
+        }
+
         let me = rcgen::generate_simple_self_signed(vec!["vncfree".to_string()])?;
-        let der = me.cert.der().clone();
-        let print = fingerprint(&der);
-        let key = rustls::pki_types::PrivateKeyDer::try_from(me.signing_key.serialize_der())
-            .map_err(|e| format!("generated an unusable private key: {e}"))?;
+        let cert = me.cert.der().to_vec();
+        let key = me.signing_key.serialize_der();
+        // Length-prefixed DER rather than PEM: rcgen hands out DER, rustls takes DER,
+        // and going via PEM in between would mean carrying a base64 decoder to read
+        // back something no person needs to read.
+        let mut blob = (cert.len() as u32).to_be_bytes().to_vec();
+        blob.extend_from_slice(&cert);
+        blob.extend_from_slice(&key);
+
+        let mut saved = false;
+        if let Some(p) = &path {
+            match p
+                .parent()
+                .map(std::fs::create_dir_all)
+                .unwrap_or(Ok(()))
+                .and_then(|_| std::fs::write(p, &blob))
+            {
+                Ok(()) => saved = true,
+                // Not fatal. An unwritable state directory should cost the convenience
+                // of a stable fingerprint, not the ability to serve a screen.
+                Err(e) => eprintln!("could not save the certificate to {}: {e}", p.display()),
+            }
+        }
+        Identity::build(&blob, !saved)
+    }
+
+    fn build(blob: &[u8], ephemeral: bool) -> Res<Identity> {
+        if blob.len() < 4 {
+            return Err("the stored certificate is truncated".into());
+        }
+        let n = u32::from_be_bytes(blob[..4].try_into().unwrap()) as usize;
+        if blob.len() < 4 + n {
+            return Err("the stored certificate is truncated".into());
+        }
+        let cert = rustls::pki_types::CertificateDer::from(blob[4..4 + n].to_vec());
+        let print = fingerprint(&cert);
+        let key = rustls::pki_types::PrivateKeyDer::try_from(blob[4 + n..].to_vec())
+            .map_err(|e| format!("unusable private key: {e}"))?;
         let cfg = rustls::ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
-            .with_single_cert(vec![der], key)?;
+            .with_single_cert(vec![cert], key)?;
         Ok(Identity {
             cfg: Arc::new(cfg),
             fingerprint: print,
+            ephemeral,
         })
     }
+}
+
+/// Check a server's certificate against the one last seen from that host, and remember
+/// it if this is the first time.
+///
+/// Trust on first use, like SSH: the first certificate from a host is taken on faith,
+/// and every one after that has to match. That does not make the first connection safe
+/// — nothing here can — but it does mean somebody who starts intercepting an
+/// established connection is caught, which covers the case that actually happens.
+///
+/// A mismatch is refused outright rather than warned about. A warning that can be
+/// clicked past is one that will be.
+pub fn check_known(host: &str, print: &str) -> Res<()> {
+    let Some(path) = state_dir().map(|d| d.join("known_hosts")) else {
+        return Ok(());
+    };
+    check_known_at(&path, host, print)
+}
+
+fn check_known_at(path: &std::path::Path, host: &str, print: &str) -> Res<()> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    for line in text.lines() {
+        let mut f = line.split_whitespace();
+        if f.next() != Some(host) {
+            continue;
+        }
+        return match f.next() {
+            Some(seen) if seen == print => Ok(()),
+            // A line for this host with nothing after it says nothing; treat it as
+            // absent rather than refusing to connect over a mangled file.
+            None => Ok(()),
+            Some(seen) => Err(format!(
+                "{host} presented a different certificate than the one remembered.\n\
+                 \x20 remembered: {seen}\n\
+                 \x20 offered:    {print}\n\
+                 Either that machine's vncfree-server was reinstalled or its saved \
+                 certificate was deleted, or something is sitting between you and it \
+                 reading the session.\n\
+                 If the first is what happened, remove the {host} line from\n\
+                 \x20 {}\n\
+                 and connect again.",
+                path.display()
+            )
+            .into()),
+        };
+    }
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{host} {print}")?;
+    eprintln!(
+        "  first time seeing this server; remembered it in {}",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Wrap a connected socket in TLS as the server. See the note on the client's
@@ -355,6 +486,98 @@ pub fn client(mut sock: TcpStream) -> Res<(WireRead, WireWrite, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch known_hosts path unique to each test, so the tests do not fight over
+    /// one file or over the environment variable that would normally choose it.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir()
+            .join("vncfree-tests")
+            .join(format!("{name}-known_hosts"));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Trust on first use: the first certificate from a host is taken on faith and
+    /// written down, and the same one afterwards is accepted silently.
+    #[test]
+    fn a_first_certificate_is_remembered_and_then_accepted() {
+        let p = scratch("first");
+        check_known_at(&p, "box:5900", "aa:bb").unwrap();
+        let after_first = std::fs::read_to_string(&p).unwrap();
+        assert!(after_first.contains("box:5900 aa:bb"));
+
+        check_known_at(&p, "box:5900", "aa:bb").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            after_first,
+            "seeing it again writes nothing new"
+        );
+    }
+
+    /// The point of the whole thing. A changed certificate is refused, not warned
+    /// about, and the message has to carry both fingerprints and the way out - a
+    /// refusal nobody can act on just gets worked around by deleting the feature.
+    #[test]
+    fn a_changed_certificate_is_refused_with_both_fingerprints() {
+        let p = scratch("changed");
+        check_known_at(&p, "box:5900", "aa:bb").unwrap();
+        let e = check_known_at(&p, "box:5900", "cc:dd")
+            .expect_err("a different certificate must not be accepted")
+            .to_string();
+        assert!(e.contains("aa:bb"), "says what it remembered: {e}");
+        assert!(e.contains("cc:dd"), "and what it was offered: {e}");
+        assert!(e.contains("known_hosts"), "and where to fix it: {e}");
+    }
+
+    /// Hosts are independent, and one entry must not be matched by a prefix of another.
+    #[test]
+    fn hosts_are_matched_whole() {
+        let p = scratch("hosts");
+        check_known_at(&p, "box:5900", "aa:bb").unwrap();
+        check_known_at(&p, "box:5901", "cc:dd").unwrap();
+        check_known_at(&p, "other:5900", "ee:ff").unwrap();
+        assert!(check_known_at(&p, "box:5901", "cc:dd").is_ok());
+        assert!(check_known_at(&p, "box:5901", "aa:bb").is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap().lines().count(), 3);
+    }
+
+    /// A file somebody has edited by hand should not be able to lock them out.
+    #[test]
+    fn a_mangled_line_does_not_refuse_the_connection() {
+        let p = scratch("mangled");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "box:5900\n\n   \n").unwrap();
+        check_known_at(&p, "box:5900", "aa:bb").unwrap();
+    }
+
+    /// The certificate has to survive a restart, or the check above would fire on every
+    /// ordinary restart and teach people to ignore it.
+    #[test]
+    fn a_saved_certificate_keeps_its_fingerprint() {
+        let me = rcgen::generate_simple_self_signed(vec!["vncfree".to_string()]).unwrap();
+        let cert = me.cert.der().to_vec();
+        let mut blob = (cert.len() as u32).to_be_bytes().to_vec();
+        blob.extend_from_slice(&cert);
+        blob.extend_from_slice(&me.signing_key.serialize_der());
+
+        let first = Identity::build(&blob, false).unwrap();
+        let again = Identity::build(&blob, false).unwrap();
+        assert_eq!(first.fingerprint, again.fingerprint);
+        assert!(!first.ephemeral);
+        assert_eq!(
+            first.fingerprint,
+            fingerprint(&cert),
+            "it is the certificate's own"
+        );
+    }
+
+    /// A truncated or junk file should be reported and replaced, not panic.
+    #[test]
+    fn a_damaged_certificate_file_is_rejected_cleanly() {
+        assert!(Identity::build(&[], false).is_err());
+        assert!(Identity::build(&[0, 0, 0, 200, 1, 2, 3], false).is_err());
+        assert!(Identity::build(&[0, 0, 0, 1, 9, 9, 9], false).is_err());
+    }
 
     /// A fingerprint has to be reproducible and readable, or comparing the two printed
     /// lines is not a check at all.

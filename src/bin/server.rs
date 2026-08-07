@@ -1290,12 +1290,20 @@ fn run() -> Res<()> {
     let (ox, oy, w, h) = win::share_region();
     println!("vncfree-server listening on {bind}, sharing {w}x{h}");
     match &me {
-        Some(me) => println!(
-            "TLS certificate {}\n  \
-             the client prints the same line - if they differ, something is sitting \
-             between you and it",
-            me.fingerprint
-        ),
+        Some(me) => {
+            println!(
+                "TLS certificate {}\n  \
+                 the client prints the same line - if they differ, something is sitting \
+                 between you and it",
+                me.fingerprint
+            );
+            if me.ephemeral {
+                println!(
+                    "  this certificate lasts only while the server runs, so clients \
+                     will see a new one next time"
+                );
+            }
+        }
         None => println!("VNC_TLS=off: this session will not be encrypted"),
     }
 

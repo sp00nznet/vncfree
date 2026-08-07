@@ -78,6 +78,12 @@ These each cost real time, and each one made correct code look broken:
   clipboard. Pipe a script file to `bash -s` rather than nesting quotes three deep.
 - **`cargo` writes progress to stderr.** In PowerShell 5.1, `2>&1` on a native command
   poisons `$?`, so a green build reports failure. Do not trust `$?` after redirecting.
+- **A running `vncfree-server.exe` locks its own binary**, so `cargo build` cannot
+  relink and the next test silently runs the *previous* build. This one cost an hour of
+  investigating a certificate that would not persist, in code that was already correct
+  and simply was not in the executable being run. Stop the server before building, and
+  when a fix appears to do nothing at all, check the exe's timestamp before checking
+  anything else.
 
 ## Verifying the Mac path
 

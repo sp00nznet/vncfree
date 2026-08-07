@@ -396,10 +396,10 @@ impl Vnc {
         let (reader, mut w, chosen) = if chosen == 19 {
             let (r, w, print) = vencrypt(&mut tcp)?;
             eprintln!("session encrypted; certificate {print}");
-            eprintln!(
-                "  compare that against the line the server printed - if they \
-                       differ, something is sitting between you and it"
-            );
+            // Refuses the connection if this host has shown a different certificate
+            // before, so an interception that starts after the first connection does
+            // not go unnoticed.
+            vncfree::wire::check_known(addr, &print)?;
             (r, w, 2)
         } else {
             let (r, w) = vncfree::wire::plain(tcp)?;

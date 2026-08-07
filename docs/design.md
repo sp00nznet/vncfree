@@ -216,20 +216,32 @@ TLS library implements it — rustls included. A self-signed certificate is the 
 amount of trust with a fingerprint attached that can actually be compared, so that is
 what this uses.
 
-The certificate is generated when the server starts, not per connection, and not
-loaded from disk. Per connection would give a different fingerprint on every reconnect,
-which is not something anyone can check against anything; from disk would mean writing
-a private key out, and this program deliberately writes nothing. The consequence is
-that the fingerprint is stable for as long as the server is running and changes when it
-restarts.
+The client accepts whatever certificate it is shown on the **first** connection to an
+address. That reads like a hole and is worth being exact about: there is no certificate
+authority for a program somebody started on a desktop five minutes ago, so refusing
+unsigned certificates would mean refusing every server. The choice is not between
+trusting it and verifying it, it is between trusting it and staying unencrypted.
+Signatures are still checked properly — skipping those would let anyone replay a
+certificate they hold no key for, which is weaker again.
 
-The client accepts whatever certificate it is shown. That reads like a hole and is
-worth being exact about: there is no certificate authority for a program somebody
-started on a desktop five minutes ago, so refusing unsigned certificates would mean
-refusing every server. The choice is not between trusting it and verifying it, it is
-between trusting it and staying unencrypted. Signatures are still checked properly —
-skipping those would let anyone replay a certificate they hold no key for, which is
-weaker again. What closes the gap is the fingerprint printed at both ends.
+What closes most of the gap is remembering it. The fingerprint goes into `known_hosts`,
+and a later connection showing a different one is **refused**, not warned about, because
+a warning that can be clicked past is one that will be. That is SSH's model and it has
+the same limit: the first connection is still taken on faith, but anyone who starts
+intercepting an established connection is caught.
+
+For that to be worth anything the server's identity has to hold still, so its
+certificate is made once on first run and kept in `server-cert`. This is the only reason
+the program writes anything to disk at all. A certificate regenerated per connection
+gives a different fingerprint on every reconnect, and one regenerated per *start* cries
+wolf after every ordinary restart — a check that fires constantly for innocent reasons
+is one people learn to ignore, which is worse than no check. `VNC_STATE=off` restores
+the write-nothing behaviour, at the cost of both properties.
+
+Two files, both plain and both deletable, and the format of the certificate blob is a
+length-prefixed pair of DER blobs rather than PEM: rcgen hands out DER and rustls takes
+DER, so going via PEM would mean carrying a base64 decoder to read back something no
+person needs to read.
 
 Both ends default to *offering* encryption rather than requiring it, because a client
 that has never heard of VeNCrypt still has to be able to connect — macOS's own viewer

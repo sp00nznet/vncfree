@@ -59,7 +59,7 @@ can't also be the quit key.
 
 ### Settings
 
-All environment variables. There is no config file and nothing is written to disk.
+All environment variables. There is no config file.
 
 | Variable | Effect |
 |---|---|
@@ -68,6 +68,7 @@ All environment variables. There is no config file and nothing is written to dis
 | `VNC_BIND` | Server only. Where to listen; default `0.0.0.0:5900`. |
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
 | `VNC_TLS` | `offer` (default), `require` or `off`. On the client, `require` refuses to connect to a server that will not encrypt. |
+| `VNC_STATE` | Where the two files below live. A path — `.` keeps them beside the executable — or `off` to write nothing at all. |
 | `VNC_ENCODING` | Client only. `raw`, `tight` or `zrle` to ask for exactly one. Answers "is it my decoder or the server?" |
 | `VNC_QUALITY` | Client only, `0`–`9`. Lets a Tight server send lossy JPEG, which is much smaller on a slow link. Unset means lossless. |
 | `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
@@ -77,6 +78,24 @@ All environment variables. There is no config file and nothing is written to dis
 
 Credentials come from the environment rather than the command line, because argv is
 visible to every process on the machine.
+
+### The only two files it writes
+
+Both live in `%APPDATA%\vncfree`, both are yours to delete, and there is nothing else
+anywhere — no registry keys, no installer, no service.
+
+| File | What it is |
+|---|---|
+| `server-cert` | The server's TLS certificate and its private key, made on first run. Kept so its fingerprint stays the same, because one that changed on every restart would be a fingerprint nobody could check anything against. |
+| `known_hosts` | One line per address the **client** has connected to, with the certificate it saw. A plain text file. |
+
+The client trusts the first certificate it sees from an address and **refuses to connect
+if it ever changes**, which is what SSH does and for the same reason. It cannot make the
+first connection safe — nothing can, without a certificate authority — but it does catch
+someone who starts intercepting a connection you have used before.
+
+If a server really was rebuilt, delete its line from `known_hosts` and connect again.
+`VNC_STATE=off` turns all of this off: nothing is written, and nothing is checked.
 
 ## What it does
 
@@ -100,13 +119,14 @@ authentication, so there is no unauthenticated path at all.
 
 ## Known limits
 
-- **TLS encrypts the session but does not prove who is on the other end.** Both ends
-  print the certificate's fingerprint; if they match, nobody is sitting in the middle.
-  Nothing checks that for you, because there is no certificate authority for a program
-  someone started on a desktop five minutes ago. A server that offers both encrypted
-  and unencrypted connections can also be pushed to the unencrypted one by someone in
-  the middle — `VNC_TLS=require` at either end removes that choice. **Still don't
-  port-forward this to the internet**: tunnel over SSH or a VPN.
+- **The first connection to a server is taken on trust.** After that the certificate is
+  remembered and a change is refused, but there is no certificate authority for a
+  program someone started on a desktop five minutes ago, so the first one cannot be
+  checked against anything. Compare the fingerprints both ends print if that first
+  connection matters. A server that offers both encrypted and unencrypted connections
+  can also be pushed to the unencrypted one by someone in the middle — `VNC_TLS=require`
+  at either end removes that choice. **Still don't port-forward this to the internet**:
+  tunnel over SSH or a VPN.
 - **Encryption needs both ends to be vncfree.** VeNCrypt's other TLS modes use
   anonymous Diffie-Hellman, which cannot detect anyone in the middle at all and which
   no current TLS library implements; vncfree speaks the X509 form instead. Against

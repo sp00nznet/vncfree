@@ -25,6 +25,7 @@
 | 20 | Client-side RFB 3.3 and 3.7, so old servers are not locked out either | done |
 | 21 | Non-US keyboard layouts, via the layout Windows has already applied | done |
 | 22 | Tight decoding, so servers that speak nothing better are not stuck on Raw | done |
+| 23 | A remembered certificate per host, so a changed one is refused | done |
 
 ## Ideas, not commitments
 
@@ -37,8 +38,8 @@ Roughly in the order they would earn their keep:
 - **Tight *encoding*, on the server.** The client decodes it now; producing it means a
   JPEG encoder, for a squeeze on top of the ZRLE the server already sends. Low value,
   high weight.
-- **Somewhere to keep a known fingerprint.** TLS is in, but the certificate is
-  self-signed and comparing the two printed fingerprints is a manual step. Remembering
-  one per host, the way SSH does, would make a changed certificate something the
-  program notices rather than something the user has to. It needs a file on disk, which
-  is a promise this program currently makes a point of not breaking.
+- **A way to verify the *first* connection.** Trust on first use catches anyone who
+  starts intercepting later, but the first certificate from a host is still taken on
+  faith. Comparing the printed fingerprints by hand is the only answer today. Anything
+  better means a shared secret or an authority, and the password is already the shared
+  secret - deriving the certificate from it is the interesting idea here.
