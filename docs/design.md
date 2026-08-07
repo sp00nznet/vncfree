@@ -31,6 +31,7 @@ Only where hand-rolling would be reckless:
 | `windows-sys` | Screen capture, input injection and the dialogs. |
 | `rustls`, `rcgen`, `sha2` | TLS, the self-signed certificate it presents, and the fingerprint of it. Built with `ring` rather than `aws-lc-rs` so the build needs no cmake or nasm. |
 | `jpeg-decoder` | Client only. Tight rectangles can arrive as JPEG, and a baseline JPEG decoder is not a thing to hand-roll. Default features off, so it brings no thread pool. |
+| `embed-resource` | Build only. A Windows icon is a linked resource, and this one gives each binary a *different* one. Failure downgrades to a warning — see [assets/README.md](../assets/README.md). |
 | `windows` | Desktop Duplication only. It is COM, and `windows-sys` has no COM support — several hundred lines of hand-written vtable calls in unsafe code, against a crate that brings reference counting and `QueryInterface`. Worth it when the alternative is managing COM lifetimes by hand. |
 
 RFB itself is hand-rolled over `std::net::TcpStream` — the spec is small and the crates
