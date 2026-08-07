@@ -88,8 +88,9 @@ visible to every process on the machine.
 | **Encryption** | TLS 1.3 over VeNCrypt, on by default, with the password exchanged inside it. `VNC_TLS=require` refuses to fall back |
 | **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, macOS's own client, and itself |
 
-The server speaks RFB 3.3 as well as 3.8, so **the viewer built into every Mac can
-connect to it** — Screen Sharing.app asks for 3.3 and would otherwise be locked out.
+Both ends speak RFB 3.3, 3.7 and 3.8. That means **the viewer built into every Mac can
+connect to the server** — Screen Sharing.app asks for 3.3 and would otherwise be locked
+out — and the client is not fussy about what it connects to either.
 
 **The server will not start without a password.** An open VNC port hands the whole
 desktop to anyone who can reach it, and defaulting to "no password" is exactly the
@@ -117,7 +118,6 @@ authentication, so there is no unauthenticated path at all.
   channel (port 3283) rather than on the VNC connection — established by watching both
   directions and Apple's own client. **Ctrl-Shift-V types the local clipboard at the
   remote machine instead**, which works anywhere. See [docs/macos.md](docs/macos.md).
-- RFB 3.8 or later. Older servers (3.3/3.7) negotiate security differently.
 - No Tight encoding, and the server's CopyRect covers vertical scrolling but not a
   window dragged sideways. Compatibility is unaffected — these cost bytes, not
   connections.

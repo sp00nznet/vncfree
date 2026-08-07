@@ -112,6 +112,31 @@ it correctly. That session ends with an explanatory error, which is honest and l
 somewhere useful — a reconnect negotiates the new size properly, and vncfree's own
 client reconnects by itself.
 
+## The three RFB versions, and where they differ
+
+Both ends speak 3.3, 3.7 and 3.8. The version reply is a *choice* and may not exceed
+what the server offered, so a 3.3 server has to be answered with 3.3; anything at or
+above 8 is answered with 8, which is what makes Apple's `RFB 003.889` fall back to
+behaving like an ordinary 3.8 server.
+
+The differences are small and every one of them fails the same way — a client waiting
+for bytes that are never coming, against a server waiting for the bytes it should have
+sent instead. That reads as a hung network rather than a protocol mistake:
+
+- **3.3 states the security type in one word rather than offering a list**, and takes no
+  answer. Sending the one-byte choice anyway puts a stray byte exactly where the server
+  expects ClientInit.
+- **Before 3.8, a security type of None is followed by nothing at all.** The
+  initialisation phase starts immediately, so waiting for a SecurityResult deadlocks.
+- **A failed SecurityResult carries a reason string only from 3.8.** Older servers just
+  hang up, so asking for the reason turns a clear "wrong password" into a stall.
+
+Because every one of those is a deadlock rather than a wrong answer, `tests/` stands up
+a real server of each version and runs the actual client binary through a whole session
+against it, down to checking the pixels that come out the other end. Those servers set
+a read timeout for the same reason: without one, a regression would hang the test suite
+instead of failing it.
+
 ## TLS, and the one thing it cannot do
 
 The session is encrypted with TLS 1.3, negotiated through VeNCrypt (security type 19)

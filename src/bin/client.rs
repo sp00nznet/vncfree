@@ -320,28 +320,48 @@ impl Vnc {
             .trim_end()
             .to_string();
         // Apple's Screen Sharing announces "RFB 003.889". Replying 003.008 makes it
-        // fall back to being a standard 3.8 server, so accept any 003.>=8 here.
-        // ponytail: no 3.3/3.7 support - they negotiate SecurityResult differently.
-        // Add them when a server actually refuses us.
+        // fall back to being a standard 3.8 server, so anything at or above 8 is
+        // answered with 8.
         let minor: u32 = ver
             .strip_prefix("RFB 003.")
             .and_then(|m| m.parse().ok())
             .ok_or_else(|| format!("not an RFB 3.x server: {ver:?}"))?;
-        if minor < 8 {
-            return Err(
-                format!("server speaks {ver:?}; vncfree needs RFB 003.008 or later").into(),
-            );
-        }
-        tcp.write_all(b"RFB 003.008\n")?;
+        // The reply is a choice, not an acknowledgement, and it may not exceed what the
+        // server offered: answering a 3.3 server with 3.8 is not a negotiation, it is a
+        // protocol error. Anything below 7 is 3.3, which is the floor.
+        let speak = match minor {
+            0..=6 => 3,
+            7 => 7,
+            _ => 8,
+        };
+        tcp.write_all(format!("RFB 003.{speak:03}\n").as_bytes())?;
 
         // --- security handshake ---
-        let n = u8r(&mut tcp)? as usize;
-        if n == 0 {
-            return Err(format!("server refused connection: {}", text(&mut tcp)?).into());
-        }
-        let types = blob(&mut tcp, n)?;
+        let types = if speak == 3 {
+            // 3.3 has no negotiation at all: the server decides and says so in one
+            // word, and the client's only options are to go along with it or hang up.
+            match u32r(&mut tcp)? {
+                0 => return Err(format!("server refused connection: {}", text(&mut tcp)?).into()),
+                t @ (1 | 2) => vec![t as u8],
+                t => {
+                    return Err(format!(
+                        "server chose security type {t}, which RFB 3.3 does not define"
+                    )
+                    .into())
+                }
+            }
+        } else {
+            let n = u8r(&mut tcp)? as usize;
+            if n == 0 {
+                return Err(format!("server refused connection: {}", text(&mut tcp)?).into());
+            }
+            blob(&mut tcp, n)?
+        };
         if debug() {
-            eprintln!("[debug] server version {ver:?}, security types offered {types:?}");
+            eprintln!(
+                "[debug] server version {ver:?}, answering 003.{speak:03}, \
+                 security types offered {types:?}"
+            );
         }
         let want_tls = env::var("VNC_TLS").unwrap_or_default() == "require";
         // VeNCrypt first: it is the only one of these that encrypts anything.
@@ -365,7 +385,11 @@ impl Vnc {
         if debug() {
             eprintln!("[debug] chose security type {chosen}");
         }
-        tcp.write_all(&[chosen])?;
+        // 3.3 stated the type rather than offering one, so there is nothing to send
+        // back; a byte here would be read as the start of the next message.
+        if speak > 3 {
+            tcp.write_all(&[chosen])?;
+        }
 
         // VeNCrypt hands the connection to TLS and then runs one of the ordinary
         // security types inside it, so `chosen` becomes whatever that turns out to be.
@@ -400,8 +424,18 @@ impl Vnc {
             }
             _ => {}
         }
-        if u32r(&mut r)? != 0 {
-            let why = text(&mut r)?;
+        // Before 3.8, a security type of None is followed by nothing at all - the
+        // initialisation phase starts immediately. Reading a SecurityResult that is
+        // never coming hangs the connection on a server that is waiting for us.
+        let expect_result = chosen != 1 || speak >= 8;
+        if expect_result && u32r(&mut r)? != 0 {
+            // The reason string arrived with 3.8. Older servers just hang up, so
+            // asking for one blocks until the socket closes.
+            let why = if speak >= 8 {
+                text(&mut r)?
+            } else {
+                format!("the server gave no reason (RFB 3.{speak} has nowhere to put one)")
+            };
             if chosen == 30 {
                 return Err(format!(
                     "authentication failed: {why}\n\
