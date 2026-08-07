@@ -25,8 +25,8 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOp
 use num_bigint::BigUint;
 
 use vncfree::{
-    blob, cut_text_msg, debug, from_latin1, i32r, rd, text, u16r, u32r, u8r, vnc_des, Res, Screen,
-    PIXEL_FORMAT,
+    blob, cut_text_msg, debug, i32r, rd, read_clipboard, text, u16r, u32r, u8r, vnc_des, Res,
+    Screen, PIXEL_FORMAT,
 };
 
 /// Shared write half. Both the network thread (update requests) and the UI thread
@@ -463,6 +463,7 @@ impl Vnc {
         w.write_all(&[1])?; // ClientInit, shared = yes
         let width = u16r(&mut r)? as usize;
         let height = u16r(&mut r)? as usize;
+        screen_size(width, height)?;
         let _server_format = rd::<16>(&mut r)?;
         let name = text(&mut r)?;
         eprintln!("connected: {name:?} {width}x{height} (server said {ver:?})");
@@ -634,12 +635,12 @@ impl Vnc {
             3 => {
                 // ServerCutText: 3 padding, then a u32-prefixed Latin-1 string.
                 blob(&mut self.r, 3)?;
-                let n = u32r(&mut self.r)? as usize;
-                let body = blob(&mut self.r, n)?;
-                if debug() {
-                    eprintln!("[debug] clipboard <- server ({n} bytes)");
+                if let Some(text) = read_clipboard(&mut self.r)? {
+                    if debug() {
+                        eprintln!("[debug] clipboard <- server ({} bytes)", text.len());
+                    }
+                    self.paste(text);
                 }
-                self.paste(from_latin1(&body));
                 Ok(false)
             }
             other => {
@@ -1324,6 +1325,24 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res
 
 // ---------------------------------------------------------------- decoding
 
+/// The largest screen this will agree to hold, in pixels. Both dimensions arrive as
+/// `u16` from the server, so without a limit a claimed 65535x65535 desktop is a
+/// seventeen-gigabyte allocation for the price of four bytes. Well past any real wall
+/// of monitors, and far short of what a hostile server would ask for.
+const MAX_PIXELS: usize = 64 * 1024 * 1024;
+
+/// Check a screen size the far end asked for before allocating it.
+fn screen_size(w: usize, h: usize) -> Res<()> {
+    if w == 0 || h == 0 || w * h > MAX_PIXELS {
+        return Err(format!("server claims a {w}x{h} screen, which is not a screen").into());
+    }
+    Ok(())
+}
+
+/// The largest pointer this will accept, per side. Cursors are small, and the same
+/// `u16` reasoning applies as for the screen above.
+const MAX_CURSOR: usize = 256;
+
 /// The pointer's picture, drawn locally so it tracks the mouse without waiting for the
 /// server. `px` holds only the visible pixels; `on` says which those are.
 #[derive(Clone, Default)]
@@ -1342,6 +1361,9 @@ fn read_cursor(r: &mut impl Read, hot_x: usize, hot_y: usize, w: usize, h: usize
     if w == 0 || h == 0 {
         // A zero-sized shape means the pointer is hidden.
         return Ok(Cursor::default());
+    }
+    if w > MAX_CURSOR || h > MAX_CURSOR {
+        return Err(format!("server sent a {w}x{h} pointer, which is not a pointer").into());
     }
     let data = blob(r, w * h * 4)?;
     let mask = blob(r, w.div_ceil(8) * h)?;
@@ -1526,6 +1548,7 @@ impl Decoder {
             if debug() {
                 eprintln!("[debug] remote resolution is now {w}x{h}");
             }
+            screen_size(w, h)?;
             s.w = w;
             s.h = h;
             s.px = vec![0; w * h];
@@ -1959,6 +1982,7 @@ fn write_ppm(path: &str, s: &Screen) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vncfree::from_latin1;
 
     /// 1024-bit MODP group (RFC 2409 group 2) - same 128-byte key length a Mac uses.
     const MODP_1024: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\

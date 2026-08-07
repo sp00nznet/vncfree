@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flate2::{Compress, Compression, FlushCompress};
-use vncfree::{blob, cut_text_msg, debug, from_latin1, rd, u16r, u32r, u8r, vnc_des};
+use vncfree::{blob, cut_text_msg, debug, rd, read_clipboard, u16r, u32r, u8r, vnc_des};
 use vncfree::{Res, Screen, PIXEL_FORMAT};
 
 mod dxgi {
@@ -1473,17 +1473,25 @@ fn run() -> Res<()> {
         None => println!("VNC_TLS=off: this session will not be encrypted"),
     }
 
+    // Shared by every connection, because the point is to remember an address across
+    // the connections it keeps opening.
+    let guard = Arc::new(Guard::default());
+
     for stream in listener.incoming() {
         let stream = stream?;
         let password = password.clone();
         let me = me.clone();
-        let peer = stream
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
+        let guard = guard.clone();
+        let addr = stream.peer_addr().ok();
+        let peer = addr.map(|a| a.to_string()).unwrap_or_default();
+        // An address that cannot be read cannot be tracked, and is treated as its own
+        // unknown host rather than being let through unmetered.
+        let ip = addr
+            .map(|a| a.ip())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         std::thread::spawn(move || {
             println!("client connected: {peer}");
-            match serve(stream, &password, me.as_deref(), ox, oy, w, h) {
+            match serve(stream, &password, me.as_deref(), &guard, ip, ox, oy, w, h) {
                 Ok(()) => println!("client {peer} disconnected"),
                 Err(e) => println!("client {peer} finished: {e}"),
             }
@@ -1492,10 +1500,13 @@ fn run() -> Res<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     mut tcp: TcpStream,
     password: &str,
     me: Option<&vncfree::wire::Identity>,
+    guard: &Guard,
+    peer: std::net::IpAddr,
     ox: i32,
     oy: i32,
     w: usize,
@@ -1520,6 +1531,22 @@ fn serve(
         .and_then(|m| m.parse().ok())
         .unwrap_or(3);
     let old = minor < 7;
+
+    // Turned away as early as the protocol allows a reason to be given, so a peer that
+    // is guessing gets no challenge to guess against. Refused rather than delayed: a
+    // connection held open on a timer is a thread per attacker, which would trade a
+    // defence against guessing for a cheaper way to exhaust the machine.
+    if let Some(left) = guard.penalty(peer) {
+        return turn_away(
+            &mut tcp,
+            old,
+            format!(
+                "too many failed passwords from this address; try again in {}s",
+                left.as_secs() + 1
+            )
+            .as_bytes(),
+        );
+    }
 
     // --- security ---
     // Whichever type is chosen, the password is checked the same way afterwards; all
@@ -1574,9 +1601,33 @@ fn serve(
     let answer = rd::<16>(&mut r)?;
     let mut expected = challenge;
     vnc_des(&mut expected, password);
-    if answer != expected {
-        return refuse(&mut out, old, b"authentication failed");
+    // Compared without an early exit. `==` on an array stops at the first byte that
+    // differs, and how long that takes is something the other end can measure - which
+    // over enough attempts turns guessing the whole response into guessing it one byte
+    // at a time. The rate limit above already makes that impractical; this makes the
+    // question not arise.
+    let wrong = answer
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        != 0;
+    if wrong {
+        let wait = guard.failed(peer);
+        println!(
+            "{peer} failed authentication; it may try again in {}s",
+            wait.as_secs()
+        );
+        return refuse(
+            &mut out,
+            old,
+            format!(
+                "authentication failed - no further attempts from this address for {}s",
+                wait.as_secs()
+            )
+            .as_bytes(),
+        );
     }
+    guard.passed(peer);
     out.write_all(&0u32.to_be_bytes())?; // SecurityResult: OK
 
     // --- init ---
@@ -1617,6 +1668,52 @@ fn serve(
     let result = read_client(&mut r, &shared, ox, oy);
     shared.alive.store(false, Ordering::Relaxed);
     result
+}
+
+/// Failed password attempts, per source address.
+///
+/// VNC authentication is DES over at most eight characters, and nothing in RFB slows
+/// down a peer that keeps guessing. At network speed that is the weakest thing here by
+/// a wide margin, so each failure from an address pushes back when that address may try
+/// again, and a success clears the record.
+///
+/// Refusing rather than sleeping on the connection: a delay held open is a thread per
+/// attacker, so a defence against guessing would hand over a cheaper way to exhaust the
+/// machine instead.
+#[derive(Default)]
+struct Guard {
+    /// Address -> how many times it has failed, and when it may try again.
+    seen: Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+}
+
+/// Longest an address is ever made to wait. Long enough to make guessing hopeless,
+/// short enough that a typo is not a lockout.
+const MAX_BACKOFF: u64 = 30;
+
+impl Guard {
+    /// How much longer this address must wait, if it is serving a penalty.
+    fn penalty(&self, ip: std::net::IpAddr) -> Option<Duration> {
+        let mut seen = self.seen.lock().unwrap();
+        // Forget addresses that have served their time, so this cannot grow without
+        // bound from connection attempts alone.
+        seen.retain(|_, (_, until)| *until > std::time::Instant::now());
+        seen.get(&ip)
+            .map(|(_, until)| until.saturating_duration_since(std::time::Instant::now()))
+            .filter(|d| !d.is_zero())
+    }
+
+    fn failed(&self, ip: std::net::IpAddr) -> Duration {
+        let mut seen = self.seen.lock().unwrap();
+        let e = seen.entry(ip).or_insert((0, std::time::Instant::now()));
+        e.0 += 1;
+        let wait = Duration::from_secs((1u64 << e.0.min(5)).min(MAX_BACKOFF));
+        e.1 = std::time::Instant::now() + wait;
+        wait
+    }
+
+    fn passed(&self, ip: std::net::IpAddr) {
+        self.seen.lock().unwrap().remove(&ip);
+    }
 }
 
 /// Whether this server offers, insists on, or refuses to encrypt.
@@ -1680,6 +1777,22 @@ fn vencrypt(
     tcp.write_all(&[1])?;
 
     vncfree::wire::server(tcp.try_clone()?, me)
+}
+
+/// Refuse before offering any security type at all, which is the one place in RFB where
+/// a reason can be given for turning a connection away rather than failing its password.
+///
+/// The count of security types is where the refusal goes: zero of them, then the reason.
+/// 3.3 has no list, so the same thing is said with a security type of zero.
+fn turn_away(tcp: &mut impl Write, old: bool, reason: &[u8]) -> Res<()> {
+    if old {
+        tcp.write_all(&0u32.to_be_bytes())?;
+    } else {
+        tcp.write_all(&[0])?;
+    }
+    tcp.write_all(&(reason.len() as u32).to_be_bytes())?;
+    tcp.write_all(reason)?;
+    Err(String::from_utf8_lossy(reason).into_owned().into())
 }
 
 /// Say no. RFB 3.7 added the explanatory string; sending one to a 3.3 client would be
@@ -1780,12 +1893,11 @@ fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> R
             }
             6 => {
                 blob(tcp, 3)?;
-                let n = u32r(tcp)? as usize;
-                let body = blob(tcp, n)?;
-                let text = from_latin1(&body);
-                *shared.clip.lock().unwrap() = text.clone();
-                if let Some(b) = board.as_mut() {
-                    let _ = b.set_text(text);
+                if let Some(text) = read_clipboard(tcp)? {
+                    *shared.clip.lock().unwrap() = text.clone();
+                    if let Some(b) = board.as_mut() {
+                        let _ = b.set_text(text);
+                    }
                 }
             }
             other => {
@@ -2120,6 +2232,51 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh address is not made to wait, a failing one waits longer each time, and
+    /// getting it right forgets the whole thing.
+    #[test]
+    fn failed_passwords_make_an_address_wait_longer_each_time() {
+        let g = Guard::default();
+        let ip: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        assert!(g.penalty(ip).is_none(), "nothing held against it yet");
+
+        let mut last = Duration::ZERO;
+        for attempt in 1..=8 {
+            let wait = g.failed(ip);
+            assert!(
+                wait >= last,
+                "attempt {attempt} waits at least as long as the one before"
+            );
+            assert!(
+                wait <= Duration::from_secs(MAX_BACKOFF),
+                "and never longer than the cap, or a typo becomes a lockout"
+            );
+            assert!(g.penalty(ip).is_some(), "and it is serving that wait now");
+            last = wait;
+        }
+        assert_eq!(last, Duration::from_secs(MAX_BACKOFF), "it reaches the cap");
+
+        g.passed(ip);
+        assert!(g.penalty(ip).is_none(), "the right password clears it");
+    }
+
+    /// One address guessing must not lock anybody else out - that would turn the
+    /// defence into the easier attack.
+    #[test]
+    fn one_addresss_failures_do_not_hold_up_another() {
+        let g = Guard::default();
+        let bad: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let good: std::net::IpAddr = "10.0.0.8".parse().unwrap();
+        for _ in 0..5 {
+            g.failed(bad);
+        }
+        assert!(g.penalty(bad).is_some());
+        assert!(
+            g.penalty(good).is_none(),
+            "a different address is unaffected"
+        );
+    }
 
     #[test]
     fn unchanged_frames_produce_no_rectangles() {

@@ -11,6 +11,17 @@ permissions:
   contents: write # needed to attach binaries to a release
 
 jobs:
+  # A published advisory against anything in the tree is something to find out about
+  # from CI rather than from a user. Separate from the build so a new advisory reports
+  # itself without also failing the binaries.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   windows:
     runs-on: windows-latest
     steps:

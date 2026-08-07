@@ -28,6 +28,7 @@
 | 23 | A remembered certificate per host, so a changed one is refused | done |
 | 24 | Continuous updates, so the server stops waiting to be asked for each frame | done |
 | 25 | A locally drawn pointer, so the mouse stops waiting for a round trip | done |
+| 26 | A security pass: bounded reads, rate-limited passwords, a written threat model | done |
 
 ## Ideas, not commitments
 

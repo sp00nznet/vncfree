@@ -63,7 +63,7 @@ All environment variables. There is no config file.
 
 | Variable | Effect |
 |---|---|
-| `VNC_PASSWORD` | Password. The server refuses to start without one. |
+| `VNC_PASSWORD` | Password. The server refuses to start without one. **Only the first 8 characters count** - that is VNC authentication, not a choice made here. |
 | `VNC_USERNAME` | macOS account name. Only needed for a Mac. |
 | `VNC_BIND` | Server only. Where to listen; default `0.0.0.0:5900`. |
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
@@ -169,6 +169,8 @@ authentication, so there is no unauthenticated path at all.
 
 ## Documentation
 
+- **[docs/security.md](docs/security.md)** — what the server hands over, what protects
+  it, what does not, and what has been hardened against what.
 - **[docs/macos.md](docs/macos.md)** — connecting to a Mac, what to do when it refuses
   you, and exactly what has been tested.
 - **[docs/design.md](docs/design.md)** — how it is put together, why each dependency is

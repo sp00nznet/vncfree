@@ -32,14 +32,59 @@ pub fn u32r(s: &mut impl Read) -> Res<u32> {
 pub fn i32r(s: &mut impl Read) -> Res<i32> {
     Ok(i32::from_be_bytes(rd::<4>(s)?))
 }
+/// How much is allocated up front for a length nobody has backed with bytes yet.
+const CHUNK: usize = 64 * 1024;
+
+/// Read exactly `n` bytes.
+///
+/// Grown as the bytes actually turn up rather than in one allocation of the size the
+/// other end claimed. Every length on this wire is a `u16` or a `u32` chosen by the
+/// peer, and `vec![0; n]` hands over four gigabytes of this process to anyone who sends
+/// four bytes saying so - on the client that is reachable before a password is exchanged
+/// at all, since a server states its failure reason with one of these.
+///
+/// A peer that genuinely sends four gigabytes still gets four gigabytes read, which is
+/// as it should be: a full-screen update really is megabytes, and the difference that
+/// matters is having to send them.
 pub fn blob(s: &mut impl Read, n: usize) -> Res<Vec<u8>> {
-    let mut v = vec![0u8; n];
-    s.read_exact(&mut v)?;
+    let mut v = Vec::with_capacity(n.min(CHUNK));
+    while v.len() < n {
+        let at = v.len();
+        let want = (n - at).min(CHUNK);
+        v.resize(at + want, 0);
+        s.read_exact(&mut v[at..])?;
+    }
     Ok(v)
 }
+
+/// Read `n` bytes and throw them away, without holding them.
+///
+/// For a message that is too big to be meant seriously but has to come off the wire
+/// anyway, because leaving it there would desynchronise everything after it.
+pub fn skip(s: &mut impl Read, n: usize) -> Res<()> {
+    let mut left = n;
+    let mut bin = vec![0u8; CHUNK.min(left.max(1))];
+    while left > 0 {
+        let want = left.min(bin.len());
+        s.read_exact(&mut bin[..want])?;
+        left -= want;
+    }
+    Ok(())
+}
+
+/// The longest string RFB has any reason to carry: a desktop name, or the reason a
+/// connection was refused. Both are a line of text.
+pub const MAX_TEXT: usize = 64 * 1024;
+
 /// A u32-prefixed string, used by RFB for error reasons and the desktop name.
 pub fn text(s: &mut impl Read) -> Res<String> {
     let n = u32r(s)? as usize;
+    if n > MAX_TEXT {
+        // Read past it rather than trusting it: this is reached during the handshake,
+        // before either end has proved anything to the other.
+        skip(s, n)?;
+        return Err(format!("peer sent a {n}-byte string where a line of text belongs").into());
+    }
     Ok(String::from_utf8_lossy(&blob(s, n)?).into_owned())
 }
 
@@ -101,6 +146,27 @@ pub const PIXEL_FORMAT: [u8; 16] = [
     0, 0, 0,                  // padding
 ];
 
+/// The largest clipboard either end will accept. Generous for text - a megabyte is
+/// several hundred pages - and it exists because the length is a `u32` chosen by the
+/// peer, so without it a clipboard message is a request to allocate anything at all.
+pub const MAX_CLIPBOARD: usize = 1024 * 1024;
+
+/// Take a clipboard body off the wire, ignoring one too big to be meant seriously.
+///
+/// Ignoring rather than refusing: an over-large clipboard is far more likely to be
+/// somebody copying a whole file by accident than an attack, and dropping the session
+/// over it would be a poor trade. The bytes are still read, because leaving them would
+/// desynchronise every message after this one.
+pub fn read_clipboard(s: &mut impl Read) -> Res<Option<String>> {
+    let n = u32r(s)? as usize;
+    if n > MAX_CLIPBOARD {
+        skip(s, n)?;
+        eprintln!("ignoring a {n}-byte clipboard, over the {MAX_CLIPBOARD}-byte limit");
+        return Ok(None);
+    }
+    Ok(Some(from_latin1(&blob(s, n)?)))
+}
+
 /// ClientCutText (msg 6). RFB clipboard text is ISO 8859-1 with LF line endings, so
 /// characters outside Latin-1 become '?' and the CR of a Windows CRLF is dropped.
 /// ServerCutText (msg 3) has the same body, so the server reuses this and patches
@@ -152,6 +218,68 @@ mod tests {
         assert_eq!(a, b, "same password must give the same answer");
         assert_ne!(a, c, "a different password must not");
         assert_ne!(a, challenge, "and it must actually encrypt");
+    }
+
+    /// The whole point of reading in instalments. A peer can claim four gigabytes in a
+    /// four-byte field and then send nothing; this must come back as a short read
+    /// rather than as four gigabytes of this process.
+    ///
+    /// The check is the *capacity*, not the failure: `read_exact` would fail either
+    /// way, but the old version failed only after allocating what it had been told.
+    #[test]
+    fn a_huge_claimed_length_does_not_allocate_before_the_bytes_arrive() {
+        struct Trickle(usize);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(self.0);
+                buf[..n].fill(b'x');
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        // Claims 4GB, has 100 bytes. Returning at all is the point: the old version
+        // asked the allocator for the whole four gigabytes before reading a byte.
+        let mut s = Trickle(100);
+        let e = blob(&mut s, u32::MAX as usize).expect_err("cannot be satisfied");
+        let io = e
+            .downcast_ref::<std::io::Error>()
+            .expect("a short read, not something else");
+        assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// And the same length in the places a peer actually controls one.
+    #[test]
+    fn absurd_strings_and_clipboards_are_refused_not_allocated() {
+        let mut msg = (MAX_TEXT as u32 + 1).to_be_bytes().to_vec();
+        msg.resize(msg.len() + MAX_TEXT + 1, b'a');
+        let e = text(&mut &msg[..]).expect_err("too long to be a line of text");
+        assert!(
+            e.to_string().contains("where a line of text belongs"),
+            "{e}"
+        );
+
+        // A clipboard over the limit is skipped rather than ending the session: much
+        // more likely to be a fat copy than an attack.
+        let mut clip = (MAX_CLIPBOARD as u32 + 1).to_be_bytes().to_vec();
+        clip.resize(clip.len() + MAX_CLIPBOARD + 1, b'a');
+        assert_eq!(read_clipboard(&mut &clip[..]).unwrap(), None);
+
+        // And one inside it still arrives.
+        let mut ok = 2u32.to_be_bytes().to_vec();
+        ok.extend_from_slice(b"hi");
+        assert_eq!(read_clipboard(&mut &ok[..]).unwrap().as_deref(), Some("hi"));
+    }
+
+    /// Reading past something has to consume exactly it, or every message after this
+    /// one is read at the wrong offset - which is worse than the message that was
+    /// rejected.
+    #[test]
+    fn skipping_consumes_exactly_what_it_was_asked_to() {
+        let data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let mut r = &data[..];
+        skip(&mut r, 150).unwrap();
+        assert_eq!(r.len(), 50, "the rest is still there");
+        assert_eq!(r[0], 150, "and starts exactly where it should");
     }
 
     #[test]
