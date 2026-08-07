@@ -31,6 +31,12 @@ Grab the same screen twice with `VNC_ENCODING` set to `raw` and then to the enco
 under test, and compare the files. They must be byte-identical. Take a third Raw grab
 to prove the screen was static, otherwise a difference might just be the clock ticking.
 
+**A third grab is not enough on its own.** Anything that *blinks* aliases against it: a
+text caret is on for the first and third grab and off for the second, so the screen
+looks static and the encodings look broken. When they differ, look at *where* before
+concluding anything. Differences confined to one small box — a 1x37 strip, say — are a
+caret; a real encoder fault is spread across the picture or lands on tile boundaries.
+
 That is how the client's ZRLE decoder and the server's ZRLE encoder were both checked:
 identical output at 3840x2160, with the debug line confirming which encoding was
 actually negotiated. Without that confirmation the comparison passes trivially when the

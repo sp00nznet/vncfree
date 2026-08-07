@@ -10,7 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -478,6 +478,17 @@ mod win {
     }
 
     impl Capture {
+        /// Whether a grab waits for the screen to change by itself.
+        ///
+        /// Desktop Duplication does, for up to 15ms, and returns the instant something
+        /// moves. `BitBlt` returns immediately and has no idea whether anything
+        /// changed, so on that path the caller has to pace itself or spin a core for
+        /// nothing. Sleeping on top of a wait that already happened is pure added
+        /// latency in front of the next thing the user does.
+        pub fn waits(&self) -> bool {
+            self.dxgi.is_some()
+        }
+
         pub fn new(ox: i32, oy: i32, w: usize, h: usize) -> Option<Capture> {
             unsafe {
                 let screen = GetDC(null_mut());
@@ -1337,7 +1348,17 @@ struct Shared {
     fmt: Mutex<PixFmt>,
     /// The client has an outstanding FramebufferUpdateRequest. RFB is request-driven:
     /// nothing may be sent until one arrives.
-    wants: AtomicBool,
+    /// A condition rather than a flag to poll. The sender used to check this every ten
+    /// milliseconds, which put up to ten milliseconds of pure delay in front of every
+    /// frame - measured at a quarter to a half of each second spent asleep. Waiting on
+    /// the condition wakes the moment the request lands instead.
+    ///
+    /// The consume-before-capturing rule still applies and is the reason this is a
+    /// `bool` under a lock rather than a counter: a request arriving while a frame is
+    /// going out must survive, and clearing it after the send is what once throttled
+    /// every client to one frame a second.
+    wants: Mutex<bool>,
+    wake: std::sync::Condvar,
     /// The client's copy of the screen is valid, so only changes need to go out.
     incremental: AtomicBool,
     /// The client listed ZRLE in SetEncodings. Sending an encoding a client never
@@ -1644,7 +1665,8 @@ fn serve(
     let shared = Arc::new(Shared {
         out: Mutex::new(out),
         fmt: Mutex::new(PixFmt::default()),
-        wants: AtomicBool::new(false),
+        wants: Mutex::new(false),
+        wake: std::sync::Condvar::new(),
         continuous: AtomicBool::new(false),
         cursor: AtomicBool::new(false),
         incremental: AtomicBool::new(false),
@@ -1662,12 +1684,108 @@ fn serve(
                 eprintln!("sender stopped: {e}");
             }
         }
-        sender.alive.store(false, Ordering::Relaxed);
+        sender.stop();
     });
 
     let result = read_client(&mut r, &shared, ox, oy);
-    shared.alive.store(false, Ordering::Relaxed);
+    // Wakes the sender out of its wait rather than leaving it to time out.
+    shared.stop();
     result
+}
+
+impl Shared {
+    /// The client wants a frame. Wakes the sender rather than leaving it to notice.
+    fn asked(&self) {
+        *self.wants.lock().unwrap() = true;
+        self.wake.notify_one();
+    }
+
+    /// Let the sender out of its wait when the session is over.
+    fn stop(&self) {
+        self.alive.store(false, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+}
+
+/// Where the server's time goes, printed once a second under `VNC_TIMING`.
+///
+/// The same idea as the client's, and for the same reason: the sleeps in the send loop
+/// below were chosen by feel, and a number chosen by feel is a number nobody has
+/// checked. Totals and worst cases, because a stall does not show up in an average.
+#[derive(Default)]
+struct ServerTiming {
+    frames: AtomicU64,
+    grab_us: AtomicU64,
+    grab_max_us: AtomicU64,
+    diff_us: AtomicU64,
+    diff_max_us: AtomicU64,
+    encode_us: AtomicU64,
+    encode_max_us: AtomicU64,
+    write_us: AtomicU64,
+    write_max_us: AtomicU64,
+    /// Time given up to the two fixed sleeps, and how often they were taken. This is
+    /// the suspect: a frame that was ready to send but waited anyway.
+    idle_us: AtomicU64,
+    idles: AtomicU64,
+    bytes: AtomicU64,
+}
+
+static STIME: ServerTiming = ServerTiming {
+    frames: AtomicU64::new(0),
+    grab_us: AtomicU64::new(0),
+    grab_max_us: AtomicU64::new(0),
+    diff_us: AtomicU64::new(0),
+    diff_max_us: AtomicU64::new(0),
+    encode_us: AtomicU64::new(0),
+    encode_max_us: AtomicU64::new(0),
+    write_us: AtomicU64::new(0),
+    write_max_us: AtomicU64::new(0),
+    idle_us: AtomicU64::new(0),
+    idles: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+};
+
+fn stick(total: &AtomicU64, max: &AtomicU64, at: std::time::Instant) {
+    let us = at.elapsed().as_micros() as u64;
+    total.fetch_add(us, Ordering::Relaxed);
+    max.fetch_max(us, Ordering::Relaxed);
+}
+
+fn timing() -> bool {
+    std::env::var("VNC_TIMING").is_ok()
+}
+
+impl ServerTiming {
+    fn report(&self, secs: f64) {
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        let frames = take(&self.frames);
+        let per = |t: u64| t as f64 / frames.max(1) as f64 / 1000.0;
+        let ms = |a: &AtomicU64| take(a) as f64 / 1000.0;
+        let idles = take(&self.idles);
+        println!(
+            "[time] {:.0} fps | grab {:.1}/{:.0}ms | diff {:.1}/{:.0}ms | encode {:.1}/{:.0}ms | \
+             write {:.1}/{:.0}ms | slept {:.0}ms over {} waits | {:.0} KB/frame   (avg/max)",
+            frames as f64 / secs,
+            per(take(&self.grab_us)),
+            ms(&self.grab_max_us),
+            per(take(&self.diff_us)),
+            ms(&self.diff_max_us),
+            per(take(&self.encode_us)),
+            ms(&self.encode_max_us),
+            per(take(&self.write_us)),
+            ms(&self.write_max_us),
+            take(&self.idle_us) as f64 / 1000.0,
+            idles,
+            take(&self.bytes) as f64 / frames.max(1) as f64 / 1000.0,
+        );
+    }
+}
+
+/// Sleep, and record that a frame's worth of time went nowhere.
+fn idle(ms: u64) {
+    STIME.idle_us.fetch_add(ms * 1000, Ordering::Relaxed);
+    STIME.idles.fetch_add(1, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(ms));
 }
 
 /// Failed password attempts, per source address.
@@ -1854,7 +1972,7 @@ fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> R
                 if !incremental {
                     shared.incremental.store(false, Ordering::Relaxed);
                 }
-                shared.wants.store(true, Ordering::Relaxed);
+                shared.asked();
             }
             150 => {
                 // EnableContinuousUpdates: a flag, then the region. We always answer
@@ -1941,6 +2059,7 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
         }
     }
     let mut clip_tick = 0u32;
+    let mut report_at = std::time::Instant::now();
 
     while shared.alive.load(Ordering::Relaxed) {
         // Our clipboard changing is worth telling the client about whether or not it
@@ -1970,9 +2089,28 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
         // which is what any client wanting more than one frame per round trip does -
         // would otherwise have its request cleared by the store that followed the
         // send, and the session would stall until it happened to ask again.
-        if !continuous && !shared.wants.swap(false, Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
+        if !continuous {
+            let idle_at = std::time::Instant::now();
+            let mut want = shared.wants.lock().unwrap();
+            while !*want {
+                if !shared.alive.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                // The timeout is only so a dead session is noticed; the notify is what
+                // actually wakes this.
+                let (next, _) = shared
+                    .wake
+                    .wait_timeout(want, Duration::from_millis(200))
+                    .unwrap();
+                want = next;
+            }
+            // Consumed before capturing, never after sending.
+            *want = false;
+            drop(want);
+            STIME
+                .idle_us
+                .fetch_add(idle_at.elapsed().as_micros() as u64, Ordering::Relaxed);
+            STIME.idles.fetch_add(1, Ordering::Relaxed);
         }
 
         // The desktop can change resolution underneath us, and everything from the
@@ -2037,16 +2175,20 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
             last_cursor = None;
         }
 
+        let grab_at = std::time::Instant::now();
         let reported = cap.grab(&mut cur.px, !local_cursor);
+        stick(&STIME.grab_us, &STIME.grab_max_us, grab_at);
+        let diff_at = std::time::Instant::now();
         if matches!(reported, Frame::Unchanged) && !full && cursor_part.is_none() {
             // The screen provably did not move, so there is nothing to diff and
             // nothing to send. Put the request back: it is still outstanding.
             if !continuous {
-                shared.wants.store(true, Ordering::Relaxed);
-            } else {
-                // Nothing to hold on to instead, so this is also what stops the loop
-                // spinning on an idle desktop.
-                std::thread::sleep(Duration::from_millis(10));
+                shared.asked();
+            } else if !cap.waits() {
+                // Only needed on the BitBlt path. Duplication has already waited for
+                // a change before returning, and sleeping again on top of that is
+                // pure added latency for the next thing that moves.
+                idle(10);
             }
             continue;
         }
@@ -2175,11 +2317,17 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
             // An incremental request stays outstanding until something actually
             // changes; answering with zero rectangles would spin the client.
             if !continuous {
-                shared.wants.store(true, Ordering::Relaxed);
+                shared.asked();
             }
-            std::thread::sleep(Duration::from_millis(20));
+            if !cap.waits() {
+                idle(20);
+            }
             continue;
         }
+
+        // Everything from the capture to here is finding what changed.
+        stick(&STIME.diff_us, &STIME.diff_max_us, diff_at);
+        let encode_at = std::time::Instant::now();
 
         let fmt = *shared.fmt.lock().unwrap();
         // ZRLE needs both the client's blessing and a pixel layout that has a legal
@@ -2216,7 +2364,17 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
                 100.0 * msg.len() as f64 / (pixels * 4).max(1) as f64
             );
         }
+        stick(&STIME.encode_us, &STIME.encode_max_us, encode_at);
+
+        let write_at = std::time::Instant::now();
         shared.out.lock().unwrap().write_all(&msg)?;
+        stick(&STIME.write_us, &STIME.write_max_us, write_at);
+        STIME.bytes.fetch_add(msg.len() as u64, Ordering::Relaxed);
+        STIME.frames.fetch_add(1, Ordering::Relaxed);
+        if timing() && report_at.elapsed() >= Duration::from_secs(1) {
+            STIME.report(report_at.elapsed().as_secs_f64());
+            report_at = std::time::Instant::now();
+        }
 
         prev.px.copy_from_slice(&cur.px);
         first = false;

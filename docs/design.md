@@ -113,6 +113,32 @@ Three details:
   monochrome mask instead, AND above XOR. Some colour ones leave alpha zero throughout
   and mean the AND mask to be used anyway, which is a third case.
 
+### Two sleeps that cost half the frame rate
+
+The server's send loop had three fixed sleeps — 10ms waiting for a request, 10ms when
+the screen had not moved, 20ms when the diff found nothing worth sending. All three were
+chosen by feel, and a number chosen by feel is a number nobody has checked. Measured,
+they came to **260–490ms of every second spent asleep**: a quarter to a half of the
+server's life, in front of frames that were ready to go.
+
+Two of them were redundant. Desktop Duplication's `AcquireNextFrame` already waits up to
+15ms and returns the instant something is drawn, so sleeping again afterwards is pure
+added delay before the next thing the user does. They now only apply on the `BitBlt`
+path, which returns immediately and has no idea whether anything changed — there the
+pacing is what stops it spinning a core for nothing.
+
+The third was waiting on the *client*, which duplication knows nothing about, and it was
+polling an atomic every 10ms. It is a condition variable now, so the sender wakes the
+moment a request lands rather than up to 10ms later. The consume-before-capturing rule
+still holds and is why it is a `bool` under a lock and not a counter: a request arriving
+while a frame is going out has to survive, and clearing it *after* the send is the bug
+that once throttled every client to one frame a second.
+
+Measured on the same 4K desktop, loopback: **20 fps before, 31–52 fps after**, with
+`slept 0ms over 0 waits`. Clients that ask per frame rather than using continuous
+updates went from about 20 to 37. What dominates now is the capture itself at 13–25ms a
+grab, which is where any further work belongs.
+
 Continuous updates (-313) remove the request from the loop entirely: the server sends
 changes as they happen and the client stops asking. There is no field anywhere that
 advertises server support — an unprompted `EndOfContinuousUpdates` *is* the
