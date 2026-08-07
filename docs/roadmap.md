@@ -1,4 +1,4 @@
-# Roadmap
+﻿# Roadmap
 
 | # | Milestone | State |
 |---|-----------|-------|
@@ -23,6 +23,7 @@
 | 18 | The last two ZRLE subencodings, and costing all five instead of guessing | done |
 | 19 | TLS, via VeNCrypt, so the session is not readable by anyone on the network | done |
 | 20 | Client-side RFB 3.3 and 3.7, so old servers are not locked out either | done |
+| 21 | Non-US keyboard layouts, via the layout Windows has already applied | done |
 
 ## Ideas, not commitments
 
@@ -32,8 +33,6 @@ Roughly in the order they would earn their keep:
   sharing over Apple Remote Desktop's channel on port 3283, not over VNC at all, so
   there is nothing to implement on the RFB side. See [macos.md](macos.md). A bridge
   over SSH using `pbcopy`/`pbpaste` would be a fraction of the effort if it is wanted.
-- **Non-US keyboard layouts.** Punctuation currently comes from a static US keysym
-  table; minifb's character callback would handle the rest.
 - **Tight encoding.** Four persistent zlib streams and a JPEG decoder for a squeeze on
   top of ZRLE. Low value, high effort.
 - **Somewhere to keep a known fingerprint.** TLS is in, but the certificate is

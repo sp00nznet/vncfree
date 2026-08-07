@@ -583,8 +583,51 @@ impl Vnc {
 
 // ---------------------------------------------------------------- input
 
+/// Whether Windows will also deliver this key as a character.
+///
+/// minifb identifies keys by *scancode*, so `Key::Key2` is the key in that physical
+/// position whatever is printed on it. Which character that produces is the keyboard
+/// layout's business, and the table below only knows the US one — on a UK keyboard the
+/// same key is `"` rather than `@`, and on a German one `@` is not reachable without
+/// AltGr at all. Windows has already applied the layout, the dead keys and AltGr by the
+/// time it sends `WM_CHAR`, so for anything that produces a character that is where the
+/// keysym comes from, and this list says which keys those are.
+fn types_a_character(k: Key) -> bool {
+    use Key::*;
+    let n = k as u32;
+    (A as u32..=Z as u32).contains(&n)
+        || (Key0 as u32..=Key9 as u32).contains(&n)
+        // The numeric keypad sends characters too, when Num Lock is on.
+        || (NumPad0 as u32..=NumPad9 as u32).contains(&n)
+        || matches!(
+            k,
+            Apostrophe
+                | Backquote
+                | Backslash
+                | Comma
+                | Equal
+                | LeftBracket
+                | Minus
+                | Period
+                | RightBracket
+                | Semicolon
+                | Slash
+                | Space
+                | NumPadDot
+                | NumPadSlash
+                | NumPadAsterisk
+                | NumPadMinus
+                | NumPadPlus
+        )
+}
+
 /// X11 keysym for a minifb key, honouring shift. Printable ASCII keysyms are just
 /// the character's ASCII value; everything else comes from the 0xff00 block.
+///
+/// The printable half assumes a US layout and is used for two things: keys held with
+/// Ctrl or Alt, where the shortcut matters more than the character, and typing the
+/// clipboard. Ordinary typing goes via the character callback instead — see
+/// `types_a_character` above.
 fn keysym(k: Key, shift: bool) -> Option<u32> {
     use Key::*;
     let n = k as u32;
@@ -607,8 +650,6 @@ fn keysym(k: Key, shift: bool) -> Option<u32> {
     if (NumPad0 as u32..=NumPad9 as u32).contains(&n) {
         return Some(0xffb0 + (n - NumPad0 as u32));
     }
-    // ponytail: US layout. Non-US punctuation needs minifb's character callback
-    // instead of this table - add it when someone types on an AZERTY keyboard.
     Some(match k {
         Apostrophe => (if shift { '"' } else { '\'' }) as u32,
         Backquote => (if shift { '~' } else { '`' }) as u32,
@@ -659,6 +700,39 @@ fn keysym(k: Key, shift: bool) -> Option<u32> {
         NumPadEnter => 0xff8d,
         _ => return None,
     })
+}
+
+/// The keysym for a character the keyboard layout produced, or None if it is not
+/// something to send as a character.
+fn sym_for_char(c: u32) -> Option<u32> {
+    // Control codes are what Windows reports for Ctrl combinations, and for Enter, Tab,
+    // Backspace and Escape - all of which are sent as keys instead. Letting them
+    // through here would send those twice.
+    if c < 0x20 || c == 0x7f {
+        return None;
+    }
+    // A character outside the basic plane arrives as the two halves of a surrogate
+    // pair, and half a pair is worse than nothing. No server is going to type an emoji.
+    if (0xd800..=0xdfff).contains(&c) {
+        return None;
+    }
+    // Latin-1 is its own keysym; everything above it is the code point in the Unicode
+    // block.
+    Some(if c < 0x100 { c } else { 0x0100_0000 + c })
+}
+
+/// Characters Windows produced for the keys pressed since the last frame, in order.
+///
+/// Collected through minifb's input callback, which fires while the window pumps its
+/// message queue, so by the time the frame's key lists are read these are already here
+/// and the two can be matched up.
+#[derive(Clone, Default)]
+struct Typed(Arc<Mutex<Vec<u32>>>);
+
+impl minifb::InputCallback for Typed {
+    fn add_char(&mut self, c: u32) {
+        self.0.lock().unwrap().push(c);
+    }
 }
 
 /// Longest clipboard this will type. At roughly a hundred characters a second a
@@ -735,6 +809,8 @@ struct Input {
     /// Key -> the keysym we sent on press. Releases must repeat that exact keysym:
     /// if shift comes up first, 'A' down followed by 'a' up leaves 'A' stuck down.
     held: HashMap<Key, u32>,
+    /// What the keyboard layout made of the keys pressed this frame.
+    typed: Typed,
 }
 
 impl Input {
@@ -767,6 +843,7 @@ impl Input {
             mask: 0,
             pos: (0, 0),
             held: HashMap::new(),
+            typed: Typed::default(),
         }
     }
 
@@ -845,6 +922,27 @@ impl Input {
         // shows up in both lists, and handling the release first would send an up
         // with nothing held, then a down that never gets released - a stuck key.
         let ctrl = win.is_key_down(Key::LeftCtrl) || win.is_key_down(Key::RightCtrl);
+        let alt = win.is_key_down(Key::LeftAlt) || win.is_key_down(Key::RightAlt);
+
+        // AltGr is how most layouts outside the US reach @, € and the like, and Windows
+        // reports it as right Alt *plus a synthetic left Ctrl*. Forwarding those would
+        // turn every AltGr character into a Ctrl-Alt shortcut on the far end, so while
+        // it is down the modifiers it invents are held back and only the character it
+        // produced is sent. Anything genuinely held before it went down is released.
+        let altgr = win.is_key_down(Key::RightAlt);
+        if altgr {
+            for k in [Key::LeftCtrl, Key::RightCtrl, Key::LeftAlt, Key::RightAlt] {
+                if let Some(sym) = self.held.remove(&k) {
+                    self.key_event(sym, false)?;
+                }
+            }
+        }
+
+        // Ctrl and Alt shortcuts come from the table: Ctrl-C should be Ctrl-C wherever
+        // the C key physically sits, and Windows reports the character for those as an
+        // unusable control code anyway.
+        let shortcut = (ctrl || alt) && !altgr;
+
         for k in win.get_keys_pressed(KeyRepeat::Yes) {
             // Ctrl-Shift-V types the local clipboard at the remote machine, for
             // servers that will not share one. Deliberately not Ctrl-V or Cmd-V:
@@ -861,11 +959,39 @@ impl Input {
                 self.held.insert(k, 0);
                 continue;
             }
+            if altgr
+                && matches!(
+                    k,
+                    Key::LeftCtrl | Key::RightCtrl | Key::LeftAlt | Key::RightAlt
+                )
+            {
+                continue;
+            }
+            // A key that produces a character is left to the character callback, which
+            // knows the layout. Sending the table's guess as well would type everything
+            // twice.
+            if types_a_character(k) && !shortcut {
+                continue;
+            }
             if let Some(sym) = keysym(k, shift) {
                 self.held.insert(k, sym);
                 self.key_event(sym, true)?;
             }
         }
+
+        // Between the presses and the releases, so a character typed with shift lands
+        // inside the shift the loop above just sent.
+        let typed = std::mem::take(&mut *self.typed.0.lock().unwrap());
+        if !shortcut {
+            for sym in typed.into_iter().filter_map(sym_for_char) {
+                // Down and straight back up. The character callback reports that
+                // something was typed, not that a key is being held, and Windows
+                // repeats it by itself while the key stays down.
+                self.key_event(sym, true)?;
+                self.key_event(sym, false)?;
+            }
+        }
+
         for k in win.get_keys_released() {
             match self.held.remove(&k) {
                 Some(0) => {} // swallowed locally; nothing was ever sent
@@ -1043,6 +1169,9 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
     };
     let mut window = Window::new(&format!("{name} - vncfree"), w, h, opts)?;
     window.set_target_fps(60);
+    // Characters land here as the window pumps its messages, with the keyboard layout
+    // already applied by Windows.
+    window.set_input_callback(Box::new(input.typed.clone()));
 
     // Escape is a key the remote machine wants, so closing the window is the only quit.
     let mut was_online = true;
@@ -1721,6 +1850,100 @@ mod tests {
         assert_eq!(keysym(Key::Enter, false), Some(0xff0d));
         assert_eq!(keysym(Key::LeftSuper, false), Some(0xffeb)); // Command on macOS
         assert_eq!(keysym(Key::Unknown, false), None);
+    }
+
+    /// Every key goes down exactly one of two routes: the character the layout produced,
+    /// or the table. A key on both is typed twice, a key on neither does nothing at all,
+    /// and both failures look like a broken keyboard rather than a mismatched list.
+    #[test]
+    fn each_key_takes_one_route_and_only_one() {
+        use Key::*;
+        let by_character = [
+            A,
+            M,
+            Z,
+            Key0,
+            Key9,
+            Apostrophe,
+            Backquote,
+            Backslash,
+            Comma,
+            Equal,
+            LeftBracket,
+            Minus,
+            Period,
+            RightBracket,
+            Semicolon,
+            Slash,
+            Space,
+            NumPad0,
+            NumPad9,
+            NumPadDot,
+            NumPadSlash,
+            NumPadAsterisk,
+            NumPadMinus,
+            NumPadPlus,
+        ];
+        let by_table = [
+            Backspace,
+            Tab,
+            Enter,
+            Escape,
+            Home,
+            Left,
+            Up,
+            Right,
+            Down,
+            PageUp,
+            PageDown,
+            End,
+            Insert,
+            Delete,
+            Pause,
+            ScrollLock,
+            NumLock,
+            Menu,
+            CapsLock,
+            LeftShift,
+            RightShift,
+            LeftCtrl,
+            RightCtrl,
+            LeftAlt,
+            RightAlt,
+            LeftSuper,
+            RightSuper,
+            NumPadEnter,
+            F1,
+            F12,
+        ];
+        for k in by_character {
+            assert!(types_a_character(k), "{k:?} produces a character");
+            // Still needs a table entry: with Ctrl held the shortcut wins over the
+            // character, and a missing entry would make that combination do nothing.
+            assert!(keysym(k, false).is_some(), "{k:?} also has a table entry");
+        }
+        for k in by_table {
+            assert!(!types_a_character(k), "{k:?} is not a character key");
+            assert!(keysym(k, false).is_some(), "{k:?} has a table entry");
+        }
+    }
+
+    /// The character path is what makes a non-US layout work, so the keysym it derives
+    /// has to be right for the three ranges a keyboard can produce.
+    #[test]
+    fn characters_become_the_right_keysyms() {
+        // Latin-1 is its own keysym: 'a', and the UK pound sign.
+        assert_eq!(sym_for_char('a' as u32), Some(0x61));
+        assert_eq!(sym_for_char('£' as u32), Some(0xa3));
+        // Beyond that, the Unicode block. The euro is the one every AltGr layout has.
+        assert_eq!(sym_for_char('€' as u32), Some(0x0100_20ac));
+        // Control codes are keys, handled by the table, and must not arrive twice.
+        assert_eq!(sym_for_char(0x0d), None, "Enter");
+        assert_eq!(sym_for_char(0x08), None, "Backspace");
+        assert_eq!(sym_for_char(0x03), None, "Ctrl-C");
+        assert_eq!(sym_for_char(0x7f), None, "Delete");
+        // Half of a surrogate pair is worse than nothing.
+        assert_eq!(sym_for_char(0xd83d), None);
     }
 
     /// These byte layouts were confirmed against a real TigerVNC server: the keysyms

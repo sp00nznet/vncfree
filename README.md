@@ -128,7 +128,12 @@ authentication, so there is no unauthenticated path at all.
 - The server follows a resolution change, but a client that did not ask for
   DesktopSize cannot be told, so that session ends and has to reconnect — vncfree's own
   client reconnects by itself.
-- US keyboard layout for non-alphanumeric keys.
+- **Ctrl and Alt shortcuts assume a US layout.** Ordinary typing follows whatever
+  layout Windows is set to, including AltGr and dead keys, but a shortcut is sent by
+  physical key position — Ctrl-C is the key where a US keyboard has C. That is usually
+  what people want from a shortcut and is what most viewers do.
+- Holding a character key sends repeats rather than one long press, because Windows
+  reports the repeats. Fine for typing, not for holding a key down in a game.
 
 ## Documentation
 

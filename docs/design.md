@@ -112,6 +112,38 @@ it correctly. That session ends with an explanatory error, which is honest and l
 somewhere useful — a reconnect negotiates the new size properly, and vncfree's own
 client reconnects by itself.
 
+## Keyboard layouts belong to Windows, not to us
+
+minifb identifies keys by **scancode**, so `Key::Key2` is the key in that physical
+position whatever is printed on it. Which character that produces is the layout's
+business: on a UK keyboard that key is `"` rather than `@`, and on a German one `@` is
+not reachable without AltGr at all. A table can only ever encode one layout, and the
+one it encoded was US.
+
+Windows has already applied the layout, the dead keys and AltGr by the time it sends
+`WM_CHAR`, so anything that produces a character now takes its keysym from there —
+minifb's input callback — and the table is left to the keys that produce no character.
+Each key must take exactly one of those routes: on both it types twice, on neither it
+does nothing, and both read as a broken keyboard rather than a mismatched list, so a
+test pins the two lists against each other.
+
+Three things this has to get right:
+
+- **Ctrl and Alt still use the table.** Ctrl-C should be Ctrl-C wherever the C key
+  physically sits, and Windows reports the character for a Ctrl combination as an
+  unusable control code anyway.
+- **AltGr is right Alt plus a synthetic left Ctrl.** Forwarding those would turn every
+  AltGr character into a Ctrl-Alt shortcut on the far end, so while AltGr is down the
+  modifiers it invents are held back and only the character reaches the server.
+- **`WM_CHAR` does deliver control codes**, whatever minifb's documentation says, so
+  they are filtered here. Enter, Tab, Backspace and Escape are keys, and letting the
+  control code through as well would send each of them twice.
+
+Characters go down and straight back up, because the callback reports that something
+was typed rather than that a key is being held — Windows repeats it by itself while the
+key stays down. That is right for typing and wrong for holding a key down in a game,
+which is not what this is for.
+
 ## The three RFB versions, and where they differ
 
 Both ends speak 3.3, 3.7 and 3.8. The version reply is a *choice* and may not exceed
