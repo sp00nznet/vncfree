@@ -1,6 +1,6 @@
 [package]
 name = "vncfree"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A free VNC client and server for Windows. No subscription, no telemetry, no installer."
 repository = "https://github.com/sp00nznet/vncfree"
