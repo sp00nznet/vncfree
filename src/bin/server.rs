@@ -717,6 +717,9 @@ enum Part {
         w: usize,
         h: usize,
     },
+    /// DesktopSize: not a picture, but the way to tell a client the screen resolution
+    /// changed. The rectangle header carries the new size and there is no body.
+    Resize { w: usize, h: usize },
 }
 
 const TILE: usize = 64;
@@ -1001,12 +1004,14 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
         let (x, y, w, h) = match *part {
             Part::Copy { x, y, w, h, .. } => (x, y, w, h),
             Part::Pixels { x, y, w, h } => (x, y, w, h),
+            Part::Resize { w, h } => (0, 0, w, h),
         };
         out.extend_from_slice(&(x as u16).to_be_bytes());
         out.extend_from_slice(&(y as u16).to_be_bytes());
         out.extend_from_slice(&(w as u16).to_be_bytes());
         out.extend_from_slice(&(h as u16).to_be_bytes());
         match *part {
+            Part::Resize { .. } => out.extend_from_slice(&(-223i32).to_be_bytes()),
             Part::Copy { sx, sy, .. } => {
                 out.extend_from_slice(&1i32.to_be_bytes()); // CopyRect
                 out.extend_from_slice(&(sx as u16).to_be_bytes());
@@ -1054,6 +1059,9 @@ struct Shared {
     zrle: AtomicBool,
     /// Likewise for CopyRect.
     copyrect: AtomicBool,
+    /// The client asked for DesktopSize, so it can be told the resolution changed.
+    /// One that did not has no way to follow, and the session has to end instead.
+    resize: AtomicBool,
     alive: AtomicBool,
     clip: Mutex<String>,
 }
@@ -1230,6 +1238,7 @@ fn serve(mut tcp: TcpStream, password: &str, w: usize, h: usize) -> Res<()> {
         incremental: AtomicBool::new(false),
         zrle: AtomicBool::new(false),
         copyrect: AtomicBool::new(false),
+        resize: AtomicBool::new(false),
         alive: AtomicBool::new(true),
         clip: Mutex::new(String::new()),
     });
@@ -1285,6 +1294,7 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
                     .collect();
                 shared.zrle.store(encs.contains(&16), Ordering::Relaxed);
                 shared.copyrect.store(encs.contains(&1), Ordering::Relaxed);
+                shared.resize.store(encs.contains(&-223), Ordering::Relaxed);
                 if debug() {
                     eprintln!(
                         "[debug] client supports encodings {encs:?}, using {}{}",
@@ -1348,6 +1358,7 @@ fn read_client(tcp: &mut TcpStream, shared: &Arc<Shared>, w: usize, h: usize) ->
 }
 
 fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
+    let (mut w, mut h) = (w, h);
     let mut cur = Screen::new(w, h);
     let mut prev = Screen::new(w, h);
     let mut first = true;
@@ -1395,7 +1406,31 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
             continue;
         }
 
-        let full = first || !shared.incremental.load(Ordering::Relaxed);
+        // The desktop can change resolution underneath us, and everything from the
+        // capture surface to the client's framebuffer is sized for the old one.
+        let mut resized = false;
+        let now = win::screen_size();
+        if now != (w, h) && now.0 > 0 && now.1 > 0 {
+            if !shared.resize.load(Ordering::Relaxed) {
+                // Nothing in the protocol lets us tell this client. Ending the session
+                // is the honest move: a reconnect negotiates the new size properly,
+                // and our own client reconnects by itself.
+                return Err(format!(
+                    "screen changed from {w}x{h} to {}x{} and this client did not ask \
+                     for DesktopSize; reconnect to pick up the new size",
+                    now.0, now.1
+                )
+                .into());
+            }
+            println!("screen resolution changed to {}x{}", now.0, now.1);
+            (w, h) = now;
+            cur = Screen::new(w, h);
+            prev = Screen::new(w, h);
+            cap = win::Capture::new(w, h).ok_or("could not recreate the capture surface")?;
+            resized = true;
+        }
+
+        let full = first || resized || !shared.incremental.load(Ordering::Relaxed);
         let reported = cap.grab(&mut cur.px);
         if matches!(reported, Frame::Unchanged) && !full {
             // The screen provably did not move, so there is nothing to diff and
@@ -1429,6 +1464,11 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
         let mut parts = Vec::new();
 
         if full {
+            // The size change goes first, so the client has resized its framebuffer
+            // before the pixels that assume the new size arrive.
+            if resized {
+                parts.push(Part::Resize { w, h });
+            }
             parts.push(Part::Pixels { x: 0, y: 0, w, h });
         } else if let Some(reported) = trusted {
             // The capture said exactly what changed, so no comparison is needed. Move
@@ -1461,6 +1501,8 @@ fn send_frames(shared: &Arc<Shared>, w: usize, h: usize) -> Res<()> {
                     let (px, py, pw, ph) = match *p {
                         Part::Copy { x, y, w, h, .. } => (x, y, w, h),
                         Part::Pixels { x, y, w, h } => (x, y, w, h),
+                        // Not a region of the picture; nothing to have covered.
+                        Part::Resize { .. } => continue,
                     };
                     for row in py..py + ph {
                         covered[row * w + px..row * w + px + pw].fill(true);

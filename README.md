@@ -108,8 +108,9 @@ authentication, so there is no unauthenticated path at all.
 - No Tight encoding, and the server's CopyRect covers vertical scrolling but not a
   window dragged sideways. Compatibility is unaffected — these cost bytes, not
   connections.
-- The server shares the primary monitor only, and does not follow a resolution change
-  while a client is connected.
+- The server shares the primary monitor only. It does follow a resolution change, but
+  a client that did not ask for DesktopSize cannot be told, so that session ends and
+  has to reconnect — vncfree's own client reconnects by itself.
 - US keyboard layout for non-alphanumeric keys.
 
 ## Documentation

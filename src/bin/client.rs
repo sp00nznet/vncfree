@@ -363,7 +363,11 @@ impl Vnc {
             eprintln!("VNC_RAW_ONLY set: requesting Raw only");
             vec![0]
         } else {
-            vec![16, 1, 0] // ZRLE, CopyRect, Raw
+            // -223 is DesktopSize: not an encoding but a way for the server to say
+            // the screen resolution changed. Without asking for it, a server that
+            // changes resolution has no way to tell us and the session is stuck at
+            // the old size.
+            vec![16, 1, 0, -223] // ZRLE, CopyRect, Raw, DesktopSize
         };
         w.write_all(&[2, 0])?;
         w.write_all(&(encodings.len() as u16).to_be_bytes())?;
@@ -996,6 +1000,18 @@ impl Decoder {
         let w = u16r(r)? as usize;
         let h = u16r(r)? as usize;
         let enc = i32r(r)?;
+        // DesktopSize is not a picture: the rectangle header carries the screen's new
+        // size and there is no body. It has to be handled before the bounds check,
+        // since a screen that grew is by definition outside the old framebuffer.
+        if enc == -223 {
+            if debug() {
+                eprintln!("[debug] remote resolution is now {w}x{h}");
+            }
+            s.w = w;
+            s.h = h;
+            s.px = vec![0; w * h];
+            return Ok((0, 0, w, h));
+        }
         if x + w > s.w || y + h > s.h {
             return Err(format!("rect {x},{y} {w}x{h} outside {}x{} framebuffer", s.w, s.h).into());
         }
@@ -1530,6 +1546,28 @@ mod tests {
         };
         let bytes: [u8; 16] = [0, 0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 1, 0, 2, 0, 0];
         assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
+    }
+
+    /// DesktopSize has to be acted on before the bounds check, because a screen that
+    /// grew is by definition outside the framebuffer it is replacing.
+    #[test]
+    fn desktop_size_resizes_the_framebuffer() {
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![9; 4],
+        };
+        #[rustfmt::skip]
+        let bytes: [u8; 12] = [
+            0, 0,  0, 0,          // x, y - ignored
+            0, 4,  0, 3,          // the new size, 4x3
+            0xff, 0xff, 0xff, 0x21, // encoding -223, and no body at all
+        ];
+        let touched = Decoder::new().rect(&mut &bytes[..], &mut s).unwrap();
+        assert_eq!((s.w, s.h), (4, 3), "framebuffer follows the screen");
+        assert_eq!(s.px.len(), 12);
+        assert!(s.px.iter().all(|&p| p == 0), "and starts blank");
+        assert_eq!(touched, (0, 0, 4, 3), "the whole of it is now dirty");
     }
 
     #[test]

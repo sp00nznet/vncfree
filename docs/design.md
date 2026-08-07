@@ -92,6 +92,24 @@ That one is worth remembering as a shape: an atomic flag written by one thread a
 cleared by another after a long operation will lose anything that arrives during the
 operation. Consume it up front instead.
 
+## Following a resolution change
+
+The desktop can change size underneath a live session, and everything from the capture
+surface to the client's framebuffer is built for the old one. The server polls the
+screen size each frame, rebuilds the capture, and sends the DesktopSize
+pseudo-encoding (-223) ahead of a full frame — size first, then the pixels that assume
+it.
+
+DesktopSize is not a picture. The rectangle header carries the new size and there is no
+body, so the client has to act on it *before* the bounds check that every other
+rectangle goes through: a screen that grew is by definition outside the framebuffer it
+is replacing.
+
+A client that never asked for -223 cannot be told, and there is no way to keep serving
+it correctly. That session ends with an explanatory error, which is honest and lands
+somewhere useful — a reconnect negotiates the new size properly, and vncfree's own
+client reconnects by itself.
+
 ## Things that bite
 
 - **ZRLE's zlib stream spans the connection, not a rectangle.** Restarting it per
