@@ -281,7 +281,8 @@ fn run() -> Res<()> {
     };
     let writer: Writer = Arc::new(Mutex::new(None));
     let clip: Clip = Arc::new(Mutex::new(String::new()));
-    let mut vnc = Vnc::connect(&target, writer, clip.clone())?;
+    let cursor = SharedCursor::default();
+    let mut vnc = Vnc::connect(&target, writer, clip.clone(), cursor.clone())?;
 
     match args.get(2) {
         Some(out) => {
@@ -291,7 +292,7 @@ fn run() -> Res<()> {
             println!("wrote {} ({}x{})", out, vnc.screen.w, vnc.screen.h);
             Ok(())
         }
-        None => run_window(vnc, target, clip),
+        None => run_window(vnc, target, clip, cursor),
     }
 }
 
@@ -299,7 +300,7 @@ impl Vnc {
     /// `out` is the shared write half. It is published only once the handshake has
     /// fully succeeded, so the UI thread can never write input into a half-open
     /// connection. Handshake writes go direct to the socket and skip the lock.
-    fn connect(t: &Target, out: Writer, clip: Clip) -> Res<Vnc> {
+    fn connect(t: &Target, out: Writer, clip: Clip, cursor: SharedCursor) -> Res<Vnc> {
         let (addr, username, password) = (&t.addr, &t.user, &t.pass);
         // A bounded timeout, because the OS default is around twenty seconds of
         // nothing at all if the address is wrong.
@@ -510,7 +511,15 @@ impl Vnc {
         //        session is stuck at the old one.
         //   -313 ContinuousUpdates: a server that supports it stops waiting to be asked
         //        for each frame, which takes a round trip out of every one.
+        //   -239 CursorShape: the pointer's picture, so the client can draw it at the
+        //        local pointer position. Without it the server bakes the pointer into
+        //        the screen, and it cannot move until a whole round trip completes.
         encodings.extend_from_slice(&[-223, -313]);
+        if env::var("VNC_NO_CURSOR").is_err() {
+            encodings.push(-239);
+        } else {
+            eprintln!("VNC_NO_CURSOR set: letting the server draw the pointer");
+        }
 
         // Asking for a quality level tells a Tight server it may send JPEG, which is
         // lossy and much smaller. Unset means lossless, because a remote desktop is
@@ -542,7 +551,10 @@ impl Vnc {
             w: out,
             screen,
             name,
-            dec: Decoder::new(),
+            dec: Decoder {
+                cursor,
+                ..Decoder::new()
+            },
             clip,
             pending_paste: None,
             pipeline: false,
@@ -953,6 +965,15 @@ impl Input {
         send(&self.w, &pointer_msg(mask, x, y))
     }
 
+    /// Where the pointer is on the remote screen, or None if it is outside the window.
+    /// The same mapping the pointer events use, so the locally drawn cursor lands
+    /// exactly where the server thinks the pointer is.
+    fn pointer_at(&self, win: &Window, fb: (usize, usize)) -> Option<(i32, i32)> {
+        let (mx, my) = win.get_mouse_pos(MouseMode::Discard)?;
+        let (x, y) = to_fb(mx, my, win.get_size(), fb);
+        Some((x as i32, y as i32))
+    }
+
     fn pump(&mut self, win: &Window, fb: (usize, usize)) -> Res<()> {
         // View-only suppresses the clipboard too: ClientCutText overwrites the
         // remote clipboard, which is still reaching over and changing something.
@@ -1183,7 +1204,7 @@ fn session(
     Ok(())
 }
 
-fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
+fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res<()> {
     let (w, h) = (vnc.screen.w, vnc.screen.h);
     let name = vnc.name.clone();
     let writer = vnc.w.clone();
@@ -1201,13 +1222,16 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
     // idle, and the UI thread must never block on that.
     let (net_frame, net_alive, net_online) = (frame.clone(), alive.clone(), online.clone());
     let net_dirty = dirty.clone();
+    // The same handle across reconnects, so a new session publishes its pointer shape
+    // where the drawing thread is already looking.
+    let net_cursor = cursor.clone();
     std::thread::spawn(move || {
         let mut first = Some(vnc);
         let mut backoff = 1u64;
         while net_alive.load(Ordering::Relaxed) {
             let fresh = match first.take() {
                 Some(v) => Ok(v),
-                None => Vnc::connect(&target, writer.clone(), clip.clone()),
+                None => Vnc::connect(&target, writer.clone(), clip.clone(), net_cursor.clone()),
             };
             match fresh {
                 Ok(v) => {
@@ -1244,6 +1268,11 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
     // Escape is a key the remote machine wants, so closing the window is the only quit.
     let mut was_online = true;
     let mut size = (w, h);
+    // What the pointer was painted over last time, so it can be lifted straight back
+    // off, and where it was, so a move alone is enough to redraw.
+    let mut under: Vec<u32> = Vec::new();
+    let mut was_at: Option<(i32, i32)> = None;
+    let mut hiding_pointer = false;
     while window.is_open() && alive.load(Ordering::Relaxed) {
         let up = online.load(Ordering::Relaxed);
         if up != was_online {
@@ -1256,13 +1285,35 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
         } else if !input.held.is_empty() {
             input.release_all()?;
         }
+        // Where the pointer is now, in the remote screen's coordinates. Redraw when it
+        // moves even if no frame arrived, because locally-drawn is the whole point:
+        // waiting for the server would put the round trip straight back.
+        let at = input.pointer_at(&window, size);
+        let moved = at != was_at;
+        was_at = at;
+
         // Only re-blit when a new frame actually arrived. Pushing an unchanged 1080p
         // buffer 60 times a second is megabytes of scaling and GDI work for nothing,
         // and it holds the frame lock the network thread is waiting on.
-        if dirty.swap(false, Ordering::Relaxed) {
-            let f = frame.lock().unwrap();
+        if dirty.swap(false, Ordering::Relaxed) || moved {
+            let mut f = frame.lock().unwrap();
             size = (f.w, f.h);
+            // Painted and taken straight back off around the blit, so the buffer the
+            // network thread writes into never contains a pointer. Leaving it there
+            // between frames would mean the next partial update restores stale pixels
+            // over whatever the server had just redrawn underneath it.
+            let shape = cursor.lock().unwrap();
+            // Two arrows on screen is worse than none, so the real one goes away for
+            // as long as we have a picture of the remote one to draw instead.
+            if shape.visible() != hiding_pointer {
+                hiding_pointer = shape.visible();
+                window.set_cursor_visibility(!hiding_pointer);
+            }
+            if let Some((x, y)) = at {
+                shape.draw(&mut f, x, y, &mut under);
+            }
             window.update_with_buffer(&f.px, f.w, f.h)?;
+            restore(&mut f, &mut under);
         } else {
             window.update();
         }
@@ -1273,8 +1324,96 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip) -> Res<()> {
 
 // ---------------------------------------------------------------- decoding
 
-/// A ZRLE "compressed pixel". Our pixel format puts all the colour in the low 3
-/// bytes, so CPIXELs drop the unused fourth byte: little-endian B, G, R.
+/// The pointer's picture, drawn locally so it tracks the mouse without waiting for the
+/// server. `px` holds only the visible pixels; `on` says which those are.
+#[derive(Clone, Default)]
+pub struct Cursor {
+    w: usize,
+    h: usize,
+    hot_x: usize,
+    hot_y: usize,
+    px: Vec<u32>,
+    on: Vec<bool>,
+}
+
+/// Read a CursorShape rectangle: the pixels, then one bit per pixel saying which of
+/// them to draw, most significant first with each row padded to a byte.
+fn read_cursor(r: &mut impl Read, hot_x: usize, hot_y: usize, w: usize, h: usize) -> Res<Cursor> {
+    if w == 0 || h == 0 {
+        // A zero-sized shape means the pointer is hidden.
+        return Ok(Cursor::default());
+    }
+    let data = blob(r, w * h * 4)?;
+    let mask = blob(r, w.div_ceil(8) * h)?;
+    let stride = w.div_ceil(8);
+    let mut px = vec![0u32; w * h];
+    let mut on = vec![false; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            let i = row * w + col;
+            let p = i * 4;
+            px[i] = (data[p + 2] as u32) << 16 | (data[p + 1] as u32) << 8 | data[p] as u32;
+            on[i] = mask[row * stride + col / 8] >> (7 - col % 8) & 1 != 0;
+        }
+    }
+    Ok(Cursor {
+        w,
+        h,
+        hot_x,
+        hot_y,
+        px,
+        on,
+    })
+}
+
+impl Cursor {
+    /// Whether there is a shape to draw at all. A server that never sends one, or that
+    /// says the pointer is hidden, leaves the local one to do its job.
+    fn visible(&self) -> bool {
+        self.w > 0 && self.h > 0
+    }
+
+    /// Paint the pointer into a framebuffer at a position, saving what was underneath so
+    /// the caller can put it back. Clipped, because the pointer is routinely half off
+    /// the edge of the screen.
+    fn draw(&self, s: &mut Screen, at_x: i32, at_y: i32, under: &mut Vec<u32>) {
+        under.clear();
+        if self.w == 0 {
+            return;
+        }
+        let x0 = at_x - self.hot_x as i32;
+        let y0 = at_y - self.hot_y as i32;
+        for row in 0..self.h {
+            for col in 0..self.w {
+                let (x, y) = (x0 + col as i32, y0 + row as i32);
+                if x < 0 || y < 0 || x >= s.w as i32 || y >= s.h as i32 {
+                    continue;
+                }
+                let i = y as usize * s.w + x as usize;
+                let c = row * self.w + col;
+                if !self.on[c] {
+                    continue;
+                }
+                under.push(i as u32);
+                under.push(s.px[i]);
+                s.px[i] = self.px[c];
+            }
+        }
+    }
+}
+
+/// Put back what `draw` painted over, so the framebuffer the server owns never has a
+/// pointer in it.
+fn restore(s: &mut Screen, under: &mut Vec<u32>) {
+    for pair in under.chunks_exact(2) {
+        let i = pair[0] as usize;
+        if i < s.px.len() {
+            s.px[i] = pair[1];
+        }
+    }
+    under.clear();
+}
+
 /// A Tight pixel. Three bytes, and - unlike ZRLE's CPIXEL, which keeps the byte order
 /// of the pixel format - the spec states these are red, green and blue in that order.
 /// Reusing the CPIXEL reader here swaps every red and blue on screen.
@@ -1317,6 +1456,8 @@ fn inflate(z: &mut flate2::Decompress, input: &[u8], expect: usize) -> Res<Vec<u
     }
 }
 
+/// A ZRLE "compressed pixel". Our pixel format puts all the colour in the low 3
+/// bytes, so CPIXELs drop the unused fourth byte: little-endian B, G, R.
 fn cpixel(r: &mut impl Read) -> Res<u32> {
     let b = rd::<3>(r)?;
     Ok((b[2] as u32) << 16 | (b[1] as u32) << 8 | b[0] as u32)
@@ -1335,7 +1476,13 @@ fn run_len(r: &mut impl Read) -> Res<usize> {
     }
 }
 
+/// The pointer's picture, shared with the thread that draws. Set by the network thread
+/// when the server sends a new shape, read by the UI thread every frame.
+type SharedCursor = Arc<Mutex<Cursor>>;
+
 struct Decoder {
+    /// Where a new pointer shape gets published to the drawing thread.
+    cursor: SharedCursor,
     /// ZRLE's zlib stream spans the whole connection, not one rectangle. Resetting
     /// it per rectangle decodes the first one and then produces garbage forever.
     zlib: flate2::Decompress,
@@ -1348,6 +1495,7 @@ struct Decoder {
 impl Decoder {
     fn new() -> Decoder {
         Decoder {
+            cursor: SharedCursor::default(),
             zlib: flate2::Decompress::new(true),
             tight: std::array::from_fn(|_| flate2::Decompress::new(true)),
         }
@@ -1363,6 +1511,17 @@ impl Decoder {
         // DesktopSize is not a picture: the rectangle header carries the screen's new
         // size and there is no body. It has to be handled before the bounds check,
         // since a screen that grew is by definition outside the old framebuffer.
+        // CursorShape is not a picture either: the position fields carry the hot spot
+        // and the body is the pointer's own bitmap, so it must be handled before the
+        // bounds check, which it would fail for a cursor near the right or bottom edge.
+        if enc == -239 {
+            *self.cursor.lock().unwrap() = read_cursor(r, x, y, w, h)?;
+            if debug() {
+                eprintln!("[debug] new pointer shape {w}x{h}, hot spot {x},{y}");
+            }
+            // Nothing on the framebuffer changed.
+            return Ok((0, 0, 0, 0));
+        }
         if enc == -223 {
             if debug() {
                 eprintln!("[debug] remote resolution is now {w}x{h}");
@@ -2424,6 +2583,132 @@ mod tests {
         near(at(12, 3), (20, 200, 20), "top right is green");
         near(at(3, 12), (20, 20, 220), "bottom left is blue");
         near(at(12, 12), (240, 240, 240), "bottom right is white");
+    }
+
+    /// A 2x2 pointer: top-left and bottom-right drawn, the other two transparent.
+    fn tiny_cursor(hot_x: usize, hot_y: usize) -> Cursor {
+        Cursor {
+            w: 2,
+            h: 2,
+            hot_x,
+            hot_y,
+            px: vec![0x11, 0x22, 0x33, 0x44],
+            on: vec![true, false, false, true],
+        }
+    }
+
+    /// The mask decides what is drawn. A pointer that painted its transparent pixels
+    /// would show as a solid block with the arrow somewhere inside it.
+    #[test]
+    fn a_cursor_draws_only_where_its_mask_is_set() {
+        let mut s = Screen {
+            w: 4,
+            h: 4,
+            px: vec![0x99; 16],
+        };
+        let mut under = Vec::new();
+        tiny_cursor(0, 0).draw(&mut s, 1, 1, &mut under);
+        let at = |x: usize, y: usize| s.px[y * 4 + x];
+        assert_eq!(at(1, 1), 0x11, "top left of the cursor");
+        assert_eq!(at(2, 1), 0x99, "masked off, so untouched");
+        assert_eq!(at(1, 2), 0x99, "masked off, so untouched");
+        assert_eq!(at(2, 2), 0x44, "bottom right of the cursor");
+    }
+
+    /// The framebuffer belongs to the server, and the pointer is only ever borrowed
+    /// onto it for the blit. If restore is not exact the leftovers accumulate, and
+    /// because updates are partial nothing ever comes along to correct them.
+    #[test]
+    fn restoring_puts_the_framebuffer_back_exactly() {
+        let before: Vec<u32> = (0..64).collect();
+        let mut s = Screen {
+            w: 8,
+            h: 8,
+            px: before.clone(),
+        };
+        let mut under = Vec::new();
+        let cursor = tiny_cursor(1, 1);
+        // Several draws in a row, as a moving pointer produces, each undone before the
+        // next: a stale save-under would show up as drift by the end.
+        for (x, y) in [(3, 3), (4, 3), (4, 4), (0, 0), (7, 7)] {
+            cursor.draw(&mut s, x, y, &mut under);
+            assert_ne!(s.px, before, "something was drawn at {x},{y}");
+            restore(&mut s, &mut under);
+            assert_eq!(s.px, before, "and taken back off cleanly at {x},{y}");
+        }
+    }
+
+    /// A pointer is routinely half off the edge, and the hot spot pushes it further
+    /// out. Clipping has to hold in both directions rather than wrapping to the
+    /// opposite side of the screen.
+    #[test]
+    fn a_cursor_at_the_edges_is_clipped_not_wrapped() {
+        let before: Vec<u32> = (0..16).collect();
+        let mut s = Screen {
+            w: 4,
+            h: 4,
+            px: before.clone(),
+        };
+        let mut under = Vec::new();
+
+        // Hot spot at the far corner puts the body off the top-left entirely.
+        tiny_cursor(1, 1).draw(&mut s, 0, 0, &mut under);
+        assert_eq!(s.px[0], 0x44, "only the bottom-right pixel lands on screen");
+        assert_eq!(s.px[3], before[3], "and nothing wrapped to the far side");
+        restore(&mut s, &mut under);
+        assert_eq!(s.px, before);
+
+        // And past the bottom-right corner.
+        tiny_cursor(0, 0).draw(&mut s, 3, 3, &mut under);
+        assert_eq!(s.px[15], 0x11);
+        assert_eq!(s.px[12], before[12], "no wrap onto the next row");
+        restore(&mut s, &mut under);
+        assert_eq!(s.px, before);
+
+        // Entirely off screen: nothing drawn, nothing to put back.
+        tiny_cursor(0, 0).draw(&mut s, -9, -9, &mut under);
+        assert!(under.is_empty());
+        assert_eq!(s.px, before);
+    }
+
+    /// A zero-sized shape is how a server says the pointer is hidden, and it has to
+    /// hand the real cursor back rather than leaving the window with none at all.
+    #[test]
+    fn a_hidden_pointer_has_no_shape_to_draw() {
+        let c = Cursor::default();
+        assert!(!c.visible());
+        assert!(tiny_cursor(0, 0).visible());
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![7; 4],
+        };
+        let mut under = Vec::new();
+        c.draw(&mut s, 1, 1, &mut under);
+        assert_eq!(s.px, vec![7; 4], "nothing drawn");
+        assert!(under.is_empty());
+    }
+
+    /// The mask is one bit per pixel, most significant first, each row padded out to a
+    /// byte - so a width that is not a multiple of eight is where it goes wrong.
+    #[test]
+    fn a_cursor_mask_is_read_a_bit_at_a_time() {
+        let (w, h) = (9usize, 2usize);
+        let mut body = Vec::new();
+        for i in 0..w * h {
+            body.extend_from_slice(&[i as u8, 0x40, 0x80, 0]); // B, G, R, pad
+        }
+        // Row 0: 101010101 padded, row 1: all off.
+        body.extend_from_slice(&[0b1010_1010, 0b1000_0000, 0, 0]);
+        let c = read_cursor(&mut &body[..], 3, 4, w, h).unwrap();
+        assert_eq!((c.hot_x, c.hot_y), (3, 4));
+        assert_eq!(c.px[0], 0x0080_4000, "R, G, B from B, G, R, pad");
+        let row0: Vec<bool> = c.on[..w].to_vec();
+        assert_eq!(
+            row0,
+            vec![true, false, true, false, true, false, true, false, true]
+        );
+        assert!(c.on[w..].iter().all(|&b| !b), "second row is all off");
     }
 
     /// keysym() does range arithmetic on minifb's enum. If a future minifb reorders

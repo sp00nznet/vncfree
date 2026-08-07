@@ -80,6 +80,39 @@ with real latency that is the difference between a session that feels live and o
 that feels like a slideshow. `VNC_NO_PIPELINE=1` turns it off, which is worth having
 because a server with the bug described next will stall if the client pipelines.
 
+### The pointer is the one thing that cannot wait for the network
+
+Everything else on a remote desktop can lag a little and still feel usable. The pointer
+cannot: a mouse that only moves after a round trip feels broken at any latency worth
+measuring, and it was moving through the *slowest possible path* — the server painted it
+into the captured picture with `DrawIconEx`, so a pointer moving one pixel meant
+repainting two boxes, encoding them, and sending them, before anything moved on screen.
+
+CursorShape (-239) sends the pointer's picture instead, once, when it changes. The
+client draws it at the local mouse position, so it moves at the frame rate of the window
+rather than the speed of the link. The handle Windows hands back for a cursor is the
+same one each time, so noticing a change costs a comparison rather than two bitmap reads
+a frame.
+
+The trade is real and worth stating plainly: the client draws the pointer where *its*
+mouse is, so it no longer shows the remote machine's own pointer moving. Somebody
+sitting at the other end moving their mouse is invisible. `VNC_NO_CURSOR=1` goes back to
+the old way for when that matters more than latency.
+
+Three details:
+
+- **The framebuffer never keeps a pointer in it.** The cursor is painted on immediately
+  before the blit and lifted straight back off after, saving what was underneath. Left
+  in place between frames it would be restored *over* whatever the next partial update
+  had just drawn there, and because updates are partial nothing would ever correct it.
+- **Transparency has to be thrown away.** RFB's mask is one bit per pixel, so a modern
+  cursor's soft alpha edges become hard ones. The alternative is a different
+  pseudo-encoding for the sake of anti-aliasing on an arrow.
+- **Both kinds of cursor still turn up.** A modern one is a 32bpp colour bitmap with a
+  real alpha channel; an old one has no colour bitmap at all and a double-height
+  monochrome mask instead, AND above XOR. Some colour ones leave alpha zero throughout
+  and mean the AND mask to be used anyway, which is a third case.
+
 Continuous updates (-313) remove the request from the loop entirely: the server sends
 changes as they happen and the client stops asking. There is no field anywhere that
 advertises server support — an unprompted `EndOfContinuousUpdates` *is* the

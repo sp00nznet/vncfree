@@ -76,6 +76,7 @@ All environment variables. There is no config file.
 | `VNC_MONITOR=all` | Server only. Share every display as one screen, not just the primary. |
 | `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |
 | `VNC_NO_CONTINUOUS=1` | Client only. Keep asking for each frame instead of letting the server send them unprompted. For servers that offer that and then mishandle it. |
+| `VNC_NO_CURSOR=1` | Client only. Let the server paint the pointer into the picture instead of drawing it locally. Laggier, but it shows the remote machine's own pointer movement. |
 
 Credentials come from the environment rather than the command line, because argv is
 visible to every process on the machine.
@@ -144,6 +145,12 @@ authentication, so there is no unauthenticated path at all.
   are no longer stuck on Raw; the server still sends ZRLE, which is a comparable size
   and lossless. Encoding Tight well means a JPEG *encoder*, which is a lot of weight
   for a squeeze on top of what is already there.
+- **The pointer is drawn locally, so it does not follow the remote machine's own
+  mouse.** That is the trade that makes it move without waiting for the network: the
+  client draws the pointer at *your* mouse position. If somebody is sitting at the
+  other machine moving its mouse, you will not see their pointer move.
+  `VNC_NO_CURSOR=1` goes back to the server painting it in, which is laggy but shows
+  everything.
 - The server's CopyRect covers vertical scrolling but not a window dragged sideways.
   Compatibility is unaffected — that costs bytes, not connections.
 - The server shares the primary monitor by default; `VNC_MONITOR=all` shares every

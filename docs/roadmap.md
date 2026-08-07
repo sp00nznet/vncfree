@@ -27,6 +27,7 @@
 | 22 | Tight decoding, so servers that speak nothing better are not stuck on Raw | done |
 | 23 | A remembered certificate per host, so a changed one is refused | done |
 | 24 | Continuous updates, so the server stops waiting to be asked for each frame | done |
+| 25 | A locally drawn pointer, so the mouse stops waiting for a round trip | done |
 
 ## Ideas, not commitments
 
@@ -36,6 +37,10 @@ Roughly in the order they would earn their keep:
   sharing over Apple Remote Desktop's channel on port 3283, not over VNC at all, so
   there is nothing to implement on the RFB side. See [macos.md](macos.md). A bridge
   over SSH using `pbcopy`/`pbpaste` would be a fraction of the effort if it is wanted.
+- **CursorPos (-232), so a pointer moved at the far end is visible again.** Drawing the
+  pointer locally is what makes it feel instant, and the cost is that the remote
+  machine's own mouse movement no longer shows. This is the pseudo-encoding that puts
+  that back without giving up the latency.
 - **Tight *encoding*, on the server.** The client decodes it now; producing it means a
   JPEG encoder, for a squeeze on top of the ZRLE the server already sends. Low value,
   high weight.

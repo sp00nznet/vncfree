@@ -317,6 +317,138 @@ mod win {
         }
     }
 
+    /// Read the pointer's current picture, for a client that draws it itself.
+    ///
+    /// Returns the shape and the `HCURSOR` it came from. That handle is the change
+    /// detector: Windows hands out the same one for the same cursor, so comparing it
+    /// costs nothing and re-reading two bitmaps every frame is avoided.
+    ///
+    /// Transparency is where cursors are awkward. A modern one is a 32bpp colour bitmap
+    /// with a real alpha channel; an old one has no colour bitmap at all and instead a
+    /// double-height monochrome mask, AND above XOR, where AND says what shows through.
+    /// Both still turn up, so both are handled.
+    pub fn cursor_shape() -> Option<(super::Cursor, isize)> {
+        unsafe {
+            let mut ci: CURSORINFO = zeroed();
+            ci.cbSize = size_of::<CURSORINFO>() as u32;
+            if GetCursorInfo(&mut ci) == 0 || ci.flags != CURSOR_SHOWING || ci.hCursor.is_null() {
+                return None;
+            }
+            let mut ii: ICONINFO = zeroed();
+            if GetIconInfo(ci.hCursor, &mut ii) == 0 {
+                return None;
+            }
+            let drop = |ii: &ICONINFO| {
+                if !ii.hbmColor.is_null() {
+                    DeleteObject(ii.hbmColor as HGDIOBJ);
+                }
+                if !ii.hbmMask.is_null() {
+                    DeleteObject(ii.hbmMask as HGDIOBJ);
+                }
+            };
+
+            let mut bm: BITMAP = zeroed();
+            let src = if ii.hbmColor.is_null() {
+                ii.hbmMask
+            } else {
+                ii.hbmColor
+            };
+            if GetObjectW(
+                src as HGDIOBJ,
+                size_of::<BITMAP>() as i32,
+                (&mut bm as *mut BITMAP).cast(),
+            ) == 0
+            {
+                drop(&ii);
+                return None;
+            }
+            let w = bm.bmWidth.max(0) as usize;
+            // A monochrome cursor's mask holds both halves stacked, so the shape is
+            // half as tall as the bitmap.
+            let h = if ii.hbmColor.is_null() {
+                (bm.bmHeight.max(0) as usize) / 2
+            } else {
+                bm.bmHeight.max(0) as usize
+            };
+            if w == 0 || h == 0 || w > 256 || h > 256 {
+                drop(&ii);
+                return None;
+            }
+
+            let read = |bmp: HBITMAP, rows: usize| -> Option<Vec<u32>> {
+                let mut bi: BITMAPINFO = zeroed();
+                bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+                bi.bmiHeader.biWidth = w as i32;
+                // Negative height asks for top-down rows, matching everything else here.
+                bi.bmiHeader.biHeight = -(rows as i32);
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                bi.bmiHeader.biCompression = BI_RGB;
+                let mut out = vec![0u32; w * rows];
+                let dc = CreateCompatibleDC(null_mut());
+                let got = GetDIBits(
+                    dc,
+                    bmp,
+                    0,
+                    rows as u32,
+                    out.as_mut_ptr().cast(),
+                    &mut bi,
+                    DIB_RGB_COLORS,
+                );
+                DeleteDC(dc);
+                (got != 0).then_some(out)
+            };
+
+            let stride = w.div_ceil(8);
+            let mut mask = vec![0u8; stride * h];
+            let mut px = vec![0u32; w * h];
+            let mut set = |i: usize| mask[i / w * stride + (i % w) / 8] |= 0x80 >> (i % w % 8);
+
+            if ii.hbmColor.is_null() {
+                // Monochrome: AND on top, XOR underneath. Where AND is 0 the pixel is
+                // drawn, and XOR then chooses black or white.
+                let both = read(ii.hbmMask, h * 2)?;
+                for i in 0..w * h {
+                    if both[i] & 0x00FF_FFFF == 0 {
+                        set(i);
+                        px[i] = if both[w * h + i] & 0x00FF_FFFF != 0 {
+                            0x00FF_FFFF
+                        } else {
+                            0
+                        };
+                    }
+                }
+            } else {
+                let colour = read(ii.hbmColor, h)?;
+                let opaque = colour.iter().any(|p| p >> 24 != 0);
+                // Some colour cursors leave alpha zero throughout and mean it to be
+                // ignored; those still have a usable AND mask.
+                let and = if opaque { None } else { read(ii.hbmMask, h) };
+                for i in 0..w * h {
+                    let visible = match &and {
+                        Some(a) => a[i] & 0x00FF_FFFF == 0,
+                        None => colour[i] >> 24 >= 128,
+                    };
+                    if visible {
+                        set(i);
+                        px[i] = colour[i] & 0x00FF_FFFF;
+                    }
+                }
+            }
+
+            let shape = super::Cursor {
+                w,
+                h,
+                hot_x: ii.xHotspot as usize,
+                hot_y: ii.yHotspot as usize,
+                px,
+                mask,
+            };
+            drop(&ii);
+            Some((shape, ci.hCursor as isize))
+        }
+    }
+
     /// A reusable capture surface. Creating the DIB once and re-filling it is far
     /// cheaper than building one per frame.
     ///
@@ -418,7 +550,9 @@ mod win {
         ///
         /// The cursor is drawn in by hand either way: neither capture route includes
         /// it, and a remote desktop with no visible pointer is close to unusable.
-        pub fn grab(&mut self, dst: &mut [u32]) -> super::Frame {
+        /// Unless `paint_cursor` is false, which means the client is drawing it locally
+        /// and baking it into the picture would show two of them.
+        pub fn grab(&mut self, dst: &mut [u32], paint_cursor: bool) -> super::Frame {
             unsafe {
                 let rows = std::slice::from_raw_parts_mut(self.bits, self.w * self.h);
                 // The source offset is the shared region's origin on the desktop,
@@ -473,7 +607,7 @@ mod win {
                 let mut ci: CURSORINFO = zeroed();
                 ci.cbSize = size_of::<CURSORINFO>() as u32;
                 let mut now = None;
-                if GetCursorInfo(&mut ci) != 0 && ci.flags == CURSOR_SHOWING {
+                if paint_cursor && GetCursorInfo(&mut ci) != 0 && ci.flags == CURSOR_SHOWING {
                     let mut ii: ICONINFO = zeroed();
                     if GetIconInfo(ci.hCursor, &mut ii) != 0 {
                         // The cursor position is on the desktop; the DIB starts at the
@@ -766,6 +900,22 @@ enum Part {
     /// DesktopSize: not a picture, but the way to tell a client the screen resolution
     /// changed. The rectangle header carries the new size and there is no body.
     Resize { w: usize, h: usize },
+    /// CursorShape: the pointer's picture, for a client that draws it itself. The
+    /// rectangle header carries the hot spot in place of a position.
+    Cursor(Cursor),
+}
+
+/// The pointer's picture, ready to send. `mask` is one bit per pixel, most significant
+/// first, each row padded to a byte - which is what RFB wants and is why a cursor's
+/// soft edges cannot survive the trip: a pixel is drawn or it is not.
+#[derive(Clone, PartialEq, Debug)]
+struct Cursor {
+    w: usize,
+    h: usize,
+    hot_x: usize,
+    hot_y: usize,
+    px: Vec<u32>,
+    mask: Vec<u8>,
 }
 
 const TILE: usize = 64;
@@ -1131,6 +1281,9 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
             Part::Copy { x, y, w, h, .. } => (x, y, w, h),
             Part::Pixels { x, y, w, h } => (x, y, w, h),
             Part::Resize { w, h } => (0, 0, w, h),
+            // The hot spot travels in the position fields. There is nowhere else for
+            // it, and a cursor has no position on the framebuffer by definition.
+            Part::Cursor(ref c) => (c.hot_x, c.hot_y, c.w, c.h),
         };
         out.extend_from_slice(&(x as u16).to_be_bytes());
         out.extend_from_slice(&(y as u16).to_be_bytes());
@@ -1138,6 +1291,13 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
         out.extend_from_slice(&(h as u16).to_be_bytes());
         match *part {
             Part::Resize { .. } => out.extend_from_slice(&(-223i32).to_be_bytes()),
+            Part::Cursor(ref c) => {
+                out.extend_from_slice(&(-239i32).to_be_bytes());
+                for p in &c.px {
+                    out.extend_from_slice(&fmt.pixel(*p));
+                }
+                out.extend_from_slice(&c.mask);
+            }
             Part::Copy { sx, sy, .. } => {
                 out.extend_from_slice(&1i32.to_be_bytes()); // CopyRect
                 out.extend_from_slice(&(sx as u16).to_be_bytes());
@@ -1191,6 +1351,9 @@ struct Shared {
     /// The client turned on continuous updates, so frames go out as the screen changes
     /// rather than once per request. Saves a round trip per frame.
     continuous: AtomicBool,
+    /// The client asked for CursorShape, so it draws the pointer itself and the
+    /// captured picture must not have one baked into it.
+    cursor: AtomicBool,
     alive: AtomicBool,
     clip: Mutex<String>,
 }
@@ -1432,6 +1595,7 @@ fn serve(
         fmt: Mutex::new(PixFmt::default()),
         wants: AtomicBool::new(false),
         continuous: AtomicBool::new(false),
+        cursor: AtomicBool::new(false),
         incremental: AtomicBool::new(false),
         zrle: AtomicBool::new(false),
         copyrect: AtomicBool::new(false),
@@ -1555,6 +1719,7 @@ fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> R
                 shared.zrle.store(encs.contains(&16), Ordering::Relaxed);
                 shared.copyrect.store(encs.contains(&1), Ordering::Relaxed);
                 shared.resize.store(encs.contains(&-223), Ordering::Relaxed);
+                shared.cursor.store(encs.contains(&-239), Ordering::Relaxed);
                 if debug() {
                     eprintln!(
                         "[debug] client supports encodings {encs:?}, using {}{}",
@@ -1648,6 +1813,9 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
     let mut cur = Screen::new(w, h);
     let mut prev = Screen::new(w, h);
     let mut first = true;
+    // The HCURSOR the client was last told about. Windows reuses the handle for the
+    // same cursor, so this is the whole change detector.
+    let mut last_cursor: Option<isize> = None;
     let mut cap = win::Capture::new(ox, oy, w, h).ok_or("could not create the capture surface")?;
     // One deflate stream for the whole connection. ZRLE's zlib state spans the
     // session, not a rectangle; restarting it per rectangle decodes the first one and
@@ -1724,8 +1892,41 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
         }
 
         let full = first || resized || !shared.incremental.load(Ordering::Relaxed);
-        let reported = cap.grab(&mut cur.px);
-        if matches!(reported, Frame::Unchanged) && !full {
+        // A client that draws the pointer itself gets a picture without one in it.
+        let local_cursor = shared.cursor.load(Ordering::Relaxed);
+
+        // The shape only has to go out when it actually changes, which is rarely - the
+        // handle Windows hands back is the same one for the same cursor, so this costs
+        // a comparison rather than two bitmap reads a frame.
+        let mut cursor_part = None;
+        if local_cursor {
+            match win::cursor_shape() {
+                Some((shape, handle)) if Some(handle) != last_cursor => {
+                    last_cursor = Some(handle);
+                    cursor_part = Some(Part::Cursor(shape));
+                }
+                Some(_) => {}
+                // The pointer is hidden - a full-screen video, or a text caret owning
+                // it. Send an empty shape so the client stops drawing the old one.
+                None if last_cursor.is_some() => {
+                    last_cursor = None;
+                    cursor_part = Some(Part::Cursor(Cursor {
+                        w: 0,
+                        h: 0,
+                        hot_x: 0,
+                        hot_y: 0,
+                        px: Vec::new(),
+                        mask: Vec::new(),
+                    }));
+                }
+                None => {}
+            }
+        } else {
+            last_cursor = None;
+        }
+
+        let reported = cap.grab(&mut cur.px, !local_cursor);
+        if matches!(reported, Frame::Unchanged) && !full && cursor_part.is_none() {
             // The screen provably did not move, so there is nothing to diff and
             // nothing to send. Put the request back: it is still outstanding.
             if !continuous {
@@ -1800,8 +2001,8 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
                     let (px, py, pw, ph) = match *p {
                         Part::Copy { x, y, w, h, .. } => (x, y, w, h),
                         Part::Pixels { x, y, w, h } => (x, y, w, h),
-                        // Not a region of the picture; nothing to have covered.
-                        Part::Resize { .. } => continue,
+                        // Not regions of the picture; nothing to have covered.
+                        Part::Resize { .. } | Part::Cursor(_) => continue,
                     };
                     for row in py..py + ph {
                         covered[row * w + px..row * w + px + pw].fill(true);
@@ -1854,6 +2055,9 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
                     .map(|(x, y, w, h)| Part::Pixels { x, y, w, h }),
             );
         }
+
+        // A new pointer shape is worth an update on its own, even on a still screen.
+        parts.extend(cursor_part);
 
         if parts.is_empty() {
             // An incremental request stays outstanding until something actually
