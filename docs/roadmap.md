@@ -31,6 +31,7 @@
 | 26 | A security pass: bounded reads, rate-limited passwords, a written threat model | done |
 | 27 | An icon on each executable | done |
 | 28 | Measuring where the time goes, and the server sleeping through half of it | done |
+| 29 | A dialog laid out from the text in it, so nothing clips at any scaling | done |
 
 ## Ideas, not commitments
 
