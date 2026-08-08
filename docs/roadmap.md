@@ -29,6 +29,8 @@
 | 24 | Continuous updates, so the server stops waiting to be asked for each frame | done |
 | 25 | A locally drawn pointer, so the mouse stops waiting for a round trip | done |
 | 26 | A security pass: bounded reads, rate-limited passwords, a written threat model | done |
+| 27 | An icon on each executable | done |
+| 28 | Measuring where the time goes, and the server sleeping through half of it | done |
 
 ## Ideas, not commitments
 
