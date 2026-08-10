@@ -32,6 +32,7 @@
 | 27 | An icon on each executable | done |
 | 28 | Measuring where the time goes, and the server sleeping through half of it | done |
 | 29 | A dialog laid out from the text in it, so nothing clips at any scaling | done |
+| 30 | Multi-monitor verified on three real displays, one at negative coordinates | done |
 
 ## Ideas, not commitments
 
@@ -41,6 +42,15 @@ Roughly in the order they would earn their keep:
   sharing over Apple Remote Desktop's channel on port 3283, not over VNC at all, so
   there is nothing to implement on the RFB side. See [macos.md](macos.md). A bridge
   over SSH using `pbcopy`/`pbpaste` would be a fraction of the effort if it is wanted.
+- **Stop copying the whole screen twice a frame.** Every grab masks and copies
+  `w * h` pixels - 8.3 million at 4K - and then copies the whole thing again into
+  `prev`, whether three pixels changed or all of them. That is the measured
+  `grab 13-25ms`, which is now the largest term on the server by a distance: encode is
+  0.2ms and write 0.1ms beside it. Duplication already reports which rectangles changed,
+  so the masking and copying could follow those instead of the whole framebuffer. The
+  care needed is that the mask exists because the DIB's top byte is undefined, so it is
+  "mask the regions about to be used", not "stop masking". **The one remaining change
+  anybody would feel.**
 - **CursorPos (-232), so a pointer moved at the far end is visible again.** Drawing the
   pointer locally is what makes it feel instant, and the cost is that the remote
   machine's own mouse movement no longer shows. This is the pseudo-encoding that puts
@@ -53,3 +63,18 @@ Roughly in the order they would earn their keep:
   faith. Comparing the printed fingerprints by hand is the only answer today. Anything
   better means a shared secret or an authority, and the password is already the shared
   secret - deriving the certificate from it is the interesting idea here.
+
+## Deliberately not doing
+
+Written down so the reasoning survives being asked again:
+
+- **File transfer.** The thing that turns a viewer into a suite. Never wanted here.
+- **A lower colour depth to help against a Mac.** Floated, then measured: 0.5 MB/s off
+  the wire against a real Mac, so bandwidth is not the constraint. It would cost colour
+  fidelity and the "one pixel format, no translation" property that the whole decoder
+  rests on, to fix something that is not the problem.
+- **Tight *encoding* on the server.** A JPEG encoder, to squeeze something that already
+  takes 0.2ms.
+- **Anything clever for the first-connection trust problem.** It needs an authority or a
+  shared secret. Every cheap version is worse than stating the limit plainly, which
+  [security.md](security.md) does.

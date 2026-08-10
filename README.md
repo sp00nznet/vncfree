@@ -155,9 +155,12 @@ authentication, so there is no unauthenticated path at all.
 - The server's CopyRect covers vertical scrolling but not a window dragged sideways.
   Compatibility is unaffected — that costs bytes, not connections.
 - The server shares the primary monitor by default; `VNC_MONITOR=all` shares every
-  display as one screen. **That has not been tested against a real second monitor** —
-  only one display was attached to the development machine — and sharing more than one
-  falls back to `BitBlt`, because Desktop Duplication works per output.
+  display as one screen. Sharing more than one falls back to `BitBlt`, because Desktop
+  Duplication works per output — so it costs more CPU than a single-monitor session.
+  Verified on three real displays, including one to the *left* of the primary and so at
+  negative coordinates, and with mixed scaling: a 4K primary at 200% beside two 1080p
+  screens at 100%. Any gap between monitors comes across as black, because on the
+  desktop it genuinely is nothing.
 - The server follows a resolution change, but a client that did not ask for
   DesktopSize cannot be told, so that session ends and has to reconnect — vncfree's own
   client reconnects by itself.

@@ -91,6 +91,23 @@ These each cost real time, and each one made correct code look broken:
   when a fix appears to do nothing at all, check the exe's timestamp before checking
   anything else.
 
+## Verifying multi-monitor
+
+`VNC_MONITOR=all` was verified on three real displays: a 4K primary at 200% scaling with
+two 1080p screens at 100%, one of them placed to the *left* of the primary and therefore
+at negative desktop coordinates. All three come across.
+
+Two things nearly produced a false bug report:
+
+- **Check the region a monitor actually occupies, not the strip it is in.** A screen
+  placed lower than the primary has dead space above it, and sampling the whole strip
+  reads as "all black, nothing captured". Read the monitor's own rectangle - Windows
+  reports its origin and size, and the debug output prints them.
+- **A black desktop is not a missing desktop.** The monitor here had black wallpaper, so
+  "is it all one colour?" said missing when it was fine. The taskbar at the bottom of
+  the crop is what settled it. Compare against a `CopyFromScreen` of the same virtual
+  desktop taken from a DPI-aware process, which is an independent capture path.
+
 ## Verifying the Mac path
 
 Requires a real Mac; see [macos.md](macos.md) for what has been confirmed and what has
