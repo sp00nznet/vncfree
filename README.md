@@ -24,7 +24,11 @@ So here's the deal: vncfree is MIT licensed, the code lives on GitHub, and anyon
 build it, fork it, ship it or audit it. **If anyone tries to sell you this software,
 they're scamming you. Walk away.**
 
-Sibling project to [futureburn](https://github.com/sp00nznet/futureburn), same attitude.
+Sister project to [bulkhead](https://github.com/sp00nznet/bulkhead),
+[futureburn](https://github.com/sp00nznet/futureburn) and
+[pstfree](https://github.com/sp00nznet/pstfree) — same attitude: find the Windows
+payware, read the published spec it is hiding behind, give it away.
+[Why](PHILOSOPHY.md).
 
 ### Prior art, credit where due
 
@@ -194,6 +198,18 @@ runtime to install.
 
 Or grab them from [Releases](https://github.com/sp00nznet/vncfree/releases) — built by
 CI straight from a tag, so nobody has to trust a binary from anywhere else.
+
+## The sister projects
+
+| | |
+|---|---|
+| [bulkhead](https://github.com/sp00nznet/bulkhead) | Block-level backup, recovery and certified secure erase for Windows. |
+| [futureburn](https://github.com/sp00nznet/futureburn) | CD, DVD and Blu-ray burning, ripping and image mounting. |
+| [pstfree](https://github.com/sp00nznet/pstfree) | Read, export and repair Outlook PST/OST files without Outlook. |
+
+Same method every time: read the published spec, call the OS API that is
+already there, ship one executable, MIT. Why that is worth doing at all is
+written down in **[PHILOSOPHY.md](PHILOSOPHY.md)**.
 
 ## License
 
