@@ -76,3 +76,10 @@ strip = true
 
 [build-dependencies]
 embed-resource = "3.0.11"
+
+# minifb's Windows backend stretches with GDI's default (unfiltered) mode, which
+# looks fine at 1:1 but visibly aliased at any other scale - exactly the case once
+# the window opens smaller than a hi-DPI server's framebuffer. Patched locally to
+# ask for HALFTONE instead; see vendor/minifb-0.28.0/src/os/windows/mod.rs.
+[patch.crates-io]
+minifb = { path = "vendor/minifb-0.28.0" }
