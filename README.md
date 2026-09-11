@@ -82,6 +82,7 @@ All environment variables. There is no config file.
 | `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |
 | `VNC_NO_CONTINUOUS=1` | Client only. Keep asking for each frame instead of letting the server send them unprompted. For servers that offer that and then mishandle it. |
 | `VNC_NO_CURSOR=1` | Client only. Let the server paint the pointer into the picture instead of drawing it locally. Laggier, but it shows the remote machine's own pointer movement. |
+| `VNC_SCROLL_DIVISOR` | Client only. Raw scroll delta per wheel click sent, default `12` (one plain mouse-wheel notch). A touchpad's driver picks its own units for the same swipe - lower this if scrolling feels slow, raise it if a light touch sends too much. |
 
 Credentials come from the environment rather than the command line, because argv is
 visible to every process on the machine.
@@ -186,6 +187,9 @@ authentication, so there is no unauthenticated path at all.
 - **[docs/testing.md](docs/testing.md)** — standing up a real server to test against,
   and the harness mistakes that make correct code look broken.
 - **[docs/roadmap.md](docs/roadmap.md)** — what is done, and what might come next.
+- **[docs/windows-setup.md](docs/windows-setup.md)** — saved passwords and
+  one-click shortcuts per Mac, and recovering the whole setup after a Windows
+  reinstall.
 
 ## Building
 
