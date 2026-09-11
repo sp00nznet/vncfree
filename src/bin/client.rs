@@ -23,6 +23,8 @@ use aes::Aes128;
 use md5::{Digest, Md5};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 use num_bigint::BigUint;
+use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
 
 use vncfree::{
     blob, cut_text_msg, debug, i32r, rd, read_clipboard, text, u16r, u32r, u8r, vnc_des, Res,
@@ -1420,6 +1422,42 @@ fn session(
     Ok(())
 }
 
+/// How big to first open the window: as large as it can be while still fitting
+/// inside this machine's work area, keeping the remote desktop's aspect ratio.
+///
+/// A server can hand over more pixels than "the screen" suggests - a Retina Mac's
+/// framebuffer is double what its resolution looks like in System Settings, in each
+/// direction - and without this the window opened at that full size, mostly off the
+/// edge of a smaller local screen. `ScaleMode::AspectRatioStretch` already draws the
+/// buffer scaled to whatever size the window actually is, so shrinking just the
+/// starting size is enough; the window stays resizable for a 1:1 view afterwards.
+fn initial_window_size(w: usize, h: usize) -> (usize, usize) {
+    let mut area: RECT = unsafe { std::mem::zeroed() };
+    let got = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            &mut area as *mut RECT as *mut std::ffi::c_void,
+            0,
+        )
+    };
+    if got == 0 {
+        return (w, h);
+    }
+    let (avail_w, avail_h) = (
+        (area.right - area.left) as f64,
+        (area.bottom - area.top) as f64,
+    );
+    // A margin rather than the exact work area, so the title bar and borders still
+    // leave the window entirely on screen instead of clipped by a pixel.
+    let (budget_w, budget_h) = (avail_w * 0.9, avail_h * 0.85);
+    let scale = (budget_w / w as f64).min(budget_h / h as f64).min(1.0);
+    (
+        ((w as f64 * scale).round() as usize).max(1),
+        ((h as f64 * scale).round() as usize).max(1),
+    )
+}
+
 fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res<()> {
     let (w, h) = (vnc.screen.w, vnc.screen.h);
     let name = vnc.name.clone();
@@ -1475,7 +1513,8 @@ fn run_window(vnc: Vnc, target: Target, clip: Clip, cursor: SharedCursor) -> Res
         scale_mode: ScaleMode::AspectRatioStretch,
         ..Default::default()
     };
-    let mut window = Window::new(&format!("{name} - vncfree"), w, h, opts)?;
+    let (iw, ih) = initial_window_size(w, h);
+    let mut window = Window::new(&format!("{name} - vncfree"), iw, ih, opts)?;
     window.set_target_fps(60);
     // Characters land here as the window pumps its messages, with the keyboard layout
     // already applied by Windows.
