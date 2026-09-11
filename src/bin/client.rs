@@ -7,7 +7,7 @@
 //! Run with no arguments and it asks where to connect. Given an address it connects
 //! straight away, and a second argument is a path for a headless one-frame PPM dump.
 //! Settings come from the environment: VNC_USERNAME, VNC_PASSWORD, VNC_VIEW_ONLY,
-//! VNC_ENCODING, VNC_DEBUG.
+//! VNC_ENCODING, VNC_DEBUG, VNC_SCROLL_DIVISOR.
 
 use std::collections::HashMap;
 use std::env;
@@ -919,6 +919,17 @@ struct Input {
     held: HashMap<Key, u32>,
     /// What the keyboard layout made of the keys pressed this frame.
     typed: Typed,
+    /// Scroll delta not yet worth a whole wheel click, carried to the next event
+    /// rather than dropped. A touchpad's reported delta ranges from a fraction of a
+    /// click to tens of them in one message, and rounding each message alone either
+    /// floors a slow drag up to a full click every time or throws away the
+    /// remainder of a fast flick - both of which is "scrolling feels slow".
+    scroll_carry: f32,
+    /// Raw delta units per wheel click sent. A plain mouse reports one notch as 12;
+    /// a touchpad's driver decides its own units for the same physical swipe, and
+    /// there is no way to ask it what they mean - so this is a knob, not a
+    /// constant. `VNC_SCROLL_DIVISOR` overrides it without a rebuild.
+    scroll_divisor: f32,
 }
 
 impl Input {
@@ -952,6 +963,12 @@ impl Input {
             pos: (0, 0),
             held: HashMap::new(),
             typed: Typed::default(),
+            scroll_carry: 0.0,
+            scroll_divisor: env::var("VNC_SCROLL_DIVISOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&d: &f32| d > 0.0)
+                .unwrap_or(12.0),
         }
     }
 
@@ -1027,11 +1044,27 @@ impl Input {
                 self.pointer_event(mask, x, y)?;
                 (self.mask, self.pos) = (mask, (x, y));
             }
-            // RFB has no scroll message: the wheel is buttons 4/5, clicked and released.
+            // RFB has no scroll message: the wheel is buttons 4/5, clicked and
+            // released, so a delta has to become some number of whole clicks.
+            // minifb reports a plain mouse wheel notch as magnitude 12; a trackpad
+            // reports anywhere from a fraction of that to several hundred in one
+            // message, depending on how hard it was flicked. Carrying the remainder
+            // to the next event means a slow drag still adds up to real clicks
+            // instead of one per message regardless of size, and there is no cap on
+            // a fast flick - it scrolls exactly as far as the delta says to.
             if let Some((_, sy)) = win.get_scroll_wheel() {
                 if sy != 0.0 {
-                    self.pointer_event(mask | if sy > 0.0 { 8 } else { 16 }, x, y)?;
-                    self.pointer_event(mask, x, y)?;
+                    self.scroll_carry += sy;
+                    let clicks_f = (self.scroll_carry / self.scroll_divisor).trunc();
+                    self.scroll_carry -= clicks_f * self.scroll_divisor;
+                    let clicks = clicks_f.abs() as u32;
+                    if clicks > 0 {
+                        let dir = if clicks_f > 0.0 { 8 } else { 16 };
+                        for _ in 0..clicks {
+                            self.pointer_event(mask | dir, x, y)?;
+                            self.pointer_event(mask, x, y)?;
+                        }
+                    }
                 }
             }
         }
