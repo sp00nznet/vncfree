@@ -1736,10 +1736,10 @@ impl Cursor {
 /// Put back what `draw` painted over, so the framebuffer the server owns never has a
 /// pointer in it.
 fn restore(s: &mut Screen, under: &mut Vec<u32>) {
-    for pair in under.chunks_exact(2) {
-        let i = pair[0] as usize;
+    for &[i, px] in under.as_chunks::<2>().0 {
+        let i = i as usize;
         if i < s.px.len() {
-            s.px[i] = pair[1];
+            s.px[i] = px;
         }
     }
     under.clear();
