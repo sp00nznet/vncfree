@@ -82,6 +82,7 @@ All environment variables. There is no config file.
 | `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |
 | `VNC_NO_CONTINUOUS=1` | Client only. Keep asking for each frame instead of letting the server send them unprompted. For servers that offer that and then mishandle it. |
 | `VNC_NO_CURSOR=1` | Client only. Let the server paint the pointer into the picture instead of drawing it locally. Laggier, but it shows the remote machine's own pointer movement. |
+| `VNC_SCROLL_DIVISOR` | Client only. Scroll delta per wheel click sent, default `12` (one plain mouse-wheel notch). A touchpad's driver picks its own units for the same swipe - lower this if scrolling feels slow, raise it if a light touch sends too much. |
 
 Credentials come from the environment rather than the command line, because argv is
 visible to every process on the machine.
@@ -174,6 +175,13 @@ authentication, so there is no unauthenticated path at all.
   what people want from a shortcut and is what most viewers do.
 - Holding a character key sends repeats rather than one long press, because Windows
   reports the repeats. Fine for typing, not for holding a key down in a game.
+- **To control an admin window, run the server as administrator.** Task Manager, Event
+  Viewer, regedit, Services and anything else started with "Run as administrator" ignore
+  input from a program that is not elevated itself — Windows drops it without saying so,
+  so the screen keeps updating while every click and key goes nowhere. Right-click
+  `vncfree-server.exe` and choose **Run as administrator** when you need those.
+  UAC prompts and the Ctrl-Alt-Del screen are out of reach either way: those need a
+  service running as SYSTEM, which this deliberately is not.
 
 ## Documentation
 
@@ -186,6 +194,13 @@ authentication, so there is no unauthenticated path at all.
 - **[docs/testing.md](docs/testing.md)** — standing up a real server to test against,
   and the harness mistakes that make correct code look broken.
 - **[docs/roadmap.md](docs/roadmap.md)** — what is done, and what might come next.
+
+## Contributors
+
+- **[tariqhamid](https://github.com/tariqhamid)** — opening the session window at a
+  size that fits the screen, so a Retina Mac's double-size framebuffer is no longer
+  mostly off the edge; and touchpad scrolling that follows the swipe
+  ([#1](https://github.com/sp00nznet/vncfree/pull/1)).
 
 ## Building
 
