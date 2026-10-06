@@ -733,6 +733,29 @@ mod win {
             0xffeb => VK_LWIN,
             0xffec => VK_RWIN,
             0xffbe..=0xffc9 => (sym - 0xffbe) as u16 + VK_F1,
+            0xff61 => VK_SNAPSHOT,
+            0xff67 => VK_APPS,
+            // The keypad. With Num Lock on a client sends KP_0..KP_9; with it off, the
+            // same keys arrive as KP_Home, KP_Up and so on.
+            0xffb0..=0xffb9 => (sym - 0xffb0) as u16 + VK_NUMPAD0,
+            0xffaa => VK_MULTIPLY,
+            0xffab => VK_ADD,
+            0xffac => VK_SEPARATOR,
+            0xffad => VK_SUBTRACT,
+            0xffae => VK_DECIMAL,
+            0xffaf => VK_DIVIDE,
+            0xff8d => VK_RETURN,
+            0xff95 => VK_HOME,
+            0xff96 => VK_LEFT,
+            0xff97 => VK_UP,
+            0xff98 => VK_RIGHT,
+            0xff99 => VK_DOWN,
+            0xff9a => VK_PRIOR,
+            0xff9b => VK_NEXT,
+            0xff9c => VK_END,
+            0xff9d => VK_CLEAR,
+            0xff9e => VK_INSERT,
+            0xff9f => VK_DELETE,
             _ => return None,
         })
     }
@@ -761,8 +784,10 @@ mod win {
                 i.Anonymous.ki.wVk = vk;
                 i.Anonymous.ki.dwFlags = if down { 0 } else { KEYEVENTF_KEYUP };
             }
-            // Printable but unmapped: type the character itself.
-            None if sym < 0x1_0000 => {
+            // Printable but unmapped: type the character itself. Not 0xfd00 and up:
+            // those are function keys, not characters, and typed as Unicode they land in
+            // halfwidth Hangul - an unmapped keypad key used to type Korean.
+            None if sym < 0xfd00 => {
                 i.Anonymous.ki.wScan = sym as u16;
                 i.Anonymous.ki.dwFlags = KEYEVENTF_UNICODE | if down { 0 } else { KEYEVENTF_KEYUP };
             }
@@ -809,6 +834,22 @@ mod win {
                 i.Anonymous.mi.dwFlags = MOUSEEVENTF_WHEEL;
                 send(&[i]);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Remmina sends KP_0 for the keypad's 0. Unmapped, it went out as the Unicode
+        /// character U+FFB0 - halfwidth Hangul - so every keypad key typed Korean.
+        #[test]
+        fn keypad_keys_are_keys_not_characters() {
+            assert_eq!(vk_for(0xffb0), Some(VK_NUMPAD0));
+            assert_eq!(vk_for(0xffb9), Some(VK_NUMPAD9));
+            assert_eq!(vk_for(0xff8d), Some(VK_RETURN));
+            assert_eq!(vk_for(0xffae), Some(VK_DECIMAL));
+            assert_eq!(vk_for(0xff9c), Some(VK_END), "Num Lock off");
         }
     }
 }
