@@ -159,6 +159,14 @@ impl Write for WireWrite {
     }
 }
 
+impl WireWrite {
+    /// Close the connection under the read half too, which is otherwise parked in a
+    /// blocking read that only the server can end.
+    pub fn shutdown(&self) {
+        let _ = self.sock.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// Split a socket into the two halves, with no encryption.
 pub fn plain(sock: TcpStream) -> Res<(WireRead, WireWrite)> {
     Ok((

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Only the pre-Compose window background; Compose paints everything after. -->
+    <style name="Theme.Vncfree" parent="android:Theme.Material.NoActionBar" />
+    <color name="ic_launcher_background">#2FB4F0</color>
+</resources>

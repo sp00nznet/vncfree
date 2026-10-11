@@ -1,0 +1,2382 @@
+//! The client half of RFB: connect, authenticate, decode. Everything a viewer needs
+//! except the window, so the Windows client and the Android app run the same code and
+//! a decoder fix lands in both.
+
+use std::env;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::Aes128;
+use md5::{Digest, Md5};
+use num_bigint::BigUint;
+
+use crate::{
+    blob, debug, i32r, rd, read_clipboard, text, u16r, u32r, u8r, vnc_des, Res, Screen,
+    PIXEL_FORMAT,
+};
+
+/// Shared write half. Both the network thread (update requests) and the UI thread
+/// (input events) write to this socket, and an interleaved write would desync the
+/// protocol, so every whole message goes out under this lock.
+pub type Writer = Arc<Mutex<Option<crate::wire::WireWrite>>>;
+
+/// Write one whole message. Does nothing while disconnected: input and clipboard
+/// events raised during a reconnect have nowhere to go, and that is not an error.
+pub fn send(w: &Writer, bytes: &[u8]) -> Res<()> {
+    if let Some(s) = w.lock().unwrap().as_mut() {
+        s.write_all(bytes)?;
+    }
+    Ok(())
+}
+
+pub fn vnc_auth(r: &mut impl Read, w: &mut impl Write, password: &str) -> Res<()> {
+    let mut challenge = rd::<16>(r)?;
+    vnc_des(&mut challenge, password);
+    w.write_all(&challenge)?;
+    Ok(())
+}
+
+/// A big-endian integer in exactly `len` bytes, left-padded with zeros. Both the
+/// shared secret and the public key are fixed-width on the wire: hashing a secret
+/// that is one byte short silently produces a different AES key, and the only
+/// symptom is the server saying authentication failed.
+pub fn pad_be(n: &BigUint, len: usize) -> Vec<u8> {
+    let b = n.to_bytes_be();
+    assert!(b.len() <= len, "value is wider than the key length");
+    let mut out = vec![0u8; len - b.len()];
+    out.extend_from_slice(&b);
+    out
+}
+
+/// Write a null-terminated string into a fixed field, leaving the rest of the field
+/// as-is (Apple pre-fills the credential blob with random bytes, so the padding after
+/// the terminator is random rather than zeros).
+pub fn write_cstr(dst: &mut [u8], s: &str, what: &str) -> Res<()> {
+    let b = s.as_bytes();
+    if b.len() >= dst.len() {
+        return Err(format!("{what} is too long: max {} bytes", dst.len() - 1).into());
+    }
+    dst[..b.len()].copy_from_slice(b);
+    dst[b.len()] = 0;
+    Ok(())
+}
+
+/// Apple's Diffie-Hellman authentication (security type 30), which is what macOS
+/// Screen Sharing uses by default so it can check real macOS account credentials.
+///
+/// The server sends a generator, a key length, a prime and its public key. We do a
+/// standard DH exchange, MD5 the shared secret into an AES-128 key, and return the
+/// username and password encrypted in a 128-byte blob followed by our public key.
+pub fn apple_dh_auth(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    username: &str,
+    password: &str,
+) -> Res<()> {
+    let generator = u16r(r)?;
+    let key_len = u16r(r)? as usize;
+    let prime = blob(r, key_len)?;
+    let server_pub = blob(r, key_len)?;
+    if debug() {
+        eprintln!("[debug] apple-dh generator={generator} key-length={key_len} bytes");
+    }
+
+    let p = BigUint::from_bytes_be(&prime);
+    if p == BigUint::from(0u32) {
+        return Err("server sent a zero prime".into());
+    }
+
+    // Our DH private key. This must come from the OS CSPRNG - a predictable private
+    // key hands the session to anyone who can watch the exchange.
+    let mut private = vec![0u8; key_len];
+    getrandom::fill(&mut private)?;
+
+    let x = BigUint::from_bytes_be(&private);
+    let client_pub = BigUint::from(generator).modpow(&x, &p);
+    let shared = BigUint::from_bytes_be(&server_pub).modpow(&x, &p);
+    let key: [u8; 16] = Md5::digest(pad_be(&shared, key_len)).into();
+
+    // 128-byte credential blob: username at 0, password at 64, each null-terminated
+    // inside its own 64-byte field, with the slack left as the random fill.
+    let mut creds = [0u8; 128];
+    getrandom::fill(&mut creds)?;
+    let (user_field, pass_field) = creds.split_at_mut(64);
+    write_cstr(user_field, username, "username")?;
+    write_cstr(pass_field, password, "password")?;
+
+    // AES-128-ECB, exactly 8 blocks, no padding.
+    let cipher = Aes128::new(&key.into());
+    for block in creds.chunks_mut(16) {
+        let mut b = GenericArray::clone_from_slice(block);
+        cipher.encrypt_block(&mut b);
+        block.copy_from_slice(&b);
+    }
+
+    w.write_all(&creds)?;
+    w.write_all(&pad_be(&client_pub, key_len))?;
+    Ok(())
+}
+
+/// The VeNCrypt sub-negotiation, up to the point where TLS takes over. Returns the two
+/// encrypted halves and the server certificate's fingerprint.
+///
+/// Only the X509 subtypes are usable here. VeNCrypt's plain TLS types authenticate with
+/// anonymous Diffie-Hellman, which offers no defence against someone sitting in the
+/// middle and which rustls does not implement. A server offering only those is refused
+/// with an explanation rather than silently downgraded.
+pub fn vencrypt(
+    tcp: &mut TcpStream,
+) -> Res<(crate::wire::WireRead, crate::wire::WireWrite, String)> {
+    const X509_VNC: u32 = 261;
+
+    let theirs = rd::<2>(tcp)?;
+    if theirs[0] != 0 || theirs[1] < 2 {
+        return Err(format!(
+            "server speaks VeNCrypt {}.{}, and vncfree needs 0.2",
+            theirs[0], theirs[1]
+        )
+        .into());
+    }
+    tcp.write_all(&[0, 2])?;
+    if u8r(tcp)? != 0 {
+        return Err("server rejected VeNCrypt 0.2".into());
+    }
+
+    let n = u8r(tcp)? as usize;
+    let list = blob(tcp, n * 4)?;
+    let subtypes: Vec<u32> = list
+        .chunks(4)
+        .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+        .collect();
+    if debug() {
+        eprintln!("[debug] VeNCrypt subtypes offered {subtypes:?}");
+    }
+    if !subtypes.contains(&X509_VNC) {
+        return Err(format!(
+            "server offers VeNCrypt subtypes {subtypes:?}, none of which vncfree can \
+             use. It needs X509Vnc (261): the TLS* subtypes authenticate with anonymous \
+             Diffie-Hellman, which cannot detect anyone sitting in the middle of the \
+             connection and which no current TLS library will do."
+        )
+        .into());
+    }
+    tcp.write_all(&X509_VNC.to_be_bytes())?;
+    // Unlike every other acknowledgement in RFB, *one* means success here.
+    if u8r(tcp)? != 1 {
+        return Err("server refused the X509Vnc subtype it had just offered".into());
+    }
+
+    crate::wire::client(tcp.try_clone()?)
+}
+
+/// Everything needed to open the connection again after it drops.
+pub struct Target {
+    pub addr: String,
+    pub user: String,
+    pub pass: String,
+}
+
+pub struct Vnc {
+    pub r: BufReader<crate::wire::WireRead>,
+    pub w: Writer,
+    pub screen: Screen,
+    pub name: String,
+    pub dec: Decoder,
+    pub clip: Clip,
+    /// Text the server sent us, waiting to go onto the Windows clipboard. The
+    /// clipboard handle itself is not held here because this struct moves between
+    /// threads on every reconnect.
+    pub pending_paste: Option<String>,
+    /// Ask for the next frame as soon as one starts arriving, rather than after it
+    /// has been decoded. Off for the one-shot PPM grab, which wants exactly one.
+    pub pipeline: bool,
+    /// The server is sending changes as they happen, so there is nothing to request.
+    pub continuous: bool,
+    /// Regions the last update actually touched, so only those need copying to the
+    /// thread that draws. Copying the whole framebuffer is 8MB at 1080p and 33MB at
+    /// 4K, every frame, most of it unchanged.
+    pub dirty: Vec<(usize, usize, usize, usize)>,
+    /// What we told the server we understand, kept so that asking for a different
+    /// monitor can say it again with one more entry.
+    pub encodings: Vec<i32>,
+}
+
+/// vncfree's pseudo-encodings for sharing one monitor out of several. RFB has no
+/// standard way to do it - ExtendedDesktopSize describes screens but cannot choose
+/// one - so these are our own.
+///
+/// A client lists MONITORS to say it understands the list; the server then sends one
+/// as a rectangle with this encoding. The client picks a monitor by sending its
+/// encodings again with `share(k)` added, which every other server ignores, so
+/// nothing new reaches a server that would choke on an unknown message type.
+// ponytail: numbers picked out of the air, not registered with anyone.
+pub const MONITORS: i32 = -0x7666_0000;
+
+/// The pseudo-encoding asking for monitor `k`, or all of them for 0.
+pub fn share(k: usize) -> i32 {
+    MONITORS - 1 - k as i32
+}
+
+/// Which monitor a pseudo-encoding asks for, if it is one of `share`'s.
+pub fn shared_monitor(enc: i32) -> Option<usize> {
+    let k = (MONITORS - 1).checked_sub(enc)?;
+    (0..64).contains(&k).then_some(k as usize)
+}
+
+/// A SetEncodings message.
+pub fn set_encodings(encodings: &[i32]) -> Vec<u8> {
+    let mut m = vec![2, 0];
+    m.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+    for e in encodings {
+        m.extend_from_slice(&e.to_be_bytes());
+    }
+    m
+}
+
+/// Ask the server to share monitor `k` (0 for all of them).
+pub fn share_monitor(w: &Writer, encodings: &[i32], k: usize) -> Res<()> {
+    let mut e = encodings.to_vec();
+    e.push(share(k));
+    send(w, &set_encodings(&e))
+}
+
+impl Vnc {
+    pub fn paste(&mut self, text: String) {
+        *self.clip.lock().unwrap() = text.clone();
+        self.pending_paste = Some(text);
+    }
+}
+
+impl Vnc {
+    /// `out` is the shared write half. It is published only once the handshake has
+    /// fully succeeded, so the UI thread can never write input into a half-open
+    /// connection. Handshake writes go direct to the socket and skip the lock.
+    pub fn connect(t: &Target, out: Writer, clip: Clip, cursor: SharedCursor) -> Res<Vnc> {
+        let (addr, username, password) = (&t.addr, &t.user, &t.pass);
+        // A bounded timeout, because the OS default is around twenty seconds of
+        // nothing at all if the address is wrong.
+        let resolved = addr
+            .to_socket_addrs()
+            .map_err(|e| format!("{addr:?} is not a usable address: {e}"))?
+            .next()
+            .ok_or_else(|| format!("{addr:?} did not resolve to anything"))?;
+        let mut tcp = TcpStream::connect_timeout(&resolved, std::time::Duration::from_secs(10))
+            .map_err(|e| format!("could not connect to {addr}: {e}"))?;
+        tcp.set_nodelay(true)?;
+
+        // Everything up to the security type is read straight off the socket rather
+        // than through a BufReader. A BufReader takes whatever has arrived, and if the
+        // security handshake is about to hand the connection over to TLS, bytes it read
+        // ahead into its own buffer are bytes the TLS session never sees.
+        //
+        // --- version handshake ---
+        let ver = String::from_utf8_lossy(&rd::<12>(&mut tcp)?)
+            .trim_end()
+            .to_string();
+        // Apple's Screen Sharing announces "RFB 003.889". Replying 003.008 makes it
+        // fall back to being a standard 3.8 server, so anything at or above 8 is
+        // answered with 8.
+        let minor: u32 = ver
+            .strip_prefix("RFB 003.")
+            .and_then(|m| m.parse().ok())
+            .ok_or_else(|| format!("not an RFB 3.x server: {ver:?}"))?;
+        // The reply is a choice, not an acknowledgement, and it may not exceed what the
+        // server offered: answering a 3.3 server with 3.8 is not a negotiation, it is a
+        // protocol error. Anything below 7 is 3.3, which is the floor.
+        let speak = match minor {
+            0..=6 => 3,
+            7 => 7,
+            _ => 8,
+        };
+        tcp.write_all(format!("RFB 003.{speak:03}\n").as_bytes())?;
+
+        // --- security handshake ---
+        let types = if speak == 3 {
+            // 3.3 has no negotiation at all: the server decides and says so in one
+            // word, and the client's only options are to go along with it or hang up.
+            match u32r(&mut tcp)? {
+                0 => return Err(format!("server refused connection: {}", text(&mut tcp)?).into()),
+                t @ (1 | 2) => vec![t as u8],
+                t => {
+                    return Err(format!(
+                        "server chose security type {t}, which RFB 3.3 does not define"
+                    )
+                    .into())
+                }
+            }
+        } else {
+            let n = u8r(&mut tcp)? as usize;
+            if n == 0 {
+                return Err(format!("server refused connection: {}", text(&mut tcp)?).into());
+            }
+            blob(&mut tcp, n)?
+        };
+        if debug() {
+            eprintln!(
+                "[debug] server version {ver:?}, answering 003.{speak:03}, \
+                 security types offered {types:?}"
+            );
+        }
+        let want_tls = env::var("VNC_TLS").unwrap_or_default() == "require";
+        // VeNCrypt first: it is the only one of these that encrypts anything.
+        let chosen = if types.contains(&19) {
+            19 // VeNCrypt: TLS, then one of the others inside it
+        } else if want_tls {
+            return Err(format!(
+                "VNC_TLS=require is set and this server does not offer VeNCrypt; it \
+                 offered security types {types:?}"
+            )
+            .into());
+        } else if types.contains(&1) {
+            1 // None
+        } else if types.contains(&2) {
+            2 // VNC auth: DES, 8-character passwords, no username
+        } else if types.contains(&30) {
+            30 // Apple Diffie-Hellman: what macOS Screen Sharing offers by default
+        } else {
+            return Err(format!("no supported security type in {types:?}").into());
+        };
+        if debug() {
+            eprintln!("[debug] chose security type {chosen}");
+        }
+        // 3.3 stated the type rather than offering one, so there is nothing to send
+        // back; a byte here would be read as the start of the next message.
+        if speak > 3 {
+            tcp.write_all(&[chosen])?;
+        }
+
+        // VeNCrypt hands the connection to TLS and then runs one of the ordinary
+        // security types inside it, so `chosen` becomes whatever that turns out to be.
+        let (reader, mut w, chosen) = if chosen == 19 {
+            let (r, w, print) = vencrypt(&mut tcp)?;
+            eprintln!("session encrypted; certificate {print}");
+            // Refuses the connection if this host has shown a different certificate
+            // before, so an interception that starts after the first connection does
+            // not go unnoticed.
+            crate::wire::check_known(addr, &print)?;
+            (r, w, 2)
+        } else {
+            let (r, w) = crate::wire::plain(tcp)?;
+            (r, w, chosen)
+        };
+        let mut r = BufReader::new(reader);
+
+        match chosen {
+            2 => {
+                if password.is_empty() {
+                    return Err("server wants a password; set VNC_PASSWORD".into());
+                }
+                vnc_auth(&mut r, &mut w, password)?;
+            }
+            30 => {
+                if username.is_empty() || password.is_empty() {
+                    return Err("this Mac authenticates against a macOS account; set \
+                                VNC_USERNAME and VNC_PASSWORD"
+                        .into());
+                }
+                apple_dh_auth(&mut r, &mut w, username, password)?;
+            }
+            _ => {}
+        }
+        // Before 3.8, a security type of None is followed by nothing at all - the
+        // initialisation phase starts immediately. Reading a SecurityResult that is
+        // never coming hangs the connection on a server that is waiting for us.
+        let expect_result = chosen != 1 || speak >= 8;
+        if expect_result && u32r(&mut r)? != 0 {
+            // The reason string arrived with 3.8. Older servers just hang up, so
+            // asking for one blocks until the socket closes.
+            let why = if speak >= 8 {
+                text(&mut r)?
+            } else {
+                format!("the server gave no reason (RFB 3.{speak} has nowhere to put one)")
+            };
+            if chosen == 30 {
+                return Err(format!(
+                    "authentication failed: {why}\n\
+                     The Diffie-Hellman exchange completed, so the Mac read our \
+                     credentials and refused them. A macOS account that logs in fine \
+                     locally is still refused here unless it is separately authorised \
+                     for remote access. On the Mac:\n\
+                     - grant access to every account:\n    \
+                     sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app\\\n      \
+                     /Contents/Resources/kickstart -configure -allowAccessFor -allUsers \
+                     -privs -all -restart -agent\n\
+                     - or System Settings > General > Sharing > Remote Management (or \
+                     Screen Sharing) > (i), add the account and tick Observe/Control\n\
+                     - use the account's short name (`whoami`), not its full name"
+                )
+                .into());
+            }
+            return Err(format!("authentication failed: {why}").into());
+        }
+
+        // --- init ---
+        w.write_all(&[1])?; // ClientInit, shared = yes
+        let width = u16r(&mut r)? as usize;
+        let height = u16r(&mut r)? as usize;
+        screen_size(width, height)?;
+        let _server_format = rd::<16>(&mut r)?;
+        let name = text(&mut r)?;
+        eprintln!("connected: {name:?} {width}x{height} (server said {ver:?})");
+
+        // Force our own pixel format so we never have to translate: 32bpp little-endian
+        // true colour, shifts 16/8/0 => each pixel reads back as 0x00RRGGBB.
+        let mut set_format = vec![0u8, 0, 0, 0]; // msg type 0 + 3 padding
+        set_format.extend_from_slice(&PIXEL_FORMAT);
+        w.write_all(&set_format)?;
+
+        // SetEncodings, most preferred first. Raw is always last so that a server
+        // supporting neither of the others still works - the fallback is automatic.
+        //
+        // Asking for exactly one of them is how "is it my decoder or the server?" gets
+        // answered, and how one encoding is checked against another: grab the same
+        // still screen twice and the two files must be byte-identical.
+        // ZRLE before Tight on purpose. A server offering both - TigerVNC does - keeps
+        // giving us lossless ZRLE, and Tight is there for the servers that do not speak
+        // ZRLE at all, where the fallback would otherwise be Raw. Tight is the only one
+        // that can arrive lossy, and only because a server chose to send JPEG.
+        let mut encodings: Vec<i32> = match env::var("VNC_ENCODING").unwrap_or_default().as_str() {
+            "raw" => {
+                eprintln!("VNC_ENCODING=raw: requesting Raw only");
+                vec![0]
+            }
+            "tight" => {
+                eprintln!("VNC_ENCODING=tight: requesting Tight only");
+                vec![7, 0]
+            }
+            "zrle" => {
+                eprintln!("VNC_ENCODING=zrle: requesting ZRLE only");
+                vec![16, 0]
+            }
+            "" => vec![16, 7, 1, 0], // ZRLE, Tight, CopyRect, Raw
+            other => {
+                return Err(format!("VNC_ENCODING={other:?}: expected raw, tight or zrle").into())
+            }
+        };
+
+        // The pseudo-encodings go on whatever was chosen above, because they are not
+        // encodings at all and the knob above is for isolating a *decoder*. Dropping
+        // them with it would mean testing Raw could not follow a resolution change.
+        //
+        //   -223 DesktopSize: how a server says the screen resolution changed. Without
+        //        asking, a server that changes size has no way to tell us and the
+        //        session is stuck at the old one.
+        //   -313 ContinuousUpdates: a server that supports it stops waiting to be asked
+        //        for each frame, which takes a round trip out of every one.
+        //   -239 CursorShape: the pointer's picture, so the client can draw it at the
+        //        local pointer position. Without it the server bakes the pointer into
+        //        the screen, and it cannot move until a whole round trip completes.
+        //   MONITORS: vncfree's own, below. Any other server ignores it.
+        encodings.extend_from_slice(&[-223, -313, MONITORS]);
+        if env::var("VNC_NO_CURSOR").is_err() {
+            encodings.push(-239);
+        } else {
+            eprintln!("VNC_NO_CURSOR set: letting the server draw the pointer");
+        }
+
+        // Asking for a quality level tells a Tight server it may send JPEG, which is
+        // lossy and much smaller. Unset means lossless, because a remote desktop is
+        // mostly text and JPEG makes a mess of text. The levels are pseudo-encodings
+        // -32 (worst) to -23 (best).
+        if let Ok(q) = env::var("VNC_QUALITY") {
+            let level: i32 = q
+                .parse()
+                .ok()
+                .filter(|l| (0..=9).contains(l))
+                .ok_or_else(|| format!("VNC_QUALITY={q:?}: expected 0 to 9"))?;
+            eprintln!("VNC_QUALITY={level}: allowing the server to send lossy JPEG");
+            encodings.push(-32 + level);
+        }
+        w.write_all(&set_encodings(&encodings))?;
+
+        let screen = Screen {
+            w: width,
+            h: height,
+            px: vec![0; width * height],
+        };
+        *out.lock().unwrap() = Some(w);
+        Ok(Vnc {
+            r,
+            w: out,
+            screen,
+            name,
+            dec: Decoder {
+                cursor,
+                ..Decoder::new()
+            },
+            clip,
+            pending_paste: None,
+            pipeline: false,
+            continuous: false,
+            dirty: Vec::new(),
+            encodings,
+        })
+    }
+
+    /// Ask the server to send changes as they happen instead of waiting to be asked
+    /// each time. Only sent once the server has said it supports this, by sending
+    /// EndOfContinuousUpdates of its own accord.
+    pub fn enable_continuous(&mut self) -> Res<()> {
+        let mut msg = vec![150u8, 1]; // 1 = enable
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&(self.screen.w as u16).to_be_bytes());
+        msg.extend_from_slice(&(self.screen.h as u16).to_be_bytes());
+        send(&self.w, &msg)?;
+        self.continuous = true;
+        if debug() {
+            eprintln!("[debug] continuous updates enabled; no longer asking per frame");
+        }
+        Ok(())
+    }
+
+    /// Ask for the whole screen. Incremental means "only what changed" - the server
+    /// holds the request open until something does, which is what paces our loop.
+    pub fn request(&mut self, incremental: bool) -> Res<()> {
+        let mut req = vec![3, incremental as u8];
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&(self.screen.w as u16).to_be_bytes());
+        req.extend_from_slice(&(self.screen.h as u16).to_be_bytes());
+        send(&self.w, &req)
+    }
+
+    /// Read one server message. Returns true if it was a framebuffer update, i.e.
+    /// the screen changed and is worth showing.
+    pub fn pump(&mut self) -> Res<bool> {
+        // Blocked here until the server has something to say. Separating this from the
+        // work that follows is the whole question: if this is never long, the server is
+        // always ahead of us, we are the bottleneck, and what is on screen is however
+        // far behind the queue has grown.
+        let t = std::time::Instant::now();
+        let msg = u8r(&mut self.r)?;
+        tick(&TIMING.wait_us, &TIMING.wait_max_us, t);
+        let work = std::time::Instant::now();
+        match msg {
+            0 => {
+                let _pad = u8r(&mut self.r)?;
+                let rects = u16r(&mut self.r)?;
+                // Ask for the next frame *now*, before decoding this one. Waiting
+                // until the update is decoded and copied leaves the server idle for
+                // all of that time, so every frame costs a round trip plus our own
+                // work rather than overlapping the two. With continuous updates there
+                // is nothing to ask for at all - the server is already sending.
+                if self.pipeline && !self.continuous {
+                    self.request(true)?;
+                }
+                self.dirty.clear();
+                for _ in 0..rects {
+                    let touched = self.dec.rect(&mut self.r, &mut self.screen)?;
+                    self.dirty.push(touched);
+                }
+                tick(&TIMING.work_us, &TIMING.work_max_us, work);
+                // How much of the screen this update actually redrew, which is how a
+                // server that resends everything for a one-character change gives
+                // itself away.
+                let px: usize = self.dirty.iter().map(|&(_, _, w, h)| w * h).sum();
+                TIMING.px.fetch_add(px as u64, Ordering::Relaxed);
+                TIMING.rects.fetch_add(rects as u64, Ordering::Relaxed);
+                // Something was typed or clicked and this is the first picture since.
+                let sent = INPUT_AT.swap(0, Ordering::Relaxed);
+                if sent != 0 {
+                    add(
+                        &TIMING.echo_us,
+                        &TIMING.echo_max_us,
+                        now_us().saturating_sub(sent),
+                    );
+                    TIMING.echoes.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(true)
+            }
+            1 => {
+                // SetColourMapEntries - we asked for true colour, so this is noise,
+                // but we still have to consume it to stay in sync with the stream.
+                blob(&mut self.r, 3)?;
+                let n = u16r(&mut self.r)? as usize;
+                blob(&mut self.r, n * 6)?;
+                Ok(false)
+            }
+            2 => Ok(false), // Bell, no body
+            150 => {
+                // EndOfContinuousUpdates. Unprompted, this is how a server announces it
+                // supports them at all; in reply to a disable it means the last update
+                // has been sent. Either way it carries no body.
+                if !self.continuous && env::var("VNC_NO_CONTINUOUS").is_err() {
+                    self.enable_continuous()?;
+                }
+                Ok(false)
+            }
+            3 => {
+                // ServerCutText: 3 padding, then a u32-prefixed Latin-1 string.
+                blob(&mut self.r, 3)?;
+                if let Some(text) = read_clipboard(&mut self.r)? {
+                    if debug() {
+                        eprintln!("[debug] clipboard <- server ({} bytes)", text.len());
+                    }
+                    self.paste(text);
+                }
+                Ok(false)
+            }
+            other => {
+                // A message whose length we do not know cannot be skipped, so this
+                // ends the session either way. Dump what follows first: an
+                // unrecognised type is exactly how a proprietary extension announces
+                // itself, and these bytes are the only record of it.
+                if debug() {
+                    let mut peek = [0u8; 64];
+                    let n = std::io::Read::read(&mut self.r, &mut peek).unwrap_or(0);
+                    eprintln!(
+                        "[debug] unknown server message type {other}, next {n} bytes: {:02x?}",
+                        &peek[..n]
+                    );
+                }
+                Err(format!("unexpected server message type {other}").into())
+            }
+        }
+    }
+}
+
+/// Longest clipboard this will type. At roughly a hundred characters a second a
+/// runaway paste is worse than no paste, and a clipboard this size is not something
+/// anyone meant to send through a keyboard.
+pub const MAX_TYPED: usize = 4000;
+
+/// Turn text into the keys needed to type it: each entry is a keysym and whether
+/// shift must be held for it.
+///
+/// This exists because macOS does not do clipboard over VNC at all - see
+/// docs/macos.md - so the only way to get text onto a Mac is to type it.
+///
+/// Shift is stated explicitly rather than left to the server. RFB says a keysym *is*
+/// the character, but a server that maps 'A' straight onto the A key without holding
+/// shift produces a lowercase 'a' - which is exactly what vncfree-server does, and
+/// probably not alone.
+pub fn typed_keys(text: &str) -> Vec<(u32, bool)> {
+    text.chars()
+        .filter(|c| *c != '\r') // CRLF arrives as one Return, not two
+        .map(|c| match c {
+            '\n' => (0xff0d, false), // Return
+            '\t' => (0xff09, false), // Tab
+            'A'..='Z' => (c as u32, true),
+            // Anything else goes as its own keysym. Servers that cannot map it to a
+            // key generally fall back to injecting the character directly, which
+            // handles punctuation and accents without a layout table here.
+            c if (c as u32) < 256 => (c as u32, false),
+            c => (0x0100_0000 + c as u32, false),
+        })
+        .collect()
+}
+
+/// KeyEvent (msg 4): down-flag, 2 padding, then the keysym big-endian.
+pub fn key_msg(sym: u32, down: bool) -> [u8; 8] {
+    let s = sym.to_be_bytes();
+    [4, down as u8, 0, 0, s[0], s[1], s[2], s[3]]
+}
+
+/// PointerEvent (msg 5): button mask, then x and y big-endian.
+pub fn pointer_msg(mask: u8, x: u16, y: u16) -> [u8; 6] {
+    let (x, y) = (x.to_be_bytes(), y.to_be_bytes());
+    [5, mask, x[0], x[1], y[0], y[1]]
+}
+
+/// Remembers the last clipboard text that crossed the link in either direction.
+/// Without it, text received from the server is immediately detected as a local
+/// clipboard change and sent straight back, and the two ends ping-pong forever.
+pub type Clip = Arc<Mutex<String>>;
+
+/// Where a session's time actually goes.
+///
+/// "Slow" on a remote desktop has several possible causes that feel identical from the
+/// outside, and reasoning about which one it is has a poor record. Every field here is
+/// recorded as a total *and* a worst case, because a stall is invisible in an average:
+/// three seconds of nothing followed by a burst averages out to something unremarkable.
+///
+/// The one that matters most is `gap`, the longest a single pass of the UI loop took.
+/// Keyboard input is only read when that loop runs, so however long it stalls for is
+/// exactly how late a keystroke is noticed - and this is measured, not deduced.
+#[derive(Default)]
+pub struct Timing {
+    pub loops: AtomicU64,
+    pub frames: AtomicU64,
+    pub gap_us: AtomicU64,
+    pub gap_max_us: AtomicU64,
+    pub blit_us: AtomicU64,
+    pub blit_max_us: AtomicU64,
+    pub ui_lock_us: AtomicU64,
+    pub ui_lock_max_us: AtomicU64,
+    pub input_us: AtomicU64,
+    pub decode_us: AtomicU64,
+    pub decode_max_us: AtomicU64,
+    /// Blocked waiting for the server to say something.
+    pub wait_us: AtomicU64,
+    pub wait_max_us: AtomicU64,
+    /// Turning the bytes of an update into pixels, once they have arrived.
+    pub work_us: AtomicU64,
+    pub work_max_us: AtomicU64,
+    /// Input to picture: the number the person at the keyboard actually feels.
+    pub echo_us: AtomicU64,
+    pub echo_max_us: AtomicU64,
+    pub echoes: AtomicU64,
+    /// Pixels redrawn and rectangles sent, to catch a server resending the world.
+    pub px: AtomicU64,
+    pub rects: AtomicU64,
+    /// Which encoding the server actually used, per rectangle.
+    pub enc_raw: AtomicU64,
+    pub enc_copy: AtomicU64,
+    pub enc_zrle: AtomicU64,
+    pub enc_tight: AtomicU64,
+    pub enc_other: AtomicU64,
+    pub copy_us: AtomicU64,
+    pub copy_max_us: AtomicU64,
+    pub net_lock_us: AtomicU64,
+    pub net_lock_max_us: AtomicU64,
+}
+
+pub static TIMING: Timing = Timing {
+    loops: AtomicU64::new(0),
+    frames: AtomicU64::new(0),
+    gap_us: AtomicU64::new(0),
+    gap_max_us: AtomicU64::new(0),
+    blit_us: AtomicU64::new(0),
+    blit_max_us: AtomicU64::new(0),
+    ui_lock_us: AtomicU64::new(0),
+    ui_lock_max_us: AtomicU64::new(0),
+    input_us: AtomicU64::new(0),
+    decode_us: AtomicU64::new(0),
+    decode_max_us: AtomicU64::new(0),
+    wait_us: AtomicU64::new(0),
+    wait_max_us: AtomicU64::new(0),
+    work_us: AtomicU64::new(0),
+    work_max_us: AtomicU64::new(0),
+    echo_us: AtomicU64::new(0),
+    echo_max_us: AtomicU64::new(0),
+    echoes: AtomicU64::new(0),
+    px: AtomicU64::new(0),
+    rects: AtomicU64::new(0),
+    enc_raw: AtomicU64::new(0),
+    enc_copy: AtomicU64::new(0),
+    enc_zrle: AtomicU64::new(0),
+    enc_tight: AtomicU64::new(0),
+    enc_other: AtomicU64::new(0),
+    copy_us: AtomicU64::new(0),
+    copy_max_us: AtomicU64::new(0),
+    net_lock_us: AtomicU64::new(0),
+    net_lock_max_us: AtomicU64::new(0),
+};
+
+/// Add one measurement to a total and its worst case.
+pub fn tick(total: &AtomicU64, max: &AtomicU64, at: std::time::Instant) -> u64 {
+    add(total, max, at.elapsed().as_micros() as u64)
+}
+
+pub fn add(total: &AtomicU64, max: &AtomicU64, us: u64) -> u64 {
+    total.fetch_add(us, Ordering::Relaxed);
+    max.fetch_max(us, Ordering::Relaxed);
+    us
+}
+
+/// Microseconds since this process started caring, for measuring across threads where
+/// an `Instant` cannot be shared through an atomic.
+pub fn now_us() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+        + 1
+}
+
+/// `VNC_TIMING=1` prints where each second went. Separate from VNC_DEBUG, which answers
+/// a different question - what was negotiated - and would be unreadable with two lines
+/// a second of measurements mixed into it.
+pub fn timing() -> bool {
+    env::var("VNC_TIMING").is_ok()
+}
+
+/// When the oldest input that has not yet produced a picture was sent, or 0.
+///
+/// This is the number the person at the keyboard actually experiences: press a key,
+/// wait, see it. Everything else here is a component of it.
+pub static INPUT_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Note that input has gone out, if nothing is already outstanding. Keeping the
+/// *oldest* unanswered one is deliberate: during a burst of typing the interesting
+/// question is how far behind the screen has fallen, not how recent the last key was.
+pub fn input_sent() {
+    let _ = INPUT_AT.compare_exchange(0, now_us(), Ordering::Relaxed, Ordering::Relaxed);
+}
+
+impl Timing {
+    /// Print the last second and start another. Averages are per occurrence; the `max`
+    /// column is the single worst one, which is where a stutter shows itself.
+    pub fn report(&self, secs: f64) {
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        let (loops, frames) = (take(&self.loops).max(1), take(&self.frames));
+        let per = |total: u64, n: u64| total as f64 / n.max(1) as f64 / 1000.0;
+        let ms = |a: &AtomicU64| take(a) as f64 / 1000.0;
+        eprintln!(
+            "[time] {:.0} ui/s, {:.0} fps | loop gap {:.1}/{:.0}ms | blit {:.1}/{:.0}ms | \
+             ui lock {:.1}/{:.0}ms | input {:.2}ms | decode {:.1}/{:.0}ms | \
+             copy {:.1}/{:.0}ms | net lock {:.1}/{:.0}ms | WAIT {:.1}/{:.0}ms | \
+             WORK {:.1}/{:.0}ms | {:.0}kpx/frame in {:.1} rects | ECHO {:.0}/{:.0}ms x{}   (avg/max)",
+            loops as f64 / secs,
+            frames as f64 / secs,
+            per(take(&self.gap_us), loops),
+            ms(&self.gap_max_us),
+            per(take(&self.blit_us), loops),
+            ms(&self.blit_max_us),
+            per(take(&self.ui_lock_us), loops),
+            ms(&self.ui_lock_max_us),
+            per(take(&self.input_us), loops),
+            per(take(&self.decode_us), frames),
+            ms(&self.decode_max_us),
+            per(take(&self.copy_us), frames),
+            ms(&self.copy_max_us),
+            per(take(&self.net_lock_us), frames),
+            ms(&self.net_lock_max_us),
+            per(take(&self.wait_us), frames),
+            ms(&self.wait_max_us),
+            per(take(&self.work_us), frames),
+            ms(&self.work_max_us),
+            take(&self.px) as f64 / frames.max(1) as f64 / 1000.0,
+            take(&self.rects) as f64 / frames.max(1) as f64,
+            {
+                let n = take(&self.echoes);
+                self.echoes.store(n, Ordering::Relaxed);
+                per(take(&self.echo_us), n)
+            },
+            ms(&self.echo_max_us),
+            take(&self.echoes),
+        );
+        let bytes = crate::wire::BYTES_IN.swap(0, Ordering::Relaxed);
+        eprintln!(
+            "[time]   {:.2} MB/s off the wire ({:.0} KB/frame) | encodings: raw {} copyrect {} zrle {} tight {} other {}",
+            bytes as f64 / secs / 1_000_000.0,
+            bytes as f64 / frames.max(1) as f64 / 1000.0,
+            take(&self.enc_raw),
+            take(&self.enc_copy),
+            take(&self.enc_zrle),
+            take(&self.enc_tight),
+            take(&self.enc_other),
+        );
+    }
+}
+
+// ---------------------------------------------------------------- decoding
+
+/// The largest screen this will agree to hold, in pixels. Both dimensions arrive as
+/// `u16` from the server, so without a limit a claimed 65535x65535 desktop is a
+/// seventeen-gigabyte allocation for the price of four bytes. Well past any real wall
+/// of monitors, and far short of what a hostile server would ask for.
+pub const MAX_PIXELS: usize = 64 * 1024 * 1024;
+
+/// Check a screen size the far end asked for before allocating it.
+pub fn screen_size(w: usize, h: usize) -> Res<()> {
+    if w == 0 || h == 0 || w * h > MAX_PIXELS {
+        return Err(format!("server claims a {w}x{h} screen, which is not a screen").into());
+    }
+    Ok(())
+}
+
+/// The largest pointer this will accept, per side. Cursors are small, and the same
+/// `u16` reasoning applies as for the screen above.
+pub const MAX_CURSOR: usize = 256;
+
+/// The pointer's picture, drawn locally so it tracks the mouse without waiting for the
+/// server. `px` holds only the visible pixels; `on` says which those are.
+#[derive(Clone, Default)]
+pub struct Cursor {
+    pub w: usize,
+    pub h: usize,
+    pub hot_x: usize,
+    pub hot_y: usize,
+    pub px: Vec<u32>,
+    pub on: Vec<bool>,
+}
+
+/// Read a CursorShape rectangle: the pixels, then one bit per pixel saying which of
+/// them to draw, most significant first with each row padded to a byte.
+pub fn read_cursor(
+    r: &mut impl Read,
+    hot_x: usize,
+    hot_y: usize,
+    w: usize,
+    h: usize,
+) -> Res<Cursor> {
+    if w == 0 || h == 0 {
+        // A zero-sized shape means the pointer is hidden.
+        return Ok(Cursor::default());
+    }
+    if w > MAX_CURSOR || h > MAX_CURSOR {
+        return Err(format!("server sent a {w}x{h} pointer, which is not a pointer").into());
+    }
+    let data = blob(r, w * h * 4)?;
+    let mask = blob(r, w.div_ceil(8) * h)?;
+    let stride = w.div_ceil(8);
+    let mut px = vec![0u32; w * h];
+    let mut on = vec![false; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            let i = row * w + col;
+            let p = i * 4;
+            px[i] = (data[p + 2] as u32) << 16 | (data[p + 1] as u32) << 8 | data[p] as u32;
+            on[i] = mask[row * stride + col / 8] >> (7 - col % 8) & 1 != 0;
+        }
+    }
+    Ok(Cursor {
+        w,
+        h,
+        hot_x,
+        hot_y,
+        px,
+        on,
+    })
+}
+
+impl Cursor {
+    /// Whether there is a shape to draw at all. A server that never sends one, or that
+    /// says the pointer is hidden, leaves the local one to do its job.
+    pub fn visible(&self) -> bool {
+        self.w > 0 && self.h > 0
+    }
+
+    /// Paint the pointer into a framebuffer at a position, saving what was underneath so
+    /// the caller can put it back. Clipped, because the pointer is routinely half off
+    /// the edge of the screen.
+    pub fn draw(&self, s: &mut Screen, at_x: i32, at_y: i32, under: &mut Vec<u32>) {
+        under.clear();
+        if self.w == 0 {
+            return;
+        }
+        let x0 = at_x - self.hot_x as i32;
+        let y0 = at_y - self.hot_y as i32;
+        for row in 0..self.h {
+            for col in 0..self.w {
+                let (x, y) = (x0 + col as i32, y0 + row as i32);
+                if x < 0 || y < 0 || x >= s.w as i32 || y >= s.h as i32 {
+                    continue;
+                }
+                let i = y as usize * s.w + x as usize;
+                let c = row * self.w + col;
+                if !self.on[c] {
+                    continue;
+                }
+                under.push(i as u32);
+                under.push(s.px[i]);
+                s.px[i] = self.px[c];
+            }
+        }
+    }
+}
+
+/// Put back what `draw` painted over, so the framebuffer the server owns never has a
+/// pointer in it.
+pub fn restore(s: &mut Screen, under: &mut Vec<u32>) {
+    for &[i, p] in under.as_chunks::<2>().0 {
+        if let Some(px) = s.px.get_mut(i as usize) {
+            *px = p;
+        }
+    }
+    under.clear();
+}
+
+/// A Tight pixel. Three bytes, and - unlike ZRLE's CPIXEL, which keeps the byte order
+/// of the pixel format - the spec states these are red, green and blue in that order.
+/// Reusing the CPIXEL reader here swaps every red and blue on screen.
+pub fn tpixel(r: &mut impl Read) -> Res<u32> {
+    let b = rd::<3>(r)?;
+    Ok((b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32)
+}
+
+/// Tight's own length format: seven bits per byte, low group first, with the top bit
+/// meaning another byte follows. Three bytes at most.
+pub fn compact_len(r: &mut impl Read) -> Res<usize> {
+    let b0 = u8r(r)? as usize;
+    let mut len = b0 & 0x7f;
+    if b0 & 0x80 != 0 {
+        let b1 = u8r(r)? as usize;
+        len |= (b1 & 0x7f) << 7;
+        if b1 & 0x80 != 0 {
+            len |= (u8r(r)? as usize) << 14;
+        }
+    }
+    Ok(len)
+}
+
+/// Pull the next block out of a zlib stream that spans the whole connection.
+pub fn inflate(z: &mut flate2::Decompress, input: &[u8], expect: usize) -> Res<Vec<u8>> {
+    let mut out = Vec::with_capacity(expect + 4096);
+    let mut consumed = 0;
+    loop {
+        // decompress_vec only writes into spare capacity; it never grows the Vec.
+        if out.len() == out.capacity() {
+            out.reserve(expect.max(4096));
+        }
+        let (in0, out0) = (z.total_in(), z.total_out());
+        z.decompress_vec(&input[consumed..], &mut out, flate2::FlushDecompress::None)?;
+        consumed += (z.total_in() - in0) as usize;
+        // No input taken and no output produced means the stream is drained.
+        if z.total_in() == in0 && z.total_out() == out0 {
+            return Ok(out);
+        }
+    }
+}
+
+/// A ZRLE "compressed pixel". Our pixel format puts all the colour in the low 3
+/// bytes, so CPIXELs drop the unused fourth byte: little-endian B, G, R.
+pub fn cpixel(r: &mut impl Read) -> Res<u32> {
+    let b = rd::<3>(r)?;
+    Ok((b[2] as u32) << 16 | (b[1] as u32) << 8 | b[0] as u32)
+}
+
+/// A ZRLE run length: one more than the sum of the bytes, where 255 means "keep
+/// reading". So a run of 256 arrives as 255, 0.
+pub fn run_len(r: &mut impl Read) -> Res<usize> {
+    let mut len = 1usize;
+    loop {
+        let b = u8r(r)?;
+        len += b as usize;
+        if b != 255 {
+            return Ok(len);
+        }
+    }
+}
+
+/// The pointer's picture, shared with the thread that draws. Set by the network thread
+/// when the server sends a new shape, read by the UI thread every frame.
+pub type SharedCursor = Arc<Mutex<Cursor>>;
+
+pub struct Decoder {
+    /// Where a new pointer shape gets published to the drawing thread.
+    pub cursor: SharedCursor,
+    /// ZRLE's zlib stream spans the whole connection, not one rectangle. Resetting
+    /// it per rectangle decodes the first one and then produces garbage forever.
+    pub zlib: flate2::Decompress,
+    /// Tight has four of them, also spanning the connection, and the server picks one
+    /// per rectangle and restarts whichever it likes. Four rather than one so that
+    /// different kinds of content each keep a dictionary suited to them.
+    pub tight: [flate2::Decompress; 4],
+    /// The server's monitors, as width and height, numbered from 1. Empty unless the
+    /// server is vncfree-server, which is the only one that says.
+    pub monitors: Vec<(usize, usize)>,
+    /// Which of them is being shared: 1 and up, or 0 for all of them as one screen.
+    pub monitor: usize,
+}
+
+impl Decoder {
+    fn new() -> Decoder {
+        Decoder {
+            cursor: SharedCursor::default(),
+            zlib: flate2::Decompress::new(true),
+            tight: std::array::from_fn(|_| flate2::Decompress::new(true)),
+            monitors: Vec::new(),
+            monitor: 0,
+        }
+    }
+
+    /// Decode one rectangle, returning the region of the framebuffer it changed.
+    pub fn rect(&mut self, r: &mut impl Read, s: &mut Screen) -> Res<(usize, usize, usize, usize)> {
+        let x = u16r(r)? as usize;
+        let y = u16r(r)? as usize;
+        let w = u16r(r)? as usize;
+        let h = u16r(r)? as usize;
+        let enc = i32r(r)?;
+        // DesktopSize is not a picture: the rectangle header carries the screen's new
+        // size and there is no body. It has to be handled before the bounds check,
+        // since a screen that grew is by definition outside the old framebuffer.
+        // CursorShape is not a picture either: the position fields carry the hot spot
+        // and the body is the pointer's own bitmap, so it must be handled before the
+        // bounds check, which it would fail for a cursor near the right or bottom edge.
+        if enc == -239 {
+            *self.cursor.lock().unwrap() = read_cursor(r, x, y, w, h)?;
+            if debug() {
+                eprintln!("[debug] new pointer shape {w}x{h}, hot spot {x},{y}");
+            }
+            // Nothing on the framebuffer changed.
+            return Ok((0, 0, 0, 0));
+        }
+        // The monitor list is not a picture either. The header carries which one is
+        // shared and how many there are; the body is each one's size.
+        if enc == MONITORS {
+            self.monitor = x;
+            self.monitors = (0..w)
+                .map(|_| Ok((u16r(r)? as usize, u16r(r)? as usize)))
+                .collect::<Res<_>>()?;
+            return Ok((0, 0, 0, 0));
+        }
+        if enc == -223 {
+            if debug() {
+                eprintln!("[debug] remote resolution is now {w}x{h}");
+            }
+            screen_size(w, h)?;
+            s.w = w;
+            s.h = h;
+            s.px = vec![0; w * h];
+            return Ok((0, 0, w, h));
+        }
+        if x + w > s.w || y + h > s.h {
+            return Err(format!("rect {x},{y} {w}x{h} outside {}x{} framebuffer", s.w, s.h).into());
+        }
+        // Which encoding a server actually chose, and how much screen it redrew with
+        // it. A full screen as Raw is eight megabytes; the same screen as ZRLE is a
+        // couple of hundred kilobytes, and the difference between those two is the
+        // difference between a usable session and an unusable one.
+        let slot = match enc {
+            0 => &TIMING.enc_raw,
+            1 => &TIMING.enc_copy,
+            7 => &TIMING.enc_tight,
+            16 => &TIMING.enc_zrle,
+            _ => &TIMING.enc_other,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+        self.decode(r, s, x, y, w, h, enc)?;
+        Ok((x, y, w, h))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        enc: i32,
+    ) -> Res<()> {
+        match enc {
+            0 => self.raw(r, s, x, y, w, h),
+            1 => self.copy_rect(r, s, x, y, w, h),
+            7 => self.tight(r, s, x, y, w, h),
+            16 => self.zrle(r, s, x, y, w, h),
+            _ => {
+                // Anything else carries a body whose length only that encoding
+                // defines, so the stream cannot be resynchronised. Record it first.
+                if debug() {
+                    let mut peek = [0u8; 64];
+                    let n = std::io::Read::read(r, &mut peek).unwrap_or(0);
+                    eprintln!(
+                        "[debug] encoding {enc}: rect {x},{y} {w}x{h}, next {n} bytes: {:02x?}",
+                        &peek[..n]
+                    );
+                }
+                Err(format!("encoding {enc} not implemented").into())
+            }
+        }
+    }
+
+    pub fn raw(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
+        let data = blob(r, w * h * 4)?;
+        for row in 0..h {
+            for col in 0..w {
+                let p = (row * w + col) * 4;
+                // Little-endian 32bpp with shifts 16/8/0 => bytes are B,G,R,pad.
+                let rgb = (data[p + 2] as u32) << 16 | (data[p + 1] as u32) << 8 | data[p] as u32;
+                s.px[(y + row) * s.w + x + col] = rgb;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy a block already on screen somewhere else - what a server sends when you
+    /// drag a window or scroll. Source and destination overlap constantly, so the
+    /// rows go via a scratch buffer rather than being copied in place.
+    pub fn copy_rect(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
+        let sx = u16r(r)? as usize;
+        let sy = u16r(r)? as usize;
+        if sx + w > s.w || sy + h > s.h {
+            return Err(format!("copyrect source {sx},{sy} {w}x{h} is off-screen").into());
+        }
+        let mut tmp = Vec::with_capacity(w * h);
+        for row in 0..h {
+            let o = (sy + row) * s.w + sx;
+            tmp.extend_from_slice(&s.px[o..o + w]);
+        }
+        for row in 0..h {
+            let o = (y + row) * s.w + x;
+            s.px[o..o + w].copy_from_slice(&tmp[row * w..(row + 1) * w]);
+        }
+        Ok(())
+    }
+
+    /// Feed one rectangle's bytes through the connection-wide zlib stream.
+    /// Tight (encoding 7), which is what most third-party servers reach for first.
+    ///
+    /// The rectangle opens with one control byte: the low nibble restarts any of the
+    /// four zlib streams, and the high nibble says what follows.
+    pub fn tight(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
+        let ctl = u8r(r)?;
+        for (i, z) in self.tight.iter_mut().enumerate() {
+            if ctl & (1 << i) != 0 {
+                z.reset(true);
+            }
+        }
+        if debug() {
+            // Which form a server actually chose is otherwise invisible, and a decoder
+            // can look correct simply by never being handed the hard cases.
+            let what = match ctl >> 4 {
+                0x08 => "fill".to_string(),
+                0x09 => "jpeg".to_string(),
+                t if t >= 0x0a => format!("bad type {t:#x}"),
+                t if t & 0x04 == 0 => format!("basic copy, stream {}", t & 3),
+                t => format!("basic filtered, stream {}", t & 3),
+            };
+            eprintln!("[debug] tight {w}x{h}: {what}");
+        }
+        match ctl >> 4 {
+            // Fill: one colour for the whole rectangle, and no compression involved.
+            0x08 => {
+                let c = tpixel(r)?;
+                for row in 0..h {
+                    let o = (y + row) * s.w + x;
+                    s.px[o..o + w].fill(c);
+                }
+                Ok(())
+            }
+            0x09 => self.tight_jpeg(r, s, x, y, w, h),
+            // 0x0A is TightPng, which is a different encoding number and not this one.
+            t @ 0x0a.. => {
+                Err(format!("tight compression type {t:#x} is not part of the encoding").into())
+            }
+            t => {
+                let stream = (t & 0x03) as usize;
+                // Without the flag the filter is Copy, and no byte is sent for it.
+                let filter = if t & 0x04 != 0 { u8r(r)? } else { 0 };
+                self.tight_basic(r, s, x, y, w, h, stream, filter)
+            }
+        }
+    }
+
+    /// The compressed forms: raw pixels, a palette, or a gradient prediction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tight_basic(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        stream: usize,
+        filter: u8,
+    ) -> Res<()> {
+        // The palette itself is *not* compressed. It sits between the filter byte and
+        // the compressed block, so it has to be read before the length is known.
+        let palette = match filter {
+            1 => {
+                let n = u8r(r)? as usize + 1;
+                let mut p = Vec::with_capacity(n);
+                for _ in 0..n {
+                    p.push(tpixel(r)?);
+                }
+                Some(p)
+            }
+            0 | 2 => None,
+            f => {
+                return Err(
+                    format!("tight filter {f} is not one of copy, palette or gradient").into(),
+                )
+            }
+        };
+
+        let expect = match &palette {
+            // Two colours are packed one bit per pixel, each row padded to a byte.
+            Some(p) if p.len() == 2 => w.div_ceil(8) * h,
+            Some(_) => w * h,
+            None => w * h * 3,
+        };
+
+        // Below a dozen bytes the server does not bother compressing, and sends no
+        // length either - the rectangle's size already says how much there is.
+        let data = if expect < 12 {
+            blob(r, expect)?
+        } else {
+            let n = compact_len(r)?;
+            let z = blob(r, n)?;
+            inflate(&mut self.tight[stream], &z, expect)?
+        };
+        if data.len() < expect {
+            return Err(format!("tight rect wanted {expect} bytes, got {}", data.len()).into());
+        }
+
+        match &palette {
+            Some(pal) if pal.len() == 2 => {
+                let stride = w.div_ceil(8);
+                for row in 0..h {
+                    for col in 0..w {
+                        let bit = data[row * stride + col / 8] >> (7 - col % 8) & 1;
+                        s.px[(y + row) * s.w + x + col] = pal[bit as usize];
+                    }
+                }
+            }
+            Some(pal) => {
+                for row in 0..h {
+                    for col in 0..w {
+                        let i = data[row * w + col] as usize;
+                        let c = pal
+                            .get(i)
+                            .ok_or_else(|| format!("tight palette index {i} of {}", pal.len()))?;
+                        s.px[(y + row) * s.w + x + col] = *c;
+                    }
+                }
+            }
+            // Gradient: each component is predicted from the pixels to the left, above
+            // and above-left, and what arrives is the difference from that prediction.
+            None if filter == 2 => {
+                let (mut prev, mut cur) = (vec![0u8; w * 3], vec![0u8; w * 3]);
+                for row in 0..h {
+                    for col in 0..w {
+                        for c in 0..3 {
+                            let left = if col > 0 {
+                                cur[(col - 1) * 3 + c] as i32
+                            } else {
+                                0
+                            };
+                            let up = prev[col * 3 + c] as i32;
+                            let upleft = if col > 0 {
+                                prev[(col - 1) * 3 + c] as i32
+                            } else {
+                                0
+                            };
+                            let guess = (left + up - upleft).clamp(0, 255);
+                            // Wrapping on purpose: the difference was taken mod 256.
+                            cur[col * 3 + c] = (data[(row * w + col) * 3 + c] as i32 + guess) as u8;
+                        }
+                        s.px[(y + row) * s.w + x + col] = (cur[col * 3] as u32) << 16
+                            | (cur[col * 3 + 1] as u32) << 8
+                            | cur[col * 3 + 2] as u32;
+                    }
+                    std::mem::swap(&mut prev, &mut cur);
+                }
+            }
+            // Copy: the pixels as they are.
+            None => {
+                for row in 0..h {
+                    for col in 0..w {
+                        let p = (row * w + col) * 3;
+                        s.px[(y + row) * s.w + x + col] =
+                            (data[p] as u32) << 16 | (data[p + 1] as u32) << 8 | data[p + 2] as u32;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A JPEG image covering the rectangle. This is the one lossy thing vncfree will
+    /// display, and only ever because a server chose to send it.
+    pub fn tight_jpeg(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
+        let n = compact_len(r)?;
+        let data = blob(r, n)?;
+        let mut dec = jpeg_decoder::Decoder::new(&data[..]);
+        let px = dec.decode()?;
+        let info = dec.info().ok_or("a JPEG rectangle with no header")?;
+        if info.width as usize != w || info.height as usize != h {
+            return Err(format!(
+                "JPEG is {}x{} but the rectangle is {w}x{h}",
+                info.width, info.height
+            )
+            .into());
+        }
+        // Servers send colour, but a greyscale JPEG is legal and cheap to allow for.
+        let step = match info.pixel_format {
+            jpeg_decoder::PixelFormat::RGB24 => 3,
+            jpeg_decoder::PixelFormat::L8 => 1,
+            f => return Err(format!("JPEG pixel format {f:?} is not supported").into()),
+        };
+        for row in 0..h {
+            for col in 0..w {
+                let p = (row * w + col) * step;
+                let (r8, g8, b8) = if step == 3 {
+                    (px[p], px[p + 1], px[p + 2])
+                } else {
+                    (px[p], px[p], px[p])
+                };
+                s.px[(y + row) * s.w + x + col] = (r8 as u32) << 16 | (g8 as u32) << 8 | b8 as u32;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn zrle(
+        &mut self,
+        r: &mut impl Read,
+        s: &mut Screen,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Res<()> {
+        let n = u32r(r)? as usize;
+        let compressed = blob(r, n)?;
+        let data = inflate(&mut self.zlib, &compressed, w * h * 3)?;
+        let mut d: &[u8] = &data;
+        // 64x64 tiles in raster order; the right and bottom edges may be smaller.
+        for ty in (0..h).step_by(64) {
+            for tx in (0..w).step_by(64) {
+                let tw = (w - tx).min(64);
+                let th = (h - ty).min(64);
+                zrle_tile(&mut d, s, x + tx, y + ty, tw, th)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One ZRLE tile. The leading byte says how it is encoded: bit 7 means RLE, and the
+/// low 7 bits are the palette size (0 meaning no palette).
+pub fn zrle_tile(
+    r: &mut impl Read,
+    s: &mut Screen,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Res<()> {
+    let sub = u8r(r)?;
+    let rle = sub & 0x80 != 0;
+    let palette_size = (sub & 0x7f) as usize;
+    let mut put = |i: usize, c: u32| s.px[(y + i / w) * s.w + x + i % w] = c;
+
+    match (rle, palette_size) {
+        // Raw tile.
+        (false, 0) => {
+            for i in 0..w * h {
+                put(i, cpixel(r)?);
+            }
+        }
+        // Solid tile: a single colour.
+        (false, 1) => {
+            let c = cpixel(r)?;
+            for i in 0..w * h {
+                put(i, c);
+            }
+        }
+        // Packed palette: indices bit-packed MSB-first, each row padded to a byte.
+        (false, 2..=16) => {
+            let pal = read_palette(r, palette_size)?;
+            let bits = match palette_size {
+                2 => 1,
+                3..=4 => 2,
+                _ => 4,
+            };
+            for row in 0..h {
+                let line = blob(r, (w * bits).div_ceil(8))?;
+                for col in 0..w {
+                    let bit = col * bits;
+                    let idx = (line[bit / 8] >> (8 - bits - bit % 8)) & ((1 << bits) - 1);
+                    let c = *pal
+                        .get(idx as usize)
+                        .ok_or("ZRLE palette index out of range")?;
+                    put(row * w + col, c);
+                }
+            }
+        }
+        // Plain RLE: colour then run length, runs flow across rows.
+        (true, 0) => {
+            let mut i = 0;
+            while i < w * h {
+                let c = cpixel(r)?;
+                let n = run_len(r)?;
+                if i + n > w * h {
+                    return Err("ZRLE run overruns its tile".into());
+                }
+                for _ in 0..n {
+                    put(i, c);
+                    i += 1;
+                }
+            }
+        }
+        // Palette RLE: an index byte, and the high bit marks a run rather than one pixel.
+        (true, 2..=127) => {
+            let pal = read_palette(r, palette_size)?;
+            let mut i = 0;
+            while i < w * h {
+                let b = u8r(r)?;
+                let c = *pal
+                    .get((b & 0x7f) as usize)
+                    .ok_or("ZRLE palette index out of range")?;
+                let n = if b & 0x80 != 0 { run_len(r)? } else { 1 };
+                if i + n > w * h {
+                    return Err("ZRLE run overruns its tile".into());
+                }
+                for _ in 0..n {
+                    put(i, c);
+                    i += 1;
+                }
+            }
+        }
+        _ => return Err(format!("invalid ZRLE subencoding {sub}").into()),
+    }
+    Ok(())
+}
+
+pub fn read_palette(r: &mut impl Read, n: usize) -> Res<Vec<u32>> {
+    (0..n).map(|_| cpixel(r)).collect()
+}
+
+pub fn write_ppm(path: &str, s: &Screen) -> Res<()> {
+    let mut f = BufWriter::new(File::create(path)?);
+    write!(f, "P6\n{} {}\n255\n", s.w, s.h)?;
+    let mut buf = Vec::with_capacity(s.px.len() * 3);
+    for p in &s.px {
+        buf.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
+    }
+    f.write_all(&buf)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{cut_text_msg, from_latin1};
+
+    /// 1024-bit MODP group (RFC 2409 group 2) - same 128-byte key length a Mac uses.
+    const MODP_1024: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
+        29024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6D\
+        F25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
+        EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF";
+
+    /// Proves the primitives are wired up right, independently of the protocol.
+    /// AES vector is FIPS-197 C.1; MD5 vector is RFC 1321.
+    #[test]
+    fn crypto_primitives_match_published_vectors() {
+        let key: [u8; 16] = (0u8..16).collect::<Vec<_>>().try_into().unwrap();
+        let mut block = GenericArray::clone_from_slice(&[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        Aes128::new(&key.into()).encrypt_block(&mut block);
+        assert_eq!(
+            block[..],
+            [
+                0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+                0xc5, 0x5a
+            ]
+        );
+        let md5: [u8; 16] = Md5::digest(b"abc").into();
+        assert_eq!(
+            md5,
+            [
+                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1,
+                0x7f, 0x72
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_width_padding_and_credential_fields() {
+        assert_eq!(pad_be(&BigUint::from(1u32), 4), [0, 0, 0, 1]);
+        assert_eq!(pad_be(&BigUint::from(0u32), 3), [0, 0, 0]);
+        assert_eq!(pad_be(&BigUint::from(0x1234u32), 2), [0x12, 0x34]);
+
+        // The field keeps its random fill after the null terminator.
+        let mut f = [0xAAu8; 8];
+        write_cstr(&mut f, "hi", "username").unwrap();
+        assert_eq!(f, [b'h', b'i', 0, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+        // A string that would fill the field leaves no room for the terminator.
+        assert!(write_cstr(&mut [0u8; 4], "abcd", "username").is_err());
+        assert!(write_cstr(&mut [0u8; 4], "abc", "username").is_ok());
+    }
+
+    /// Stands in for the Mac: plays the server side of the exchange, then decrypts
+    /// what we sent and checks the credentials come back out intact. This verifies
+    /// the DH maths, the MD5-to-AES key derivation and the blob layout. It cannot
+    /// verify Apple's field order, which is taken from the protocol description.
+    #[test]
+    fn apple_dh_round_trip_recovers_the_credentials() {
+        use aes::cipher::BlockDecrypt;
+
+        let p = BigUint::parse_bytes(MODP_1024.as_bytes(), 16).unwrap();
+        let key_len = 128usize;
+        assert_eq!(p.to_bytes_be().len(), key_len, "prime transcribed wrong");
+
+        let server_priv = BigUint::from(0x0123_4567_89ABu64);
+        let server_pub = BigUint::from(2u32).modpow(&server_priv, &p);
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&2u16.to_be_bytes()); // generator
+        msg.extend_from_slice(&(key_len as u16).to_be_bytes());
+        msg.extend_from_slice(&pad_be(&p, key_len));
+        msg.extend_from_slice(&pad_be(&server_pub, key_len));
+
+        let mut out = Vec::new();
+        apple_dh_auth(&mut &msg[..], &mut out, "alice", "hunter2").unwrap();
+        assert_eq!(out.len(), 128 + key_len, "blob then public key");
+
+        // Server side: derive the same key from our public key and decrypt.
+        let (ciphertext, client_pub) = out.split_at(128);
+        let shared = BigUint::from_bytes_be(client_pub).modpow(&server_priv, &p);
+        let key: [u8; 16] = Md5::digest(pad_be(&shared, key_len)).into();
+        let cipher = Aes128::new(&key.into());
+        let mut plain = ciphertext.to_vec();
+        for block in plain.chunks_mut(16) {
+            let mut b = GenericArray::clone_from_slice(block);
+            cipher.decrypt_block(&mut b);
+            block.copy_from_slice(&b);
+        }
+
+        let field = |f: &[u8]| {
+            String::from_utf8(f[..f.iter().position(|&c| c == 0).unwrap()].to_vec()).unwrap()
+        };
+        assert_eq!(field(&plain[..64]), "alice");
+        assert_eq!(field(&plain[64..]), "hunter2");
+    }
+
+    /// Two runs must differ: the private key and the blob padding are random, so
+    /// identical output would mean the CSPRNG is not being used at all.
+    #[test]
+    fn apple_dh_output_is_not_deterministic() {
+        let p = BigUint::parse_bytes(MODP_1024.as_bytes(), 16).unwrap();
+        let key_len = 128usize;
+        let server_pub = BigUint::from(2u32).modpow(&BigUint::from(99u32), &p);
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&2u16.to_be_bytes());
+        msg.extend_from_slice(&(key_len as u16).to_be_bytes());
+        msg.extend_from_slice(&pad_be(&p, key_len));
+        msg.extend_from_slice(&pad_be(&server_pub, key_len));
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        apple_dh_auth(&mut &msg[..], &mut a, "alice", "hunter2").unwrap();
+        apple_dh_auth(&mut &msg[..], &mut b, "alice", "hunter2").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn raw_rect_lands_at_the_right_offset() {
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
+        #[rustfmt::skip]
+        let bytes: [u8; 16] = [
+            0, 1,  0, 1,          // x=1, y=1
+            0, 1,  0, 1,          // w=1, h=1
+            0, 0, 0, 0,           // encoding = Raw
+            0xAA, 0xBB, 0xCC, 0,  // one pixel: B, G, R, pad
+        ];
+        Decoder::new().rect(&mut &bytes[..], &mut s).unwrap();
+        assert_eq!(s.px, vec![0, 0, 0, 0x00CC_BBAA]);
+    }
+
+    /// B, G, R - a CPIXEL, which is a pixel minus the unused fourth byte.
+    fn cp(c: u32) -> [u8; 3] {
+        [c as u8, (c >> 8) as u8, (c >> 16) as u8]
+    }
+
+    /// Run `payload` through a zlib stream and wrap it as ZRLE rectangles. Returns
+    /// one encoded rectangle per payload, all sharing a single zlib stream, which is
+    /// what a real server does.
+    fn zrle_rects(dims: (usize, usize), payloads: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut c = flate2::Compress::new(flate2::Compression::default(), true);
+        let mut out = Vec::new();
+        for payload in payloads {
+            // Capacity is ample for these small payloads, so each step needs one call.
+            // Note the flush must happen exactly once: calling Sync repeatedly emits a
+            // fresh sync marker every time and never reports "done".
+            let mut z = Vec::with_capacity(payload.len() * 2 + 1024);
+            let mut consumed = 0;
+            while consumed < payload.len() {
+                let in0 = c.total_in();
+                c.compress_vec(&payload[consumed..], &mut z, flate2::FlushCompress::None)
+                    .unwrap();
+                consumed += (c.total_in() - in0) as usize;
+                assert!(c.total_in() > in0, "compressor stalled on input");
+            }
+            c.compress_vec(&[], &mut z, flate2::FlushCompress::Sync)
+                .unwrap();
+            assert!(
+                z.len() < z.capacity(),
+                "flush filled the buffer; reserve more"
+            );
+            let mut m = Vec::new();
+            m.extend_from_slice(&0u16.to_be_bytes()); // x
+            m.extend_from_slice(&0u16.to_be_bytes()); // y
+            m.extend_from_slice(&(dims.0 as u16).to_be_bytes());
+            m.extend_from_slice(&(dims.1 as u16).to_be_bytes());
+            m.extend_from_slice(&16i32.to_be_bytes()); // ZRLE
+            m.extend_from_slice(&(z.len() as u32).to_be_bytes());
+            m.extend_from_slice(&z);
+            out.push(m);
+        }
+        out
+    }
+
+    fn decode_one(payload: Vec<u8>) -> Vec<u32> {
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
+        let rects = zrle_rects((2, 2), &[payload]);
+        Decoder::new().rect(&mut &rects[0][..], &mut s).unwrap();
+        s.px
+    }
+
+    const A: u32 = 0x00AA_BBCC;
+    const B: u32 = 0x0011_2233;
+
+    #[test]
+    fn zrle_solid_and_raw_tiles() {
+        // Subencoding 1: one colour for the whole tile.
+        let mut solid = vec![1u8];
+        solid.extend_from_slice(&cp(A));
+        assert_eq!(decode_one(solid), vec![A; 4]);
+
+        // Subencoding 0: every pixel spelled out.
+        let mut raw = vec![0u8];
+        for c in [A, B, B, A] {
+            raw.extend_from_slice(&cp(c));
+        }
+        assert_eq!(decode_one(raw), vec![A, B, B, A]);
+    }
+
+    #[test]
+    fn zrle_packed_palette_unpacks_msb_first() {
+        // Two colours => 1 bit per index, each row padded to a whole byte.
+        let mut t = vec![2u8];
+        t.extend_from_slice(&cp(A));
+        t.extend_from_slice(&cp(B));
+        t.push(0b0100_0000); // row 0: A then B
+        t.push(0b1000_0000); // row 1: B then A
+        assert_eq!(decode_one(t), vec![A, B, B, A]);
+    }
+
+    #[test]
+    fn zrle_rle_tiles_run_across_rows() {
+        // Plain RLE: colour, then a length byte (length is one more than the sum).
+        let mut plain = vec![128u8];
+        plain.extend_from_slice(&cp(A));
+        plain.push(1); // run of 2
+        plain.extend_from_slice(&cp(B));
+        plain.push(1); // run of 2
+        assert_eq!(decode_one(plain), vec![A, A, B, B]);
+
+        // Palette RLE: index byte, high bit means a run follows.
+        let mut pal = vec![130u8];
+        pal.extend_from_slice(&cp(A));
+        pal.extend_from_slice(&cp(B));
+        pal.extend_from_slice(&[0x80, 1]); // palette[0] x2
+        pal.extend_from_slice(&[0x81, 1]); // palette[1] x2
+        assert_eq!(decode_one(pal), vec![A, A, B, B]);
+    }
+
+    #[test]
+    fn zrle_run_overrunning_its_tile_is_rejected() {
+        let mut t = vec![128u8];
+        t.extend_from_slice(&cp(A));
+        t.push(200); // run of 201 into a 4-pixel tile
+        let rects = zrle_rects((2, 2), &[t]);
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
+        assert!(Decoder::new().rect(&mut &rects[0][..], &mut s).is_err());
+    }
+
+    /// ZRLE's zlib stream spans the connection. A decoder that resets it per
+    /// rectangle decodes the first one and then produces garbage, so decode two
+    /// rectangles from one stream and check the second is still right.
+    #[test]
+    fn zrle_zlib_stream_persists_across_rectangles() {
+        let mut first = vec![1u8];
+        first.extend_from_slice(&cp(A));
+        let mut second = vec![1u8];
+        second.extend_from_slice(&cp(B));
+
+        let rects = zrle_rects((2, 2), &[first, second]);
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
+        let mut d = Decoder::new();
+        d.rect(&mut &rects[0][..], &mut s).unwrap();
+        assert_eq!(s.px, vec![A; 4]);
+        d.rect(&mut &rects[1][..], &mut s).unwrap();
+        assert_eq!(s.px, vec![B; 4]);
+    }
+
+    /// Dragging a window makes the source and destination overlap. Copying in place
+    /// front-to-back would smear the first pixel across the whole run.
+    #[test]
+    fn copy_rect_handles_overlapping_source_and_destination() {
+        let mut s = Screen {
+            w: 4,
+            h: 1,
+            px: vec![1, 2, 3, 4],
+        };
+        #[rustfmt::skip]
+        let bytes: [u8; 16] = [
+            0, 1,  0, 0,   // dst x=1, y=0
+            0, 3,  0, 1,   // w=3, h=1
+            0, 0, 0, 1,    // encoding = CopyRect
+            0, 0,  0, 0,   // src x=0, y=0
+        ];
+        Decoder::new().rect(&mut &bytes[..], &mut s).unwrap();
+        assert_eq!(s.px, vec![1, 1, 2, 3]);
+    }
+
+    #[test]
+    fn copy_rect_with_offscreen_source_is_rejected() {
+        let mut s = Screen {
+            w: 4,
+            h: 1,
+            px: vec![1, 2, 3, 4],
+        };
+        let bytes: [u8; 16] = [0, 0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 1, 0, 2, 0, 0];
+        assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
+    }
+
+    /// DesktopSize has to be acted on before the bounds check, because a screen that
+    /// grew is by definition outside the framebuffer it is replacing.
+    #[test]
+    fn desktop_size_resizes_the_framebuffer() {
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![9; 4],
+        };
+        #[rustfmt::skip]
+        let bytes: [u8; 12] = [
+            0, 0,  0, 0,          // x, y - ignored
+            0, 4,  0, 3,          // the new size, 4x3
+            0xff, 0xff, 0xff, 0x21, // encoding -223, and no body at all
+        ];
+        let touched = Decoder::new().rect(&mut &bytes[..], &mut s).unwrap();
+        assert_eq!((s.w, s.h), (4, 3), "framebuffer follows the screen");
+        assert_eq!(s.px.len(), 12);
+        assert!(s.px.iter().all(|&p| p == 0), "and starts blank");
+        assert_eq!(touched, (0, 0, 4, 3), "the whole of it is now dirty");
+    }
+
+    #[test]
+    fn rect_outside_the_framebuffer_is_rejected() {
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![0; 4],
+        };
+        let bytes: [u8; 12] = [0, 1, 0, 1, 0, 4, 0, 4, 0, 0, 0, 0];
+        assert!(Decoder::new().rect(&mut &bytes[..], &mut s).is_err());
+    }
+
+    /// Build the 12-byte rectangle header Tight bodies hang off.
+    fn tight_rect(w: usize, h: usize, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u16.to_be_bytes()); // x
+        v.extend_from_slice(&0u16.to_be_bytes()); // y
+        v.extend_from_slice(&(w as u16).to_be_bytes());
+        v.extend_from_slice(&(h as u16).to_be_bytes());
+        v.extend_from_slice(&7i32.to_be_bytes()); // Tight
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn blank(w: usize, h: usize) -> Screen {
+        Screen {
+            w,
+            h,
+            px: vec![0; w * h],
+        }
+    }
+
+    /// Tight's length header, as a server would write it.
+    fn compact(n: usize) -> Vec<u8> {
+        if n < 0x80 {
+            vec![n as u8]
+        } else if n < 0x4000 {
+            vec![(n & 0x7f) as u8 | 0x80, (n >> 7) as u8]
+        } else {
+            vec![
+                (n & 0x7f) as u8 | 0x80,
+                ((n >> 7) & 0x7f) as u8 | 0x80,
+                (n >> 14) as u8,
+            ]
+        }
+    }
+
+    /// One block of a persistent zlib stream, flushed so the far end can read it back
+    /// without waiting for more.
+    fn deflate(z: &mut flate2::Compress, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + 1024);
+        z.compress_vec(data, &mut out, flate2::FlushCompress::Sync)
+            .unwrap();
+        out
+    }
+
+    /// A whole rectangle in one colour, and the byte order trap: TPIXEL is red, green,
+    /// blue, where ZRLE's CPIXEL in the very same decoder is blue, green, red. Reusing
+    /// the wrong one swaps every red and blue on screen and still decodes cleanly.
+    #[test]
+    fn tight_fill_is_one_colour_in_rgb_order() {
+        let mut s = blank(3, 2);
+        let body = [0x80, 0x11, 0x22, 0x33];
+        let touched = Decoder::new()
+            .rect(&mut &tight_rect(3, 2, &body)[..], &mut s)
+            .unwrap();
+        assert_eq!(touched, (0, 0, 3, 2));
+        assert!(s.px.iter().all(|&p| p == 0x0011_2233), "{:06x?}", s.px);
+    }
+
+    /// Under twelve bytes a server sends the pixels as they are: no length, no zlib.
+    #[test]
+    fn tight_copy_below_the_threshold_is_uncompressed() {
+        let mut s = blank(2, 1);
+        // Control byte 0: stream 0, no filter byte, so Copy. Then 2 pixels of 3 bytes.
+        let body = [0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff];
+        Decoder::new()
+            .rect(&mut &tight_rect(2, 1, &body)[..], &mut s)
+            .unwrap();
+        assert_eq!(s.px, vec![0x00ff_0000, 0x0000_00ff]);
+    }
+
+    /// Above it, a compact length and a zlib block off the stream the control byte named.
+    #[test]
+    fn tight_copy_above_the_threshold_is_deflated() {
+        let (w, h) = (4, 2);
+        let px: Vec<u8> = (0..w * h * 3).map(|i| (i * 7) as u8).collect();
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &px);
+
+        let mut body = vec![0x00]; // stream 0, Copy
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        for i in 0..w * h {
+            let e = (px[i * 3] as u32) << 16 | (px[i * 3 + 1] as u32) << 8 | px[i * 3 + 2] as u32;
+            assert_eq!(s.px[i], e, "pixel {i}");
+        }
+    }
+
+    /// Two colours are one bit per pixel, most significant first, and every row starts
+    /// on a fresh byte. A row that is not a multiple of eight wide is where that goes
+    /// wrong, so this one is nine across.
+    #[test]
+    fn tight_two_colour_palette_is_bit_packed_per_row() {
+        let (w, h) = (9, 2);
+        // Row 0: 101010101, row 1: 010101010 - each padded out to two bytes. Four
+        // bytes in total, which is under the threshold, so they go as they are.
+        let data = [0b1010_1010, 0b1000_0000, 0b0101_0101, 0b0000_0000];
+
+        // 0x40: basic compression, stream 0, and a filter byte follows.
+        let mut body = vec![0x40, 0x01, 0x01]; // filter Palette, two colours
+        body.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60]); // two TPIXELs
+        body.extend_from_slice(&data);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        let (a, b) = (0x0010_2030, 0x0040_5060);
+        assert_eq!(&s.px[..w], &[b, a, b, a, b, a, b, a, b], "row 0");
+        assert_eq!(&s.px[w..], &[a, b, a, b, a, b, a, b, a], "row 1");
+    }
+
+    /// More than two colours is a whole byte of index per pixel.
+    #[test]
+    fn tight_palette_indexes_one_byte_per_pixel() {
+        let (w, h) = (4, 3);
+        let data: Vec<u8> = (0..w * h).map(|i| (i % 3) as u8).collect();
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &data);
+
+        let mut body = vec![0x40, 0x01, 0x02]; // filter Palette, three colours
+        body.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0, 3]);
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        let pal = [0x0001_0000, 0x0000_0200, 0x0000_0003];
+        for i in 0..w * h {
+            assert_eq!(s.px[i], pal[i % 3], "pixel {i}");
+        }
+    }
+
+    /// An out-of-range palette index is a corrupt stream, not something to index with.
+    #[test]
+    fn tight_palette_index_past_the_end_is_refused() {
+        let (w, h) = (4, 3);
+        let data = vec![9u8; w * h];
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &data);
+        let mut body = vec![0x40, 0x01, 0x02];
+        body.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0, 3]);
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        assert!(Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .is_err());
+    }
+
+    /// The gradient filter sends the difference from a prediction made out of the
+    /// pixels left, above and above-left. All-zero differences mean every pixel is
+    /// exactly its own prediction, which for the first row and column is black.
+    #[test]
+    fn tight_gradient_predicts_from_its_neighbours() {
+        let (w, h) = (4, 3);
+        let mut want = vec![0u32; w * h];
+        let mut diff = vec![0u8; w * h * 3];
+        // Work out what a server would send for a known picture, then check the
+        // decoder puts that picture back.
+        let picture: Vec<[u8; 3]> = (0..w * h)
+            .map(|i| [(i * 17) as u8, (i * 5) as u8, (255 - i * 9) as u8])
+            .collect();
+        for row in 0..h {
+            for col in 0..w {
+                for c in 0..3 {
+                    let left = if col > 0 {
+                        picture[row * w + col - 1][c] as i32
+                    } else {
+                        0
+                    };
+                    let up = if row > 0 {
+                        picture[(row - 1) * w + col][c] as i32
+                    } else {
+                        0
+                    };
+                    let upleft = if col > 0 && row > 0 {
+                        picture[(row - 1) * w + col - 1][c] as i32
+                    } else {
+                        0
+                    };
+                    let guess = (left + up - upleft).clamp(0, 255);
+                    diff[(row * w + col) * 3 + c] =
+                        (picture[row * w + col][c] as i32 - guess) as u8;
+                }
+                let p = picture[row * w + col];
+                want[row * w + col] = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+            }
+        }
+        let mut z = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z, &diff);
+        let mut body = vec![0x40, 0x02]; // filter Gradient
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+
+        let mut s = blank(w, h);
+        Decoder::new()
+            .rect(&mut &tight_rect(w, h, &body)[..], &mut s)
+            .unwrap();
+        assert_eq!(s.px, want);
+    }
+
+    /// The four streams are independent and span the connection, and the server
+    /// restarts whichever it likes with the low nibble of the control byte. Getting
+    /// that wrong decodes the first rectangle and then produces garbage, which is the
+    /// same trap ZRLE's single stream already has a note about.
+    #[test]
+    fn tight_streams_are_separate_and_resettable() {
+        let (w, h) = (4, 2);
+        let one: Vec<u8> = (0..w * h * 3).map(|i| i as u8).collect();
+        let two: Vec<u8> = (0..w * h * 3).map(|i| (200 - i) as u8).collect();
+        let mut dec = Decoder::new();
+
+        // Stream 1 carries two blocks in a row: the second only decodes if the first
+        // left the dictionary in place.
+        let mut z1 = flate2::Compress::new(flate2::Compression::default(), true);
+        for want in [&one, &two] {
+            let block = deflate(&mut z1, want);
+            let mut body = vec![0x01 << 4]; // stream 1, Copy, no reset
+            body.extend_from_slice(&compact(block.len()));
+            body.extend_from_slice(&block);
+            let mut s = blank(w, h);
+            dec.rect(&mut &tight_rect(w, h, &body)[..], &mut s).unwrap();
+            assert_eq!(
+                s.px[0],
+                (want[0] as u32) << 16 | (want[1] as u32) << 8 | want[2] as u32
+            );
+        }
+
+        // Now restart stream 1 and send a fresh one down it.
+        let mut z1b = flate2::Compress::new(flate2::Compression::default(), true);
+        let block = deflate(&mut z1b, &one);
+        let mut body = vec![0x01 << 4 | 0x02]; // stream 1, and reset stream 1
+        body.extend_from_slice(&compact(block.len()));
+        body.extend_from_slice(&block);
+        let mut s = blank(w, h);
+        dec.rect(&mut &tight_rect(w, h, &body)[..], &mut s).unwrap();
+        assert_eq!(
+            s.px[0],
+            (one[0] as u32) << 16 | (one[1] as u32) << 8 | one[2] as u32
+        );
+    }
+
+    #[test]
+    fn compact_lengths_take_one_to_three_bytes() {
+        assert_eq!(compact_len(&mut &[0x7f][..]).unwrap(), 127);
+        assert_eq!(compact_len(&mut &compact(127)[..]).unwrap(), 127);
+        assert_eq!(compact_len(&mut &compact(128)[..]).unwrap(), 128);
+        assert_eq!(compact_len(&mut &compact(16383)[..]).unwrap(), 16383);
+        assert_eq!(compact_len(&mut &compact(16384)[..]).unwrap(), 16384);
+        assert_eq!(compact_len(&mut &compact(1 << 20)[..]).unwrap(), 1 << 20);
+        // And the byte counts themselves, since the encoder above is ours too.
+        assert_eq!(compact(127).len(), 1);
+        assert_eq!(compact(128).len(), 2);
+        assert_eq!(compact(16384).len(), 3);
+    }
+
+    /// A real JPEG from a real encoder, in four quadrants. Lossy, so the check is
+    /// approximate - but a red and blue the wrong way round is not approximate.
+    #[test]
+    fn tight_jpeg_decodes_with_the_channels_the_right_way_round() {
+        let jpeg = include_bytes!("../tests/fixtures/quadrants.jpg");
+        let mut body = vec![0x09 << 4];
+        body.extend_from_slice(&compact(jpeg.len()));
+        body.extend_from_slice(jpeg);
+
+        let mut s = blank(16, 16);
+        Decoder::new()
+            .rect(&mut &tight_rect(16, 16, &body)[..], &mut s)
+            .unwrap();
+
+        let at = |x: usize, y: usize| {
+            let p = s.px[y * 16 + x];
+            ((p >> 16) as i32, (p >> 8 & 0xff) as i32, (p & 0xff) as i32)
+        };
+        let near = |got: (i32, i32, i32), want: (i32, i32, i32), what: &str| {
+            let d = (got.0 - want.0).abs() + (got.1 - want.1).abs() + (got.2 - want.2).abs();
+            assert!(d < 60, "{what}: got {got:?}, wanted about {want:?}");
+        };
+        near(at(3, 3), (220, 20, 20), "top left is red");
+        near(at(12, 3), (20, 200, 20), "top right is green");
+        near(at(3, 12), (20, 20, 220), "bottom left is blue");
+        near(at(12, 12), (240, 240, 240), "bottom right is white");
+    }
+
+    /// A 2x2 pointer: top-left and bottom-right drawn, the other two transparent.
+    fn tiny_cursor(hot_x: usize, hot_y: usize) -> Cursor {
+        Cursor {
+            w: 2,
+            h: 2,
+            hot_x,
+            hot_y,
+            px: vec![0x11, 0x22, 0x33, 0x44],
+            on: vec![true, false, false, true],
+        }
+    }
+
+    /// The mask decides what is drawn. A pointer that painted its transparent pixels
+    /// would show as a solid block with the arrow somewhere inside it.
+    #[test]
+    fn a_cursor_draws_only_where_its_mask_is_set() {
+        let mut s = Screen {
+            w: 4,
+            h: 4,
+            px: vec![0x99; 16],
+        };
+        let mut under = Vec::new();
+        tiny_cursor(0, 0).draw(&mut s, 1, 1, &mut under);
+        let at = |x: usize, y: usize| s.px[y * 4 + x];
+        assert_eq!(at(1, 1), 0x11, "top left of the cursor");
+        assert_eq!(at(2, 1), 0x99, "masked off, so untouched");
+        assert_eq!(at(1, 2), 0x99, "masked off, so untouched");
+        assert_eq!(at(2, 2), 0x44, "bottom right of the cursor");
+    }
+
+    /// The framebuffer belongs to the server, and the pointer is only ever borrowed
+    /// onto it for the blit. If restore is not exact the leftovers accumulate, and
+    /// because updates are partial nothing ever comes along to correct them.
+    #[test]
+    fn restoring_puts_the_framebuffer_back_exactly() {
+        let before: Vec<u32> = (0..64).collect();
+        let mut s = Screen {
+            w: 8,
+            h: 8,
+            px: before.clone(),
+        };
+        let mut under = Vec::new();
+        let cursor = tiny_cursor(1, 1);
+        // Several draws in a row, as a moving pointer produces, each undone before the
+        // next: a stale save-under would show up as drift by the end.
+        for (x, y) in [(3, 3), (4, 3), (4, 4), (0, 0), (7, 7)] {
+            cursor.draw(&mut s, x, y, &mut under);
+            assert_ne!(s.px, before, "something was drawn at {x},{y}");
+            restore(&mut s, &mut under);
+            assert_eq!(s.px, before, "and taken back off cleanly at {x},{y}");
+        }
+    }
+
+    /// A pointer is routinely half off the edge, and the hot spot pushes it further
+    /// out. Clipping has to hold in both directions rather than wrapping to the
+    /// opposite side of the screen.
+    #[test]
+    fn a_cursor_at_the_edges_is_clipped_not_wrapped() {
+        let before: Vec<u32> = (0..16).collect();
+        let mut s = Screen {
+            w: 4,
+            h: 4,
+            px: before.clone(),
+        };
+        let mut under = Vec::new();
+
+        // Hot spot at the far corner puts the body off the top-left entirely.
+        tiny_cursor(1, 1).draw(&mut s, 0, 0, &mut under);
+        assert_eq!(s.px[0], 0x44, "only the bottom-right pixel lands on screen");
+        assert_eq!(s.px[3], before[3], "and nothing wrapped to the far side");
+        restore(&mut s, &mut under);
+        assert_eq!(s.px, before);
+
+        // And past the bottom-right corner.
+        tiny_cursor(0, 0).draw(&mut s, 3, 3, &mut under);
+        assert_eq!(s.px[15], 0x11);
+        assert_eq!(s.px[12], before[12], "no wrap onto the next row");
+        restore(&mut s, &mut under);
+        assert_eq!(s.px, before);
+
+        // Entirely off screen: nothing drawn, nothing to put back.
+        tiny_cursor(0, 0).draw(&mut s, -9, -9, &mut under);
+        assert!(under.is_empty());
+        assert_eq!(s.px, before);
+    }
+
+    /// A zero-sized shape is how a server says the pointer is hidden, and it has to
+    /// hand the real cursor back rather than leaving the window with none at all.
+    #[test]
+    fn a_hidden_pointer_has_no_shape_to_draw() {
+        let c = Cursor::default();
+        assert!(!c.visible());
+        assert!(tiny_cursor(0, 0).visible());
+        let mut s = Screen {
+            w: 2,
+            h: 2,
+            px: vec![7; 4],
+        };
+        let mut under = Vec::new();
+        c.draw(&mut s, 1, 1, &mut under);
+        assert_eq!(s.px, vec![7; 4], "nothing drawn");
+        assert!(under.is_empty());
+    }
+
+    /// The mask is one bit per pixel, most significant first, each row padded out to a
+    /// byte - so a width that is not a multiple of eight is where it goes wrong.
+    #[test]
+    fn a_cursor_mask_is_read_a_bit_at_a_time() {
+        let (w, h) = (9usize, 2usize);
+        let mut body = Vec::new();
+        for i in 0..w * h {
+            body.extend_from_slice(&[i as u8, 0x40, 0x80, 0]); // B, G, R, pad
+        }
+        // Row 0: 101010101 padded, row 1: all off.
+        body.extend_from_slice(&[0b1010_1010, 0b1000_0000, 0, 0]);
+        let c = read_cursor(&mut &body[..], 3, 4, w, h).unwrap();
+        assert_eq!((c.hot_x, c.hot_y), (3, 4));
+        assert_eq!(c.px[0], 0x0080_4000, "R, G, B from B, G, R, pad");
+        let row0: Vec<bool> = c.on[..w].to_vec();
+        assert_eq!(
+            row0,
+            vec![true, false, true, false, true, false, true, false, true]
+        );
+        assert!(c.on[w..].iter().all(|&b| !b), "second row is all off");
+    }
+
+    /// These byte layouts were confirmed against a real TigerVNC server: the keysyms
+    /// below showed up verbatim in the X server's event log.
+    #[test]
+    fn input_messages_match_the_wire_format() {
+        assert_eq!(key_msg(0x61, true), [4, 1, 0, 0, 0, 0, 0, 0x61]); // 'a' down
+        assert_eq!(key_msg(0x61, false), [4, 0, 0, 0, 0, 0, 0, 0x61]); // 'a' up
+        assert_eq!(key_msg(0xff0d, true), [4, 1, 0, 0, 0, 0, 0xff, 0x0d]); // Return
+        assert_eq!(pointer_msg(0, 640, 480), [5, 0, 0x02, 0x80, 0x01, 0xe0]);
+        assert_eq!(pointer_msg(1, 1, 1), [5, 1, 0, 1, 0, 1]); // left button down
+        assert_eq!(pointer_msg(8, 0, 0), [5, 8, 0, 0, 0, 0]); // wheel up
+    }
+
+    #[test]
+    fn clipboard_text_converts_to_and_from_latin1() {
+        // Header is type 6, three padding bytes, then a big-endian length.
+        assert_eq!(cut_text_msg("hi"), vec![6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
+        // Windows CRLF must go out as bare LF - RFB has no CR.
+        assert_eq!(cut_text_msg("a\r\nb")[8..], [b'a', b'\n', b'b']);
+        // Outside Latin-1 becomes '?' rather than mangling the byte count.
+        assert_eq!(
+            cut_text_msg("caf\u{e9} \u{4e2d}")[8..],
+            [b'c', b'a', b'f', 0xe9, b' ', b'?']
+        );
+        // A 2-byte char must not be counted as 2 bytes in the length field.
+        assert_eq!(
+            u32::from_be_bytes(cut_text_msg("\u{4e2d}")[4..8].try_into().unwrap()),
+            1
+        );
+
+        // Coming back the other way, LF regains its CR so Windows apps paste right.
+        assert_eq!(from_latin1(b"a\nb"), "a\r\nb");
+        assert_eq!(from_latin1(&[0xe9]), "\u{e9}");
+        assert_eq!(from_latin1(b""), "");
+    }
+
+    /// Typing the clipboard is the only way to get text onto a Mac, so the conversion
+    /// has to be right for the characters people actually paste.
+    #[test]
+    fn clipboard_text_becomes_typeable_keys() {
+        assert_eq!(typed_keys("ab"), [(0x61, false), (0x62, false)]);
+        // Uppercase says shift explicitly; a server that maps 'A' to the A key
+        // without it types a lowercase 'a'.
+        assert_eq!(typed_keys("Hi"), [(0x48, true), (0x69, false)]);
+        // A Windows CRLF is one Return, not a stray carriage return as well.
+        assert_eq!(
+            typed_keys("a\r\nb"),
+            [(0x61, false), (0xff0d, false), (0x62, false)]
+        );
+        assert_eq!(typed_keys("\t"), [(0xff09, false)]);
+        // Punctuation goes as its own keysym and is left to the server to place.
+        assert_eq!(typed_keys("!"), [(0x21, false)]);
+        assert_eq!(
+            typed_keys("\u{e9}"),
+            [(0xe9, false)],
+            "latin-1 is its own keysym"
+        );
+        // Beyond Latin-1, RFB adds 0x01000000 to the code point.
+        assert_eq!(typed_keys("\u{4e2d}"), [(0x0100_4e2d, false)]);
+        assert!(typed_keys("").is_empty());
+    }
+}

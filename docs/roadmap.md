@@ -33,6 +33,8 @@
 | 28 | Measuring where the time goes, and the server sleeping through half of it | done |
 | 29 | A dialog laid out from the text in it, so nothing clips at any scaling | done |
 | 30 | Multi-monitor verified on three real displays, one at negative coordinates | done |
+| 31 | An Android client, on the same Rust engine as the Windows one | done |
+| 32 | Switching monitor from the client, and a pointer on another monitor no longer ending the session | done |
 
 ## Ideas, not commitments
 

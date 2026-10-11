@@ -1,13 +1,13 @@
 //! Shared RFB protocol pieces, used by both the client and the server.
 //!
-//! Only genuinely two-sided things live here. Decoding a rectangle belongs to the
-//! client and encoding one belongs to the server, so those stay in their binaries;
-//! what they share is the wire primitives, the framebuffer layout, the VNC-auth key
-//! derivation (one side answers the challenge, the other sets it) and the clipboard
-//! text encoding.
+//! What both ends share is here: the wire primitives, the framebuffer layout, the
+//! VNC-auth key derivation (one side answers the challenge, the other sets it) and the
+//! clipboard text encoding. `rfb` is the client's protocol engine, kept out of the
+//! Windows binary so the Android app can run it too; encoding stays in the server.
 
 #[cfg(windows)]
 pub mod gui;
+pub mod rfb;
 pub mod wire;
 
 use std::env;

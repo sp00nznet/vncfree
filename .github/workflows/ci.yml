@@ -68,3 +68,72 @@ jobs:
             target/release/vncfree.exe
             target/release/vncfree-server.exe
           generate_release_notes: true
+
+  # The Android app, built from the same checkout as the Windows binaries so the APK
+  # always carries the engine that was just tested above.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install the NDK
+        run: sdkmanager "ndk;26.1.10909125"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # No signingConfig in the release build type, so this lands as -unsigned and is
+      # signed below.
+      - name: Build the release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      # Android refuses to install an unsigned APK. With the release keystore in
+      # secrets, builds upgrade over each other; without it, they don't - hence the
+      # warning rather than a silent throwaway key.
+      - name: Sign the APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: |
+          set -euo pipefail
+          version=$(grep -oP 'versionName\s*=\s*"\K[^"]+' android/app/build.gradle.kts)
+          unsigned=$(find android/app/build/outputs/apk/release -name '*-release-unsigned.apk' | head -1)
+          tools="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          ks="$RUNNER_TEMP/vncfree.keystore"
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$ks"
+            pass="$KEYSTORE_PASS"
+          else
+            echo "::warning::No ANDROID_KEYSTORE_B64 secret - signing with a throwaway key. Users will have to uninstall any previous vncfree before installing this build."
+            pass=vncfree123
+            keytool -genkeypair -keystore "$ks" -alias vncfree -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$pass" -keypass "$pass" -dname 'CN=vncfree, O=vncfree, C=US'
+          fi
+          "$tools/zipalign" -f -p 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" sign --ks "$ks" --ks-pass "pass:$pass" --key-pass "pass:$pass" \
+            --out "vncfree-$version.apk" "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" verify --print-certs "vncfree-$version.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vncfree-android
+          path: vncfree-*.apk
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: vncfree-*.apk

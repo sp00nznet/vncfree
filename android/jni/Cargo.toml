@@ -1,0 +1,16 @@
+[package]
+name = "vncfree-android"
+version = "0.3.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# The Android app's half of the client: the same protocol engine as the Windows one,
+# exposed to Kotlin over JNI. The window, touch and keyboard are Kotlin's.
+[lib]
+name = "vncfree_jni"
+crate-type = ["cdylib"]
+
+[dependencies]
+vncfree = { path = "../.." }
+jni = { version = "0.21.1", default-features = false }

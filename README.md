@@ -1,6 +1,7 @@
 # vncfree
 
-A free, modern, open-source VNC **client and server** for Windows 11. MIT licensed.
+A free, modern, open-source VNC **client and server** for Windows 11, and a client
+for **Android**. MIT licensed.
 Free forever. No spyware, no bundled junk, no "free trial" nag screens, no telemetry,
 no accounts, no subscription, no ad-gated download.
 
@@ -61,6 +62,30 @@ vncfree-server                          # share this screen on 0.0.0.0:5900
 Close the client window to quit — Escape is forwarded to the remote machine, so it
 can't also be the quit key.
 
+### Android
+
+The same client engine as the Windows viewer, in an app. Type an address (the port
+defaults to 5900), a password, and a username only for a Mac.
+
+- **One finger is the mouse.** Tap to click, hold and let go to right-click, drag to drag.
+- **Two fingers zoom and pan** the view, and never reach the remote machine.
+- **Keyboard** brings up the soft keyboard; a hardware keyboard works throughout,
+  arrows, Ctrl and Alt included. **Paste** *types* the phone's clipboard at the remote
+  machine, which works even on a Mac. Text copied on the remote machine lands on the
+  phone's clipboard.
+- **PC keys** opens a strip above the soft keyboard with what a phone keyboard lacks:
+  Esc, Tab, arrows, Home/End, PgUp/PgDn, Ins, Del, PrtSc, Menu and F1–F12. Ctrl, Alt,
+  Shift and Win/Cmd are sticky — tap one (it lights up), then the next key from the
+  strip or the soft keyboard is sent with it held, so Ctrl, then `c`, is Ctrl-C. Tap a
+  lit modifier again to let go of it.
+- **Screen 1** (shown only when the server has more than one monitor) picks which
+  monitor to show, or all of them side by side. That needs vncfree-server at the other
+  end; it is not something other servers offer over VNC.
+- **Close**, or Back, disconnects.
+
+It remembers the address and username, never the password, and keeps the TLS
+known-hosts list in its own private storage.
+
 ### Settings
 
 All environment variables. There is no config file.
@@ -109,7 +134,7 @@ If a server really was rebuilt, delete its line from `known_hosts` and connect a
 
 | | |
 |---|---|
-| **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode. **Ctrl-Shift-V** types the local clipboard at the remote machine, for servers that will not share one |
+| **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode. **Ctrl-Shift-V** types the local clipboard at the remote machine, for servers that will not share one. **Ctrl-Shift-M** shows the next monitor, against vncfree-server |
 | **Server** | Desktop Duplication capture with the cursor, keyboard and mouse injection, clipboard, mandatory password. An idle desktop costs about 20x less CPU than the `BitBlt` it falls back to |
 | **Encodings** | Raw, CopyRect, ZRLE, and Tight for servers that speak nothing else. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
 | **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
@@ -166,6 +191,12 @@ authentication, so there is no unauthenticated path at all.
   negative coordinates, and with mixed scaling: a 4K primary at 200% beside two 1080p
   screens at 100%. Any gap between monitors comes across as black, because on the
   desktop it genuinely is nothing.
+- A client can also switch monitors mid-session: vncfree-server sends its list of
+  monitors and shares whichever one the client picks. RFB has no standard way to do
+  this, so it is a vncfree extension — two private pseudo-encodings that any other
+  server or client ignores. In the Windows viewer **Ctrl-Shift-M** steps through them
+  (1, 2 ... then all, then 1 again; the window title says which), and works in
+  view-only mode too. The Android app has a menu for it.
 - The server follows a resolution change, but a client that did not ask for
   DesktopSize cannot be told, so that session ends and has to reconnect — vncfree's own
   client reconnects by itself.
@@ -173,6 +204,10 @@ authentication, so there is no unauthenticated path at all.
   layout Windows is set to, including AltGr and dead keys, but a shortcut is sent by
   physical key position — Ctrl-C is the key where a US keyboard has C. That is usually
   what people want from a shortcut and is what most viewers do.
+- **Android:** no automatic reconnect yet — a dropped link goes back to the connect
+  screen with the reason. No mouse wheel. 64-bit phones only. The server paints the pointer into
+  the picture, since there is no mouse for a local one to follow. Tested on the
+  emulator against `vncfree-server`; not yet on a real phone or a Mac.
 - Holding a character key sends repeats rather than one long press, because Windows
   reports the repeats. Fine for typing, not for holding a key down in a game.
 - **To control an admin window, run the server as administrator.** Task Manager, Event
@@ -210,6 +245,16 @@ cargo build --release
 
 Produces `target/release/vncfree.exe` and `target/release/vncfree-server.exe`, with no
 runtime to install.
+
+The Android app needs the Android SDK and NDK 26.1, and the two Android Rust targets:
+
+```
+rustup target add aarch64-linux-android x86_64-linux-android
+cd android && ./gradlew assembleDebug
+```
+
+Gradle runs cargo for each ABI itself, so the APK always carries the engine from the
+same checkout.
 
 Or grab them from [Releases](https://github.com/sp00nznet/vncfree/releases) — built by
 CI straight from a tag, so nobody has to trust a binary from anywhere else.

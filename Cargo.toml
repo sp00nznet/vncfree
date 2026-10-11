@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["vnc", "rfb", "remote-desktop", "windows"]
 categories = ["network-programming", "command-line-utilities"]
 
+# The Android app's JNI bridge lives in android/jni and builds against this library.
+[workspace]
+members = ["android/jni"]
+
 # Shared RFB protocol pieces. The two binaries below are the client and the server.
 [lib]
 name = "vncfree"
@@ -32,14 +36,17 @@ num-bigint = "0.5.1"
 getrandom = "0.4.3"
 # ZRLE is deflate over run-length-encoded tiles.
 flate2 = "1.1.9"
-# Client only: window, and clipboard without the image-format baggage.
-minifb = "0.28.0"
-arboard = { version = "3.6.1", default-features = false }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"] }
 rustls-pki-types = "1.15.1"
 sha2 = "0.11.0"
 jpeg-decoder = { version = "0.3.2", default-features = false }
+
+# Windows client only: window, and clipboard without the image-format baggage. Kept off
+# Android so the library cross-compiles for the app, which has its own window.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+minifb = "0.28.0"
+arboard = { version = "3.6.1", default-features = false }
 
 # Screen capture, input injection and the dialogs. windows-sys is the plain binding
 # crate and is all the flat C API needs.

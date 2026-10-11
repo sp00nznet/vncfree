@@ -4,18 +4,23 @@ Why things are the way they are, and the traps that cost real time getting here.
 
 ## Shape
 
-Rust, two self-contained executables, no runtime to install. Shared RFB protocol
-pieces live in `src/lib.rs`; decoding a rectangle belongs to the client and encoding
-one belongs to the server, so those stay in their own binaries. What they genuinely
-share is the wire primitives, the framebuffer layout, the VNC-auth key derivation (one
-side answers the challenge, the other sets it) and the clipboard text encoding.
+Rust, two self-contained executables, no runtime to install, plus an Android app
+that runs the same client engine. Shared RFB protocol pieces live in `src/lib.rs`:
+the wire primitives, the framebuffer layout, the VNC-auth key derivation (one side
+answers the challenge, the other sets it) and the clipboard text encoding. The client's
+handshake, authentication and decoders live in `src/rfb.rs` rather than in the viewer
+binary, so the Windows window and the Android app are two front ends on one engine and
+a decoder fix lands in both. Encoding stays in the server binary.
 
 ```
 src/lib.rs         shared protocol
+src/rfb.rs         the client engine: connect, authenticate, decode
 src/wire.rs        the transport: a socket, or a socket with TLS over it
 src/gui.rs         the native dialog, shared
-src/bin/client.rs  viewer
+src/bin/client.rs  Windows viewer: window, keyboard, mouse, clipboard
 src/bin/server.rs  screen sharing
+android/jni        the engine exposed to Kotlin over JNI, as libvncfree_jni.so
+android/app        Android viewer: Compose screen, touch, soft keyboard
 ```
 
 ## Dependencies

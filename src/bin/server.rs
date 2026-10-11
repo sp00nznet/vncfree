@@ -10,11 +10,12 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flate2::{Compress, Compression, FlushCompress};
+use vncfree::rfb::{shared_monitor, MONITORS};
 use vncfree::{blob, cut_text_msg, debug, rd, read_clipboard, u16r, u32r, u8r, vnc_des};
 use vncfree::{Res, Screen, PIXEL_FORMAT};
 
@@ -269,7 +270,8 @@ mod dxgi {
 mod win {
     //! The only unsafe in the project: screen capture and input injection.
     use std::mem::{size_of, zeroed};
-    use std::ptr::null_mut;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{LPARAM, RECT};
     use windows_sys::Win32::Graphics::Gdi::*;
     use windows_sys::Win32::UI::HiDpi::*;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -284,36 +286,73 @@ mod win {
         }
     }
 
-    /// The region to share, in physical screen coordinates: origin then size.
+    /// Every monitor, in physical screen coordinates: origin then size. The primary
+    /// comes first and the rest follow left to right, so monitor 1 is the one with the
+    /// taskbar clock on it and the numbers do not shuffle between connections.
+    pub fn monitors() -> Vec<(i32, i32, usize, usize)> {
+        type List = Vec<(i32, i32, usize, usize)>;
+        unsafe extern "system" fn each(_: HMONITOR, _: HDC, r: *mut RECT, list: LPARAM) -> i32 {
+            let (r, list) = unsafe { (&*r, &mut *(list as *mut List)) };
+            list.push((
+                r.left,
+                r.top,
+                (r.right - r.left) as usize,
+                (r.bottom - r.top) as usize,
+            ));
+            1
+        }
+        let mut list = List::new();
+        unsafe {
+            EnumDisplayMonitors(
+                null_mut(),
+                null(),
+                Some(each),
+                &mut list as *mut List as LPARAM,
+            );
+        }
+        // The primary monitor is the one at the desktop's origin, by definition.
+        list.sort_by_key(|&(x, y, _, _)| ((x, y) != (0, 0), x, y));
+        list
+    }
+
+    /// The region to share, in physical screen coordinates: origin then size, plus
+    /// which monitor that is (0 for all of them).
     ///
-    /// `VNC_MONITOR=all` shares every display as one wide screen. The default is the
-    /// primary only, deliberately: sharing more of someone's desk than they asked for
-    /// is not a good surprise, and the framebuffer of three monitors is three times
-    /// the pixels to encode and send.
+    /// `pick` is what the client asked for, if it asked. Otherwise `VNC_MONITOR=all`
+    /// shares every display as one wide screen, and the default is the primary only,
+    /// deliberately: sharing more of someone's desk than they asked for is not a good
+    /// surprise, and the framebuffer of three monitors is three times the pixels to
+    /// encode and send.
     ///
     /// The virtual desktop's origin is not necessarily 0,0 - a monitor placed to the
     /// left of the primary gives it a negative x - so the origin has to be carried
     /// around rather than assumed.
-    pub fn share_region() -> (i32, i32, usize, usize) {
+    pub fn share_region(
+        pick: Option<usize>,
+        list: &[(i32, i32, usize, usize)],
+    ) -> ((i32, i32, usize, usize), usize) {
+        let all = std::env::var("VNC_MONITOR")
+            .map(|v| v == "all")
+            .unwrap_or(false);
+        // A monitor that has since been unplugged falls back to the default.
+        let k = match pick {
+            Some(k) if k <= list.len() => k,
+            _ if all => 0,
+            _ => 1,
+        };
+        if let Some(&m) = k.checked_sub(1).and_then(|i| list.get(i)) {
+            return (m, k);
+        }
         unsafe {
-            if std::env::var("VNC_MONITOR")
-                .map(|v| v == "all")
-                .unwrap_or(false)
-            {
+            (
                 (
                     GetSystemMetrics(SM_XVIRTUALSCREEN),
                     GetSystemMetrics(SM_YVIRTUALSCREEN),
                     GetSystemMetrics(SM_CXVIRTUALSCREEN) as usize,
                     GetSystemMetrics(SM_CYVIRTUALSCREEN) as usize,
-                )
-            } else {
-                (
-                    0,
-                    0,
-                    GetSystemMetrics(SM_CXSCREEN) as usize,
-                    GetSystemMetrics(SM_CYSCREEN) as usize,
-                )
-            }
+                ),
+                0,
+            )
         }
     }
 
@@ -637,7 +676,7 @@ mod win {
                         // A generous box rather than the exact icon size. Cursors are
                         // small, so over-reporting costs a rounding error of pixels
                         // and saves asking the bitmap how big it is.
-                        now = Some(self.clamp_rect(x - 4, y - 4, 136, 136));
+                        now = super::clip(x - 4, y - 4, 136, 136, self.w, self.h);
                     }
                 }
                 // Both where it was and where it is now have to be repainted, or the
@@ -665,14 +704,6 @@ mod win {
                     super::Frame::Unknown
                 }
             }
-        }
-
-        fn clamp_rect(&self, x: i32, y: i32, w: i32, h: i32) -> (usize, usize, usize, usize) {
-            let x0 = x.max(0) as usize;
-            let y0 = y.max(0) as usize;
-            let x1 = ((x + w).max(0) as usize).min(self.w);
-            let y1 = ((y + h).max(0) as usize).min(self.h);
-            (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
         }
     }
 
@@ -933,6 +964,24 @@ enum Frame {
 
 /// One piece of an update. A Copy tells the client to move something it already has,
 /// which costs four bytes instead of the pixels.
+/// The part of a rectangle that lies on a `sw` x `sh` screen, or None if none of it
+/// does. The pointer on another monitor is entirely off the shared one, and an empty
+/// rectangle placed past the edge is one a client rightly rejects.
+fn clip(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    sw: usize,
+    sh: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let x0 = (x.max(0) as usize).min(sw);
+    let y0 = (y.max(0) as usize).min(sh);
+    let x1 = ((x + w).max(0) as usize).min(sw);
+    let y1 = ((y + h).max(0) as usize).min(sh);
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
 #[derive(Debug, PartialEq)]
 enum Part {
     Copy {
@@ -955,6 +1004,11 @@ enum Part {
     /// CursorShape: the pointer's picture, for a client that draws it itself. The
     /// rectangle header carries the hot spot in place of a position.
     Cursor(Cursor),
+    /// vncfree's monitor list: which one is shared, and every one's size.
+    Monitors {
+        shared: usize,
+        sizes: Vec<(usize, usize)>,
+    },
 }
 
 /// The pointer's picture, ready to send. `mask` is one bit per pixel, most significant
@@ -1336,6 +1390,7 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
             // The hot spot travels in the position fields. There is nowhere else for
             // it, and a cursor has no position on the framebuffer by definition.
             Part::Cursor(ref c) => (c.hot_x, c.hot_y, c.w, c.h),
+            Part::Monitors { shared, ref sizes } => (shared, 0, sizes.len(), 0),
         };
         out.extend_from_slice(&(x as u16).to_be_bytes());
         out.extend_from_slice(&(y as u16).to_be_bytes());
@@ -1343,6 +1398,13 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
         out.extend_from_slice(&(h as u16).to_be_bytes());
         match *part {
             Part::Resize { .. } => out.extend_from_slice(&(-223i32).to_be_bytes()),
+            Part::Monitors { ref sizes, .. } => {
+                out.extend_from_slice(&MONITORS.to_be_bytes());
+                for &(w, h) in sizes {
+                    out.extend_from_slice(&(w as u16).to_be_bytes());
+                    out.extend_from_slice(&(h as u16).to_be_bytes());
+                }
+            }
             Part::Cursor(ref c) => {
                 out.extend_from_slice(&(-239i32).to_be_bytes());
                 for p in &c.px {
@@ -1416,6 +1478,13 @@ struct Shared {
     /// The client asked for CursorShape, so it draws the pointer itself and the
     /// captured picture must not have one baked into it.
     cursor: AtomicBool,
+    /// The client understands vncfree's monitor list.
+    monitors: AtomicBool,
+    /// The monitor the client asked for, 0 for all; usize::MAX until it asks.
+    pick: AtomicUsize,
+    /// Where the shared region starts on the desktop, for placing the pointer. It
+    /// moves when the client switches monitor or the resolution changes.
+    origin: Mutex<(i32, i32)>,
     alive: AtomicBool,
     clip: Mutex<String>,
 }
@@ -1515,7 +1584,7 @@ fn run() -> Res<()> {
 
     let listener =
         TcpListener::bind(&bind).map_err(|e| format!("could not listen on {bind}: {e}"))?;
-    let (ox, oy, w, h) = win::share_region();
+    let ((ox, oy, w, h), _) = win::share_region(None, &win::monitors());
     println!("vncfree-server listening on {bind}, sharing {w}x{h}");
     match &me {
         Some(me) => {
@@ -1710,6 +1779,9 @@ fn serve(
         wake: std::sync::Condvar::new(),
         continuous: AtomicBool::new(false),
         cursor: AtomicBool::new(false),
+        monitors: AtomicBool::new(false),
+        pick: AtomicUsize::new(usize::MAX),
+        origin: Mutex::new((ox, oy)),
         incremental: AtomicBool::new(false),
         zrle: AtomicBool::new(false),
         copyrect: AtomicBool::new(false),
@@ -1728,7 +1800,7 @@ fn serve(
         sender.stop();
     });
 
-    let result = read_client(&mut r, &shared, ox, oy);
+    let result = read_client(&mut r, &shared);
     // Wakes the sender out of its wait rather than leaving it to time out.
     shared.stop();
     result
@@ -1965,7 +2037,7 @@ fn refuse(tcp: &mut impl Write, old: bool, reason: &[u8]) -> Res<()> {
     Err(String::from_utf8_lossy(reason).into_owned().into())
 }
 
-fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> Res<()> {
+fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>) -> Res<()> {
     let mut mask = 0u8;
     let mut shift_held = false;
     let mut board = arboard::Clipboard::new().ok();
@@ -1992,6 +2064,15 @@ fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> R
                 shared.copyrect.store(encs.contains(&1), Ordering::Relaxed);
                 shared.resize.store(encs.contains(&-223), Ordering::Relaxed);
                 shared.cursor.store(encs.contains(&-239), Ordering::Relaxed);
+                shared
+                    .monitors
+                    .store(encs.contains(&MONITORS), Ordering::Relaxed);
+                let pick = encs.iter().find_map(|&e| shared_monitor(e));
+                shared
+                    .pick
+                    .store(pick.unwrap_or(usize::MAX), Ordering::Relaxed);
+                // A different monitor is a different screen; wake the sender to notice.
+                shared.asked();
                 if debug() {
                     eprintln!(
                         "[debug] client supports encodings {encs:?}, using {}{}",
@@ -2046,6 +2127,7 @@ fn read_client(tcp: &mut impl Read, shared: &Arc<Shared>, ox: i32, oy: i32) -> R
             5 => {
                 let now = u8r(tcp)?;
                 let (x, y) = (u16r(tcp)?, u16r(tcp)?);
+                let (ox, oy) = *shared.origin.lock().unwrap();
                 win::move_pointer(x, y, ox, oy);
                 win::buttons(mask, now);
                 mask = now;
@@ -2087,6 +2169,8 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
     // The HCURSOR the client was last told about. Windows reuses the handle for the
     // same cursor, so this is the whole change detector.
     let mut last_cursor: Option<isize> = None;
+    // The monitor list as the client last heard it.
+    let mut told: Option<(usize, Vec<(usize, usize)>)> = None;
     let mut cap = win::Capture::new(ox, oy, w, h).ok_or("could not create the capture surface")?;
     // One deflate stream for the whole connection. ZRLE's zlib state spans the
     // session, not a rectangle; restarting it per rectangle decodes the first one and
@@ -2157,7 +2241,9 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
         // The desktop can change resolution underneath us, and everything from the
         // capture surface to the client's framebuffer is sized for the old one.
         let mut resized = false;
-        let now = win::share_region();
+        let list = win::monitors();
+        let pick = Some(shared.pick.load(Ordering::Relaxed)).filter(|&k| k != usize::MAX);
+        let (now, k) = win::share_region(pick, &list);
         if now != (ox, oy, w, h) && now.2 > 0 && now.3 > 0 {
             if !shared.resize.load(Ordering::Relaxed) {
                 // Nothing in the protocol lets us tell this client. Ending the session
@@ -2175,6 +2261,7 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
                 now.2, now.3, now.0, now.1
             );
             (ox, oy, w, h) = now;
+            *shared.origin.lock().unwrap() = (ox, oy);
             cur = Screen::new(w, h);
             prev = Screen::new(w, h);
             cap =
@@ -2216,11 +2303,28 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
             last_cursor = None;
         }
 
+        // Sent when it changes: a switch, or a monitor plugged in or taken away.
+        let mut monitors_part = None;
+        if shared.monitors.load(Ordering::Relaxed) {
+            let now = (k, list.iter().map(|m| (m.2, m.3)).collect::<Vec<_>>());
+            if told.as_ref() != Some(&now) {
+                monitors_part = Some(Part::Monitors {
+                    shared: now.0,
+                    sizes: now.1.clone(),
+                });
+                told = Some(now);
+            }
+        }
+
         let grab_at = std::time::Instant::now();
         let reported = cap.grab(&mut cur.px, !local_cursor);
         stick(&STIME.grab_us, &STIME.grab_max_us, grab_at);
         let diff_at = std::time::Instant::now();
-        if matches!(reported, Frame::Unchanged) && !full && cursor_part.is_none() {
+        if matches!(reported, Frame::Unchanged)
+            && !full
+            && cursor_part.is_none()
+            && monitors_part.is_none()
+        {
             // The screen provably did not move, so there is nothing to diff and
             // nothing to send. Put the request back: it is still outstanding.
             if !continuous {
@@ -2297,7 +2401,7 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
                         Part::Copy { x, y, w, h, .. } => (x, y, w, h),
                         Part::Pixels { x, y, w, h } => (x, y, w, h),
                         // Not regions of the picture; nothing to have covered.
-                        Part::Resize { .. } | Part::Cursor(_) => continue,
+                        Part::Resize { .. } | Part::Cursor(_) | Part::Monitors { .. } => continue,
                     };
                     for row in py..py + ph {
                         covered[row * w + px..row * w + px + pw].fill(true);
@@ -2353,6 +2457,7 @@ fn send_frames(shared: &Arc<Shared>, ox: i32, oy: i32, w: usize, h: usize) -> Re
 
         // A new pointer shape is worth an update on its own, even on a still screen.
         parts.extend(cursor_part);
+        parts.extend(monitors_part);
 
         if parts.is_empty() {
             // An incremental request stays outstanding until something actually
@@ -2431,6 +2536,48 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pointer on a second monitor is wholly off the shared one. That used to go
+    /// out as an empty rectangle at x=4728 on a 3840-wide screen, and the client - right
+    /// to - dropped the connection over it.
+    #[test]
+    fn a_rectangle_off_the_screen_is_not_sent() {
+        assert_eq!(clip(4728, 354, 136, 136, 3840, 2160), None);
+        assert_eq!(clip(-200, 10, 136, 136, 3840, 2160), None);
+        assert_eq!(
+            clip(3800, -4, 136, 136, 3840, 2160),
+            Some((3800, 0, 40, 132))
+        );
+        assert_eq!(clip(10, 10, 136, 136, 3840, 2160), Some((10, 10, 136, 136)));
+    }
+
+    /// What the server says about its monitors is what the client hears, and asking
+    /// for one survives the trip back.
+    #[test]
+    fn the_monitor_list_reaches_the_client() {
+        let part = Part::Monitors {
+            shared: 2,
+            sizes: vec![(3840, 2160), (1920, 1080)],
+        };
+        let msg = update(None, &Screen::new(4, 4), &[part], &PixFmt::default()).unwrap();
+        let mut dec = vncfree::rfb::Decoder {
+            cursor: Default::default(),
+            zlib: flate2::Decompress::new(true),
+            tight: std::array::from_fn(|_| flate2::Decompress::new(true)),
+            monitors: Vec::new(),
+            monitor: 0,
+        };
+        let touched = dec.rect(&mut &msg[4..], &mut Screen::new(4, 4)).unwrap();
+        assert_eq!(touched, (0, 0, 0, 0), "not a picture");
+        assert_eq!(dec.monitors, [(3840, 2160), (1920, 1080)]);
+        assert_eq!(dec.monitor, 2);
+        for k in 0..4 {
+            assert_eq!(shared_monitor(vncfree::rfb::share(k)), Some(k));
+        }
+        for e in [MONITORS, 16, -223, -239, -313] {
+            assert_eq!(shared_monitor(e), None, "{e}");
+        }
+    }
 
     /// A fresh address is not made to wait, a failing one waits longer each time, and
     /// getting it right forgets the whole thing.
