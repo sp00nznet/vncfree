@@ -87,10 +87,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Its default list includes "tools", a package the current sdkmanager no longer
+      # has, which fails the step. The NDK is for cargo: ring has C to compile.
       - uses: android-actions/setup-android@v3
-
-      - name: Install the NDK
-        run: sdkmanager "ndk;26.1.10909125"
+        with:
+          packages: platform-tools ndk;26.1.10909125
 
       - uses: gradle/actions/setup-gradle@v4
 
